@@ -1,0 +1,17 @@
+[package]
+name = "skuiz-standalone"
+description = "Run a Skuiz processor as a standalone desktop application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skuiz-core.workspace = true
+skuiz-ipc = { path = "../skuiz-ipc" }
+# tao + wry are the window and webview halves of the Tauri stack. See the
+# crate docs for why the standalone shell uses them directly rather than the
+# full Tauri app framework.
+tao = "0.36"
+wry = "0.56"
+cpal = "0.18"

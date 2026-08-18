@@ -1,0 +1,18 @@
+[package]
+name = "trigger-note"
+description = "Skuiz example: C envelope follower that emits MIDI notes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+skuiz-core.workspace = true
+skuiz-clap.workspace = true
+skuiz-midi.workspace = true
+
+[build-dependencies]
+cc = "1"

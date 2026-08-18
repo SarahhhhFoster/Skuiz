@@ -1,0 +1,15 @@
+[package]
+name = "solid-synth"
+description = "Skuiz example: SolidJS editor driving a Rust oscillator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+skuiz-core.workspace = true
+skuiz-clap.workspace = true
+skuiz-standalone.workspace = true

@@ -1,0 +1,117 @@
+</script>
+
+<script>
+(() => {
+  const { createSignal, createEffect, createMemo, render, html } = window.Solid;
+
+  // Must match the constants in lib.rs.
+  const FREQ = 0, WAVE = 1, LEVEL = 2, CUTOFF = 3;
+  const WAVEFORMS = ["Sine", "Square", "Saw", "Triangle"];
+  const NOTES = [
+    ["A3", 220.00], ["B3", 246.94], ["C4", 261.63], ["D4", 293.66],
+    ["E4", 329.63], ["F4", 349.23], ["G4", 392.00],
+  ];
+
+  // Last value known to agree with the plugin. Without this, a value
+  // arriving from the host or another instance would be echoed straight
+  // back, and two editors would drive each other in a loop.
+  const agreed = Object.create(null);
+
+  const push = (id, value) => {
+    if (agreed[id] === value) return;
+    agreed[id] = value;
+    // Optional: without the host bridge the page still renders and stays
+    // interactive, instead of throwing during mount and showing nothing.
+    window.ipc?.postMessage?.("set_param " + id + " " + value);
+  };
+
+  function App() {
+    const [freq, setFreq] = createSignal(220);
+    const [wave, setWave] = createSignal(0);
+    const [level, setLevel] = createSignal(0.3);
+    const [cutoff, setCutoff] = createSignal(1);
+
+    // This is the demo: Solid's reactive state IS the synth's state. Each
+    // effect re-runs precisely when its own signal changes, and the sound
+    // follows from that alone.
+    createEffect(() => push(FREQ, freq()));
+    createEffect(() => push(WAVE, wave()));
+    createEffect(() => push(LEVEL, level()));
+    createEffect(() => push(CUTOFF, cutoff()));
+
+    // Derived state, recomputed only when frequency changes.
+    const nearestNote = createMemo(() => {
+      let best = NOTES[0];
+      for (const note of NOTES) {
+        if (Math.abs(note[1] - freq()) < Math.abs(best[1] - freq())) best = note;
+      }
+      return Math.abs(best[1] - freq()) < 1 ? best[0] : "";
+    });
+
+    // The plugin pushes values here: host automation, a preset load, or
+    // another instance of this plugin over the IPC bus.
+    window.skuizOnParam = (id, value) => {
+      agreed[id] = value;
+      if (id === FREQ) setFreq(value);
+      else if (id === WAVE) setWave(Math.round(value));
+      else if (id === LEVEL) setLevel(value);
+      else if (id === CUTOFF) setCutoff(value);
+    };
+
+    return html`
+      <h1>Solid Synth</h1>
+      <div class="sub">SolidJS state driving Rust DSP</div>
+
+      <div class="row">
+        <div class="label">
+          <b>Frequency</b>
+          <span class="val">${() => freq().toFixed(1)} Hz ${nearestNote}</span>
+        </div>
+        <input type="range" min="55" max="1760" step="0.1"
+               value=${freq}
+               onInput=${(e) => setFreq(parseFloat(e.currentTarget.value))} />
+        <div class="keys">
+          ${() => NOTES.map(([name, hz]) => html`
+            <button data-on=${() => Math.abs(freq() - hz) < 0.5}
+                    onClick=${() => setFreq(hz)}>${name}</button>
+          `)}
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label"><b>Waveform</b><span class="val">${() => WAVEFORMS[wave()]}</span></div>
+        <div class="waves">
+          ${() => WAVEFORMS.map((name, index) => html`
+            <button data-on=${() => wave() === index}
+                    onClick=${() => setWave(index)}>${name}</button>
+          `)}
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="label"><b>Level</b><span class="val">${() => level().toFixed(2)}</span></div>
+        <input type="range" min="0" max="1" step="0.001"
+               value=${level}
+               onInput=${(e) => setLevel(parseFloat(e.currentTarget.value))} />
+      </div>
+
+      <div class="row">
+        <div class="label"><b>Cutoff</b><span class="val">${() => cutoff().toFixed(2)}</span></div>
+        <input type="range" min="0" max="1" step="0.001"
+               value=${cutoff}
+               onInput=${(e) => setCutoff(parseFloat(e.currentTarget.value))} />
+      </div>
+
+      <div class="note">
+        Every control is a Solid signal. <code>createEffect</code> sends each
+        change to the DSP, and the same channel carries values back from host
+        automation or another instance.
+      </div>
+    `;
+  }
+
+  render(App, document.getElementById("app"));
+})();
+</script>
+</body>
+</html>

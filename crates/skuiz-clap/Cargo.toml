@@ -1,0 +1,13 @@
+[package]
+name = "skuiz-clap"
+description = "CLAP format adapter for Skuiz processors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skuiz-core.workspace = true
+skuiz-ui.workspace = true
+skuiz-ipc = { path = "../skuiz-ipc" }
+clap-sys.workspace = true

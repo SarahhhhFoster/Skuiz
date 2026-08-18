@@ -1,0 +1,10 @@
+[package]
+name = "skuiz-midi"
+description = "MIDI 1.0 message construction and output configuration for Skuiz plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skuiz-core.workspace = true

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Entitlements for BOTH the AUv3 extension target and its containing app.
+
+  The App Group is not optional for Skuiz. An AUv3 extension is sandboxed,
+  and a sandboxed process may not connect to arbitrary Unix domain sockets —
+  but processes on the same team MAY use a socket created inside a shared App
+  Group container. That container path is what you pass to
+  `skuiz_auv3_init(app_group_dir)`.
+
+  Without it each instance binds a private socket in its own sandbox, every
+  instance believes it won the election, and state sync silently does
+  nothing. Replace ${TEAM_ID} and the group name, and keep them identical
+  across the app and the extension.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.${TEAM_ID}.skuiz</string>
+    </array>
+</dict>
+</plist>

@@ -1,0 +1,16 @@
+[package]
+name = "skuiz-dsp"
+description = "DSP integration for Skuiz plugins: embedded Pure Data via libpd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Off by default: libpd vendors and compiles the Pure Data sources, which is
+# a slow build no plugin should pay for unless it embeds Pd.
+default = []
+libpd = ["dep:libpd-sys"]
+
+[dependencies]
+libpd-sys = { version = "0.3", optional = true }
