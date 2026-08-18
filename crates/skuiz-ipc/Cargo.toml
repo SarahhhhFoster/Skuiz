@@ -1,0 +1,22 @@
+[package]
+name = "skuiz-ipc"
+description = "Cross-process message bus with zero-config leader election for Skuiz plugin instances"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"  # flock only: the one election primitive stdlib does not expose
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_Security",
+]

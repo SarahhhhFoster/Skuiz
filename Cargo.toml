@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/skuiz-core",
+    "crates/skuiz-clap",
+    "crates/skuiz-ui",
+    "crates/skuiz-ipc",
+    "crates/skuiz-midi",
+    "crates/skuiz-dsp",
+    "crates/skuiz-vst3",
+    "crates/skuiz-auv3",
+    "crates/skuiz-standalone",
+    "examples/shared-gain",
+    "examples/trigger-note",
+    "examples/solid-synth",
+]
+
+# skuiz-vst3 is deliberately NOT a default member: shipping a VST3 binary
+# carries a Steinberg licensing obligation (GPLv3 or their free proprietary
+# agreement) that CLAP does not, so building it is an explicit choice.
+# `cargo build -p skuiz-vst3` and `cargo test --workspace` still include it.
+default-members = [
+    "crates/skuiz-core",
+    "crates/skuiz-clap",
+    "crates/skuiz-ui",
+    "crates/skuiz-ipc",
+    "crates/skuiz-midi",
+    "crates/skuiz-dsp",
+    "crates/skuiz-auv3",
+    "crates/skuiz-standalone",
+    "examples/shared-gain",
+    "examples/trigger-note",
+    "examples/solid-synth",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sarahhhh/skuiz"
+
+[workspace.dependencies]
+skuiz-core = { path = "crates/skuiz-core" }
+skuiz-clap = { path = "crates/skuiz-clap" }
+skuiz-ui = { path = "crates/skuiz-ui" }
+skuiz-ipc = { path = "crates/skuiz-ipc" }
+skuiz-midi = { path = "crates/skuiz-midi" }
+skuiz-dsp = { path = "crates/skuiz-dsp" }
+skuiz-vst3 = { path = "crates/skuiz-vst3" }
+skuiz-standalone = { path = "crates/skuiz-standalone" }
+clap-sys = "0.5"

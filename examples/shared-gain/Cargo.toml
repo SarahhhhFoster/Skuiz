@@ -1,0 +1,21 @@
+[package]
+name = "shared-gain"
+description = "Skuiz example: gain plugin with IPC-shared parameter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# rlib too, so the standalone binary can link the same processor.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Opt in to the VST3 build; see crates/skuiz-vst3 for the licensing note.
+vst3 = ["dep:skuiz-vst3"]
+
+[dependencies]
+skuiz-core.workspace = true
+skuiz-clap.workspace = true
+skuiz-vst3 = { workspace = true, optional = true }
+skuiz-standalone.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "skuiz-ui"
+description = "Webview editor embedding for Skuiz plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wry = "0.56"
+raw-window-handle = "0.6"

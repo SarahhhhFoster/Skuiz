@@ -1,0 +1,17 @@
+[package]
+name = "skuiz-vst3"
+description = "VST3 format adapter for Skuiz processors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skuiz-core.workspace = true
+skuiz-ipc = { path = "../skuiz-ipc" }
+skuiz-ui.workspace = true
+# Clean-room, MIT/Apache-2.0 bindings (the Coupler project's vst3-rs).
+# Nothing from Steinberg's GPL/proprietary SDK is vendored or linked; see
+# this crate's docs for the obligations that still apply when *shipping* a
+# VST3 binary.
+vst3 = "0.3"

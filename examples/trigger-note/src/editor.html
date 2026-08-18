@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 14px; background: #1e1e22; color: #ddd; }
+  .row { display: grid; grid-template-columns: 5.5em 1fr 3em; align-items: center;
+         gap: 8px; margin-bottom: 10px; }
+  input[type=range] { width: 100%; }
+  select { width: 100%; background: #2b2b31; color: #ddd; border: 1px solid #45454d;
+           border-radius: 4px; padding: 3px; }
+  .val { text-align: right; font-variant-numeric: tabular-nums; color: #9a9aa4; }
+  .level { height: 6px; background: #2b2b31; border-radius: 3px; overflow: hidden; }
+  .level > div { height: 100%; width: 0; background: #6ea8fe; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <label for="threshold">Threshold</label>
+    <input id="threshold" type="range" min="0" max="1" step="0.001" value="0.1">
+    <span class="val" id="threshold-val">0.100</span>
+  </div>
+  <div class="row">
+    <label for="note">Note</label>
+    <select id="note"></select>
+    <span></span>
+  </div>
+  <div class="row">
+    <label for="channel">Channel</label>
+    <select id="channel"></select>
+    <span></span>
+  </div>
+  <div class="row">
+    <label for="velocity">Velocity</label>
+    <input id="velocity" type="range" min="1" max="127" step="1" value="100">
+    <span class="val" id="velocity-val">100</span>
+  </div>
+
+  <script>
+    // Parameter ids must match the constants in lib.rs.
+    const THRESHOLD = 0, NOTE = 1, CHANNEL = 2, VELOCITY = 3;
+
+    const NOTES = ['C3','C#3','D3','D#3','E3','F3','F#3','G3','G#3','A3','A#3','B3'];
+    const fill = (el, labels) => labels.forEach((label, i) => {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = label;
+      el.appendChild(opt);
+    });
+    fill(document.getElementById('note'), NOTES);
+    fill(document.getElementById('channel'), Array.from({length: 16}, (_, i) => String(i + 1)));
+
+    const send = (id, value) => window.ipc.postMessage('set_param ' + id + ' ' + value);
+
+    const controls = {
+      [THRESHOLD]: document.getElementById('threshold'),
+      [NOTE]: document.getElementById('note'),
+      [CHANNEL]: document.getElementById('channel'),
+      [VELOCITY]: document.getElementById('velocity'),
+    };
+    const readouts = {
+      [THRESHOLD]: [document.getElementById('threshold-val'), v => Number(v).toFixed(3)],
+      [VELOCITY]: [document.getElementById('velocity-val'), v => String(Math.round(v))],
+    };
+
+    const showValue = (id, value) => {
+      const readout = readouts[id];
+      if (readout) readout[0].textContent = readout[1](value);
+    };
+
+    for (const [id, el] of Object.entries(controls)) {
+      el.addEventListener('input', () => {
+        showValue(id, el.value);
+        send(id, el.value);
+      });
+    }
+
+    // plugin -> UI, including values that arrived from another instance
+    // over IPC; must not echo back or two instances would ping-pong.
+    window.skuizOnParam = (id, value) => {
+      const el = controls[id];
+      if (!el) return;
+      el.value = value;
+      showValue(id, value);
+    };
+  </script>
+</body>
+</html>
