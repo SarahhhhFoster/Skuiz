@@ -35,9 +35,20 @@ unsafe fn process_block(plugin: *const clap_plugin, samples: &mut [f32]) -> Vec<
         try_push: Some(collect),
     };
 
-    let mut ptr = samples.as_mut_ptr();
+    // Feed the signal as a real host would: via the audio input port, with a
+    // separate output buffer for the adapter to copy into.
+    let mut in_ptr = samples.as_mut_ptr();
+    let in_buf = clap_audio_buffer {
+        data32: &mut in_ptr,
+        data64: null_mut(),
+        channel_count: 1,
+        latency: 0,
+        constant_mask: 0,
+    };
+    let mut out_storage = vec![0.0f32; samples.len()];
+    let mut out_ptr = out_storage.as_mut_ptr();
     let mut out_buf = clap_audio_buffer {
-        data32: &mut ptr,
+        data32: &mut out_ptr,
         data64: null_mut(),
         channel_count: 1,
         latency: 0,
@@ -47,9 +58,9 @@ unsafe fn process_block(plugin: *const clap_plugin, samples: &mut [f32]) -> Vec<
         steady_time: 0,
         frames_count: samples.len() as u32,
         transport: null(),
-        audio_inputs: null(),
+        audio_inputs: &in_buf,
         audio_outputs: &mut out_buf,
-        audio_inputs_count: 0,
+        audio_inputs_count: 1,
         audio_outputs_count: 1,
         in_events: null(),
         out_events: &out_events,

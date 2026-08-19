@@ -3,13 +3,23 @@
 //! Plugin authors implement [`Processor`]; format adapter crates
 //! (skuiz-clap, skuiz-vst3, ...) translate host callbacks into calls on it.
 
+#![warn(missing_docs)]
 /// Static metadata identifying a plugin to hosts.
 pub struct PluginInfo {
-    /// Reverse-DNS unique id, e.g. "com.example.shared-gain".
+    /// Reverse-DNS unique id, e.g. `"com.example.shared-gain"`.
+    ///
+    /// This is the plugin's identity everywhere it matters, so it must never
+    /// change once released: hosts key saved projects on it, the VST3 class
+    /// id is derived from it, and instances find each other on the IPC bus
+    /// by it. Two plugins sharing an id would share a bus.
     pub id: &'static str,
+    /// Display name shown in the host's plugin list.
     pub name: &'static str,
+    /// Vendor or author name, as hosts group plugins by it.
     pub vendor: &'static str,
+    /// Version string, conventionally semver (`env!("CARGO_PKG_VERSION")`).
     pub version: &'static str,
+    /// One-line description for hosts that show one.
     pub description: &'static str,
 }
 
@@ -21,11 +31,16 @@ pub struct PluginInfo {
 /// output interface, bit depth, tuning and so on are all just choice
 /// parameters, so they automate, save, and sync over IPC like anything else.
 pub struct ParamDef {
-    /// Stable id; also used as the key in IPC shared state.
+    /// Stable id, also the key in saved state and IPC messages. Like
+    /// [`PluginInfo::id`], changing it breaks saved projects.
     pub id: u32,
+    /// Display name shown by the host and by editors.
     pub name: &'static str,
-    /// Continuous range. Ignored when `choices` is non-empty.
+    /// Lowest value of a continuous range. Ignored when `choices` is
+    /// non-empty; use [`ParamDef::low`] to read the effective minimum.
     pub min: f64,
+    /// Highest value of a continuous range. Ignored when `choices` is
+    /// non-empty; use [`ParamDef::high`] to read the effective maximum.
     pub max: f64,
     /// Default value; an index into `choices` for choice parameters.
     pub default: f64,
@@ -88,10 +103,14 @@ impl MidiOut {
         }
     }
 
+    /// Every queued event as `(frame_offset, midi_bytes)`, in push order.
+    /// Adapters drain this after [`Processor::process`] returns.
     pub fn events(&self) -> &[(u32, [u8; 3])] {
         &self.events
     }
 
+    /// Drop all queued events, keeping the allocation. Adapters call this
+    /// before each block, which is why `process` receives it already empty.
     pub fn clear(&mut self) {
         self.events.clear();
     }
@@ -167,24 +186,59 @@ pub fn snapshot_params<P: Processor>(processor: &std::sync::Mutex<P>) -> Vec<(u3
 /// Methods are called from the host's threads per the plugin format's
 /// threading rules; `process` is realtime — no allocation or blocking there.
 pub trait Processor: Send + 'static {
+    /// Static identity and metadata. See [`PluginInfo`].
+    ///
+    /// Called on any thread, and expected to be a constant.
     fn info() -> PluginInfo
     where
         Self: Sized;
 
+    /// Every parameter this plugin exposes, in the order hosts display them.
+    ///
+    /// The list is static: parameters cannot be added or removed at runtime,
+    /// because hosts snapshot it when the plugin loads. Called on any
+    /// thread, including the audio thread, so it must stay cheap.
     fn params() -> &'static [ParamDef]
     where
         Self: Sized;
 
-    /// Called before processing starts; allocate here.
+    /// Prepare for playback at a known sample rate and maximum block size.
+    ///
+    /// **Main thread.** This is the one place to allocate buffers, build
+    /// tables, and reset state — [`Processor::process`] must not. `activate`
+    /// may be called again if the host changes sample rate.
     fn activate(&mut self, _sample_rate: f64, _max_frames: u32) {}
+
+    /// Release anything [`Processor::activate`] set up. **Main thread.**
     fn deactivate(&mut self) {}
 
+    /// Apply a parameter change.
+    ///
+    /// Called from the **audio thread** (host automation, and values
+    /// arriving from other instances) *and* the **main thread** (the editor,
+    /// state loading), so keep it to arithmetic and assignment: no
+    /// allocation, no locking, no I/O. Clamp the value — hosts are not
+    /// obliged to respect your declared range.
     fn set_param(&mut self, id: u32, value: f64);
+
+    /// Read a parameter back. Called from **any thread**; same rules as
+    /// [`Processor::set_param`].
     fn get_param(&self, id: u32) -> f64;
 
-    /// Process audio in place: `channels[c]` arrives holding the input and
-    /// must leave holding the output. All channel slices are `frames` long.
-    /// Push any MIDI the DSP generates to `midi`; it arrives cleared.
+    /// Process one block of audio, in place.
+    ///
+    /// `channels[c]` arrives holding the input and must leave holding the
+    /// output; every slice is the same length, which is the block size for
+    /// this call and varies between calls. `channels` may be empty for a
+    /// plugin with no audio output, so a MIDI-only plugin still runs.
+    ///
+    /// Push any MIDI the DSP generates into `midi`, which arrives cleared;
+    /// see [`MidiOut::push`].
+    ///
+    /// **Audio thread, realtime.** No allocation, no locking, no file or
+    /// network I/O, no logging, and no panicking — a panic here crosses an
+    /// FFI boundary and aborts the host. Everything expensive belongs in
+    /// [`Processor::activate`].
     fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut MidiOut);
 
     /// Whether this plugin generates MIDI. Adapters only advertise a note

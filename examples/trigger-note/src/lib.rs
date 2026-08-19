@@ -168,7 +168,8 @@ impl Processor for TriggerNote {
         };
 
         // Release first: a gate that closed and reopened in the same block
-        // must produce note-off then note-on, not the reverse.
+        // must produce note-off then note-on, not the reverse. Note-off is
+        // block-quantized (pushed at frame 0) — only note-on is sample-accurate.
         if closed != 0 {
             if let Some((ch, key)) = self.sounding.take() {
                 midi.push(0, skuiz_midi::note_off(ch, key, 0));
@@ -177,10 +178,8 @@ impl Processor for TriggerNote {
         if crossing >= 0 {
             let ch = skuiz_midi::channel_of(self.channel);
             let key = self.note();
-            // Retrigger without a gap would leave a stuck note behind.
-            if let Some((old_ch, old_key)) = self.sounding.take() {
-                midi.push(crossing as u32, skuiz_midi::note_off(old_ch, old_key, 0));
-            }
+            // No retrigger guard needed: the gate can't reopen while open, so
+            // any sounding note was already released by the `closed` branch.
             midi.push(
                 crossing as u32,
                 skuiz_midi::note_on(ch, key, self.velocity as u8),

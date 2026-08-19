@@ -95,14 +95,10 @@ fn bus_frame_reaches_all_instances() {
         assert!(((*b).init.unwrap())(b));
 
         // A third node broadcasts a param change once everyone has joined.
+        // No readiness wait is needed: the poll loop below re-sends the
+        // frame every 20 ms, so sends lost while the bus is still forming
+        // are simply retried.
         let outsider = skuiz_ipc::Bus::join("test.ipcgain", |_| {});
-        wait_until("a bus server to be elected", || {
-            outsider.is_server() || {
-                // Someone won the bind; give the others a moment to connect.
-                std::thread::sleep(Duration::from_millis(50));
-                true
-            }
-        });
 
         // Values land on the next audio block, so keep pumping blocks while
         // waiting rather than assuming one is enough.

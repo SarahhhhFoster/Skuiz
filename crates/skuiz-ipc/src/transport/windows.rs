@@ -15,14 +15,19 @@
 //! Pipes are byte mode and blocking, giving the same stream semantics as a
 //! Unix socket, so the length-prefixed framing above this layer is identical
 //! on both platforms.
+//!
+//! Unlike the Unix backend, writes carry no timeout: a stuck peer can block
+//! a `WriteFile` call — and with it the bus's client lock — indefinitely.
+//! Bounding that needs overlapped I/O, which this unverified backend does
+//! not yet implement.
 
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_PIPE_BUSY, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
@@ -32,7 +37,6 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::IO::CancelIoEx;
 
 const PIPE_BUFFER: u32 = 64 * 1024;
@@ -82,7 +86,10 @@ impl Endpoint {
 
 /// A connection to one peer process.
 pub(crate) struct Conn {
-    handle: OwnedHandle,
+    /// Shared with the reader clone, not duplicated: `CancelIoEx` only
+    /// cancels I/O issued on the handle it is given, so `close` must act on
+    /// the very handle the reader thread blocks on.
+    handle: Arc<OwnedHandle>,
     /// Serialises writes: a frame must not interleave with another's.
     write_lock: Mutex<()>,
 }
@@ -90,30 +97,20 @@ pub(crate) struct Conn {
 impl Conn {
     fn new(handle: HANDLE) -> Self {
         Self {
-            handle: OwnedHandle(handle),
+            handle: Arc::new(OwnedHandle(handle)),
             write_lock: Mutex::new(()),
         }
     }
 
+    /// A second handle to the same pipe for the reader thread. Concurrent
+    /// reads and writes on one pipe handle are supported, so sharing beats
+    /// duplicating: the handle closes when the last clone drops, and
+    /// `close` cancels the reader's blocked I/O.
     pub(crate) fn try_clone(&self) -> Option<Conn> {
-        let mut duplicate: HANDLE = std::ptr::null_mut();
-        // Safety: both handles belong to this process; the source outlives
-        // the call, and the duplicate is owned by the returned Conn.
-        let ok = unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                self.handle.0,
-                GetCurrentProcess(),
-                &mut duplicate,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-        if ok == 0 {
-            return None;
-        }
-        Some(Conn::new(duplicate))
+        Some(Conn {
+            handle: Arc::clone(&self.handle),
+            write_lock: Mutex::new(()),
+        })
     }
 
     /// Cancel any blocked I/O so a reader wakes up promptly.
@@ -131,6 +128,7 @@ impl Read for Conn {
         if buf.is_empty() {
             return Ok(0);
         }
+        debug_assert!(u32::try_from(buf.len()).is_ok());
         let mut read: u32 = 0;
         // Safety: `buf` is valid for `buf.len()` bytes for the call's duration.
         let ok = unsafe {
@@ -155,7 +153,11 @@ impl Read for Conn {
 
 impl Write for Conn {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        // ponytail: a blocking WriteFile has no timeout, so a stuck peer can
+        // park this call — and the bus lock above it — forever. Overlapped
+        // I/O is the fix; see the module docs.
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert!(u32::try_from(buf.len()).is_ok());
         let mut written: u32 = 0;
         // Safety: `buf` is valid for `buf.len()` bytes for the call's duration.
         let ok = unsafe {
@@ -223,8 +225,7 @@ impl Listener {
             // ERROR_PIPE_CONNECTED means a client arrived first, which is
             // success; anything else ends the listener.
             let err = Error::last_os_error().raw_os_error().unwrap_or(0);
-            const ERROR_PIPE_CONNECTED: i32 = 535;
-            if err != ERROR_PIPE_CONNECTED {
+            if err != ERROR_PIPE_CONNECTED as i32 {
                 return None;
             }
         }
@@ -234,8 +235,21 @@ impl Listener {
         let endpoint = Endpoint {
             name: self.endpoint_name.clone(),
         };
-        let next = create_instance(&endpoint, false)?;
-        *slot = Some(OwnedHandle(next));
+        // Creating the next instance can fail transiently (handle
+        // exhaustion), so retry briefly rather than ending the listener.
+        // ponytail: if it keeps failing the listener still ends, and because
+        // the live client connections continue to hold the name, this
+        // process can neither serve again nor connect as a client until they
+        // drain — recovering from that needs a fuller redesign.
+        let mut next = None;
+        for _ in 0..20 {
+            if let Some(handle) = create_instance(&endpoint, false) {
+                next = Some(handle);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        *slot = Some(OwnedHandle(next?));
 
         let handle = waiting.0;
         std::mem::forget(waiting); // ownership moves into the Conn

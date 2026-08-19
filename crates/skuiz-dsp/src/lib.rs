@@ -22,6 +22,8 @@
 //!   block. `PdEngine::process` adapts between the two, at the cost of
 //!   `PdEngine::latency_frames` samples of delay.
 
+#![warn(missing_docs)]
+
 #[cfg(feature = "libpd")]
 mod pd {
 
@@ -38,15 +40,34 @@ mod pd {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Why an engine could not be created or a patch could not be loaded.
     #[derive(Debug)]
     pub enum PdError {
         /// libpd was built without multi-instance support, so plugin instances
         /// would trample each other's patches.
         NoInstanceSupport,
+        /// Pd refused the requested channel count or sample rate.
         AudioInit,
+        /// The patch path had no usable file name or parent directory.
         PatchNotFound,
+        /// Pd could not open the patch (missing file or parse error).
         PatchFailed,
     }
+
+    impl std::fmt::Display for PdError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                PdError::NoInstanceSupport => {
+                    write!(f, "libpd was built without multi-instance support")
+                }
+                PdError::AudioInit => write!(f, "Pd refused the audio configuration"),
+                PdError::PatchNotFound => write!(f, "patch path has no file name or parent"),
+                PdError::PatchFailed => write!(f, "Pd could not open the patch"),
+            }
+        }
+    }
+
+    impl std::error::Error for PdError {}
 
     /// An embedded Pure Data instance: one patch, one DSP graph, independent of
     /// every other `PdEngine` in the process.
@@ -61,11 +82,12 @@ mod pd {
         /// One tick of interleaved output, straight from Pd.
         tick_out: Vec<f32>,
         /// Interleaved output ring absorbing the mismatch between Pd's fixed
-        /// tick and the host's block size.
+        /// tick and the host's block size. Reads never overrun writes: the
+        /// engine is primed with one tick of silence, and every further tick
+        /// writes exactly the frames the reads that fed it will consume.
         ring: Vec<f32>,
         read: usize,
         write: usize,
-        available: usize,
     }
 
     // Safety: every method selects `instance` on the calling thread before
@@ -75,6 +97,9 @@ mod pd {
     impl PdEngine {
         /// Create an engine with `channels` in and out. Call off the audio
         /// thread — this allocates and takes the global Pd setup lock.
+        ///
+        /// Input and output are one count: a generator patch cannot ask for
+        /// 0 inputs, it just ignores the channels it gets.
         pub fn new(sample_rate: f64, channels: usize) -> Result<Self, PdError> {
             static INIT: Once = Once::new();
             let _guard = setup_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -114,12 +139,10 @@ mod pd {
                     ring: vec![0.0; ring_frames * channels],
                     read: 0,
                     write: 0,
-                    available: 0,
                 };
                 // Prime one tick of silence so `process` always has output to
                 // hand back, which is what makes the latency constant.
                 engine.write = block;
-                engine.available = block;
                 Ok(engine)
             }
         }
@@ -133,6 +156,13 @@ mod pd {
         pub fn open_patch(&mut self, path: &Path) -> Result<(), PdError> {
             let (Some(name), Some(dir)) = (path.file_name(), path.parent()) else {
                 return Err(PdError::PatchNotFound);
+            };
+            // A bare file name has parent "" — mean the current directory,
+            // or libpd searches its own paths instead of next to the patch.
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
             };
             let (Ok(name), Ok(dir)) = (
                 CString::new(name.to_string_lossy().as_bytes()),
@@ -164,15 +194,18 @@ mod pd {
             };
             unsafe {
                 libpd_sys::libpd_set_instance(self.instance);
+                // Fire-and-forget: the return only flags a receiver nobody
+                // is bound to, which a parameter stream can't act on.
                 libpd_sys::libpd_float(name.as_ptr(), value);
             }
         }
 
         /// Run one block. `channels` is deinterleaved and processed in place;
         /// slices may be any length, including lengths Pd cannot process
-        /// directly. Realtime-safe: no allocation, no global lock.
+        /// directly. Unequal slice lengths process up to the shortest rather
+        /// than panic. Realtime-safe: no allocation, no global lock.
         pub fn process(&mut self, channels: &mut [&mut [f32]]) {
-            let frames = channels.first().map_or(0, |c| c.len());
+            let frames = channels.iter().map(|c| c.len()).min().unwrap_or(0);
             if frames == 0 {
                 return;
             }
@@ -196,13 +229,14 @@ mod pd {
                     }
                 }
                 self.read = (self.read + 1) % (self.ring.len() / self.channels);
-                self.available = self.available.saturating_sub(1);
             }
         }
 
         /// Process one Pd tick and push its output into the ring.
         fn run_tick(&mut self) {
             unsafe {
+                // Return value is Pd's DSP error flag; there is nothing
+                // realtime-safe to do with it here.
                 libpd_sys::libpd_process_float(1, self.in_buf.as_ptr(), self.tick_out.as_mut_ptr());
             }
             let ring_frames = self.ring.len() / self.channels;
@@ -213,13 +247,14 @@ mod pd {
                 }
                 self.write = (self.write + 1) % ring_frames;
             }
-            self.available = (self.available + self.block).min(ring_frames);
         }
 
         /// Caller must hold the setup lock and have selected this instance.
         unsafe fn set_dsp(&self, on: bool) {
             let Ok(pd) = CString::new("pd") else { return };
             let Ok(dsp) = CString::new("dsp") else { return };
+            // Fire-and-forget, like `send_float`: a failed message send
+            // leaves DSP off, which fails safe (silence).
             libpd_sys::libpd_start_message(1);
             libpd_sys::libpd_add_float(if on { 1.0 } else { 0.0 });
             libpd_sys::libpd_finish_message(pd.as_ptr(), dsp.as_ptr());
@@ -262,6 +297,26 @@ mod pd {
                  #X obj 50 150 dac~;\n\
                  #X connect 0 0 1 0;\n\
                  #X connect 1 0 2 0;\n",
+            )
+            .unwrap();
+            path
+        }
+
+        /// Stereo version of `halving_patch`: each channel halved on its
+        /// own, so swapped or duplicated interleaving shows up.
+        fn stereo_halving_patch(dir: &Path) -> std::path::PathBuf {
+            let path = dir.join("half_stereo.pd");
+            std::fs::write(
+                &path,
+                "#N canvas 0 0 450 300 12;\n\
+                 #X obj 50 50 adc~;\n\
+                 #X obj 50 100 *~ 0.5;\n\
+                 #X obj 150 100 *~ 0.5;\n\
+                 #X obj 50 150 dac~;\n\
+                 #X connect 0 0 1 0;\n\
+                 #X connect 0 1 2 0;\n\
+                 #X connect 1 0 3 0;\n\
+                 #X connect 2 0 3 1;\n",
             )
             .unwrap();
             path
@@ -334,6 +389,43 @@ mod pd {
                 out_b.iter().all(|s| s.abs() < 1e-6),
                 "engine without a patch produced signal: instances are sharing state"
             );
+        }
+
+        /// Distinct L/R constants in, halved and unswapped out: proves the
+        /// deinterleave/interleave mapping, which mono tests cannot see.
+        #[test]
+        fn stereo_channels_interleave_in_order() {
+            let dir = scratch();
+            let patch = stereo_halving_patch(&dir);
+
+            let mut pd = PdEngine::new(48_000.0, 2).expect("pd engine");
+            pd.open_patch(&patch).expect("open patch");
+            let latency = pd.latency_frames() as usize;
+
+            let block = 100;
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            for _ in 0..12 {
+                let mut l = vec![1.0f32; block];
+                let mut r = vec![0.25f32; block];
+                pd.process(&mut [&mut l, &mut r]);
+                left.extend_from_slice(&l);
+                right.extend_from_slice(&r);
+            }
+
+            let steady_l = &left[latency + 64..];
+            let steady_r = &right[latency + 64..];
+            assert!(!steady_l.is_empty());
+            for (i, (l, r)) in steady_l.iter().zip(steady_r).enumerate() {
+                assert!(
+                    (l - 0.5).abs() < 1e-6,
+                    "left sample {i} was {l}, expected 0.5"
+                );
+                assert!(
+                    (r - 0.125).abs() < 1e-6,
+                    "right sample {i} was {r}, expected 0.125 — swapped or duplicated channels?"
+                );
+            }
         }
     }
 }

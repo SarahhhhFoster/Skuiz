@@ -27,11 +27,13 @@
 //! here needs yet: a tone makes an effect audible and its parameters
 //! demonstrable. See [`Input`] to choose silence instead.
 
+#![warn(missing_docs)]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use skuiz_core::{MidiOut, Processor};
 use std::sync::{Arc, Mutex};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 
 /// Frames the deinterleave scratch can hold. Larger host buffers are
@@ -54,12 +56,18 @@ pub enum Input {
     Silence,
 }
 
+/// Why [`run`] could not start.
 #[derive(Debug)]
 pub enum Error {
+    /// The system reported no usable audio output device.
     NoOutputDevice,
+    /// The output device would not describe a usable configuration.
     Config(String),
+    /// The audio stream could not be created or started.
     Audio(String),
+    /// The application window could not be created.
     Window(String),
+    /// The webview could not be attached to the window.
     WebView(String),
 }
 
@@ -124,6 +132,11 @@ impl Scratch {
 ///
 /// Split out from the stream callback so it can be tested without an audio
 /// device: it is where interleaving, the tone and the processor meet.
+///
+/// `channel_count` is the *device* channel count, used to deinterleave
+/// `out`; `scratch` holds the *processor* channel count, clamped to stereo.
+/// The two differ on devices with more than two outputs — the stream
+/// callback duplicates the last produced channel over the extras.
 fn render_pass<P: Processor>(
     processor: &Mutex<P>,
     midi: &mut MidiOut,
@@ -149,9 +162,13 @@ fn render_pass<P: Processor>(
         for (view, chan) in views.iter_mut().zip(scratch.channels.iter_mut()) {
             *view = &mut chan[..frames];
         }
-        if let Ok(mut p) = processor.lock() {
-            p.process(&mut views[..used], midi);
-        }
+        // A poisoned lock is recovered, not skipped: a panic on another
+        // thread must not silence the audio thread or drop edits. Same
+        // policy as `skuiz_core::snapshot_params`.
+        processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process(&mut views[..used], midi);
     }
 
     for frame in 0..frames {
@@ -161,7 +178,8 @@ fn render_pass<P: Processor>(
     }
 }
 
-/// Run `P` as a standalone application. Blocks until the window closes.
+/// Run `P` as a standalone application. Blocks until the window closes,
+/// then calls [`Processor::deactivate`] before returning.
 pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     let info = P::info();
 
@@ -169,14 +187,15 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
 
     let processor = Arc::new(Mutex::new(P::default()));
     for def in P::params() {
-        if let Ok(mut p) = processor.lock() {
-            p.set_param(def.id, def.default);
-        }
+        processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_param(def.id, def.default);
     }
 
     // --- window and event loop -------------------------------------------
 
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let (width, height) = P::editor_size();
     let window = WindowBuilder::new()
         .with_title(info.name)
@@ -212,9 +231,10 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     // fed from the last one we produce.
     let channel_count = device_channels.clamp(1, 2);
 
-    if let Ok(mut p) = processor.lock() {
-        p.activate(sample_rate, SCRATCH_FRAMES as u32);
-    }
+    processor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .activate(sample_rate, SCRATCH_FRAMES as u32);
 
     let stream = {
         let processor = Arc::clone(&processor);
@@ -283,9 +303,10 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
             if !P::params().iter().any(|d| d.id == id) {
                 return;
             }
-            if let Ok(mut p) = ui_processor.lock() {
-                p.set_param(id, value);
-            }
+            ui_processor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_param(id, value);
             // Share the move with every other instance, in this process or
             // in a DAW hosting the same plugin.
             ui_bus.send(skuiz_core::protocol::set_param(id, value).as_bytes());
@@ -296,13 +317,21 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     // Seed the page with the current values — snapshot first so the
     // processor lock is not held across the eval calls, which the audio
     // callback would otherwise block on.
+    //
+    // These evals race page load: one landing before the page has installed
+    // `window.skuizOnParam` is a no-op (the generated call is guarded). The
+    // editor contract therefore requires pages to push their own state on
+    // mount — that, not this seeding, is what the examples rely on.
     for (id, value) in skuiz_core::snapshot_params::<P>(&processor) {
         let _ = webview.evaluate_script(&skuiz_core::protocol::on_param_js(id, value));
     }
 
     // --- run --------------------------------------------------------------
 
-    event_loop.run(move |event, _, control_flow| {
+    // `run_return` rather than tao's `run`: `run` never returns, which would
+    // make `deactivate` unreachable.
+    let rt_processor = Arc::clone(&processor);
+    event_loop.run_return(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::WindowEvent {
@@ -315,18 +344,25 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                 if !P::params().iter().any(|d| d.id == id) {
                     return;
                 }
-                if let Ok(mut p) = processor.lock() {
-                    p.set_param(id, value);
-                }
+                rt_processor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_param(id, value);
                 // Update the page, but do not echo back onto the bus, or two
                 // instances would ping-pong a value forever.
-                let _ = webview.evaluate_script(&format!(
-                    "window.skuizOnParam && window.skuizOnParam({id}, {value})"
-                ));
+                let _ = webview.evaluate_script(&skuiz_core::protocol::on_param_js(id, value));
             }
             _ => {}
         }
     });
+
+    // The window has closed; release what `activate` set up, on the main
+    // thread as the Processor contract requires.
+    processor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .deactivate();
+    Ok(())
 }
 
 #[cfg(test)]

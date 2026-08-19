@@ -3,10 +3,12 @@
 set -eu
 cd "$(dirname "$0")/../.."
 cargo build -p trigger-note
+# Crate versions are workspace-inherited; the root manifest is the source.
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
 BUNDLE=target/trigger-note.clap
 mkdir -p "$BUNDLE/Contents/MacOS"
 cp target/debug/libtrigger_note.dylib "$BUNDLE/Contents/MacOS/trigger-note"
-cat > "$BUNDLE/Contents/Info.plist" <<'EOF'
+cat > "$BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -20,7 +22,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>BNDL</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>$VERSION</string>
 </dict>
 </plist>
 EOF

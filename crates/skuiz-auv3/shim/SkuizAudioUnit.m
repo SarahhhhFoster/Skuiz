@@ -26,6 +26,7 @@ typedef struct {
 extern void *skuiz_auv3_init(const char *appGroupDir);
 extern void skuiz_auv3_destroy(void *inst);
 extern void skuiz_auv3_activate(void *inst, double sampleRate, uint32_t maxFrames);
+extern void skuiz_auv3_deactivate(void *inst);
 extern void skuiz_auv3_render(void *inst, float *const *channels,
                               uint32_t channelCount, uint32_t frames);
 extern uint32_t skuiz_auv3_param_count(void);
@@ -43,6 +44,49 @@ extern bool skuiz_auv3_midi_event(void *inst, uint32_t index, uint32_t *frame, u
 #define kSkuizMaxChannels 2u
 /// Key the state blob is stored under inside `fullState`.
 static NSString *const kSkuizStateKey = @"skuiz.state";
+
+/// Timed parameter events one block may carry before the excess is dropped.
+/// Fixed-size and stack-allocated: the render thread must not allocate.
+#define kSkuizMaxParamEvents 64u
+
+typedef struct {
+    uint32_t frame;
+    uint32_t address;
+    double value;
+} SkuizParamEvent;
+
+/// Render `channels[start..end]` in place and hand the segment's MIDI to the
+/// host, offset back into block time. Called once per automation segment, so
+/// MIDI frames the DSP stamps are segment-relative.
+static void SkuizRenderSegment(void *instance, float *const *channels, uint32_t channelCount,
+                               uint32_t start, uint32_t end, AUMIDIOutputEventBlock midiOut,
+                               const AudioTimeStamp *timestamp) {
+    float *segment[kSkuizMaxChannels] = {NULL, NULL};
+    for (uint32_t i = 0; i < channelCount; i++) {
+        segment[i] = channels[i] + start;
+    }
+    skuiz_auv3_render(instance, segment, channelCount, end - start);
+
+    if (midiOut != NULL) {
+        uint32_t segmentFrames = end - start;
+        uint32_t midiCount = skuiz_auv3_midi_count(instance);
+        for (uint32_t i = 0; i < midiCount; i++) {
+            uint32_t frame = 0;
+            uint8_t bytes[3] = {0, 0, 0};
+            if (skuiz_auv3_midi_event(instance, i, &frame, bytes)) {
+                // The DSP is trusted for content, not for timing: an offset
+                // past the end of the segment is clamped rather than handed
+                // to the host.
+                if (frame >= segmentFrames) {
+                    frame = segmentFrames - 1;
+                }
+                midiOut((AUEventSampleTime)(timestamp->mSampleTime) +
+                            (AUEventSampleTime)(start + frame),
+                        0, sizeof(bytes), bytes);
+            }
+        }
+    }
+}
 
 static NSString *_Nullable gSkuizAppGroupDirectory = nil;
 
@@ -157,6 +201,9 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
     // and a strong self-capture would be a retain cycle.
     void *instance = _instance;
     _parameterTree.implementorValueObserver = ^(AUParameter *param, AUValue value) {
+        // This assumes hosts fire value observers off the render thread
+        // (the documented behaviour): skuiz_auv3_set_param allocates and
+        // writes to the IPC socket, which has no place in a render callback.
         skuiz_auv3_set_param(instance, (uint32_t)param.address, (double)value);
     };
     _parameterTree.implementorValueProvider = ^AUValue(AUParameter *param) {
@@ -225,6 +272,12 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
     return YES;
 }
 
+- (void)deallocateRenderResources {
+    // The pair of allocateRenderResourcesAndReturnError's activate.
+    skuiz_auv3_deactivate(_instance);
+    [super deallocateRenderResources];
+}
+
 - (NSArray<NSString *> *)MIDIOutputNames {
     return @[ @"MIDI Out" ];
 }
@@ -247,19 +300,39 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
             return kAudioUnitErr_InvalidParameter;
         }
 
-        // Parameter changes the host scheduled for this block. Ramps are
-        // applied at their start value: the Processor contract is
-        // block-quantised, matching the other adapters.
+        // Parameter events the host scheduled for this block, collected and
+        // sorted by sample offset so the block can be split at event times
+        // and automation lands sample-accurately. A ramp event is applied
+        // stepwise at its offset — per-sample interpolation, and the
+        // cross-block state it needs, is a ponytail.
+        SkuizParamEvent timed[kSkuizMaxParamEvents];
+        uint32_t timedCount = 0;
         for (const AURenderEvent *event = realtimeEventListHead; event != NULL;
              event = event->head.next) {
-            if (event->head.eventType == AURenderEventParameter ||
-                event->head.eventType == AURenderEventParameterRamp) {
-                // The render-safe variant: no allocation, no bus. Host
-                // automation is not broadcast, matching the other adapters.
-                skuiz_auv3_set_param_from_render(instance,
-                                                 (uint32_t)event->parameter.parameterAddress,
-                                                 (double)event->parameter.value);
+            if (event->head.eventType != AURenderEventParameter &&
+                event->head.eventType != AURenderEventParameterRamp) {
+                continue;
             }
+            if (timedCount >= kSkuizMaxParamEvents) {
+                break; // full: drop the excess, same philosophy as MidiOut
+            }
+            int64_t offset = event->head.eventSampleTime - (int64_t)timestamp->mSampleTime;
+            if (offset < 0) {
+                offset = 0;
+            }
+            if (offset > (int64_t)frameCount) {
+                offset = (int64_t)frameCount;
+            }
+            // Insertion sort by frame; the list is tiny and fixed-size, and
+            // hosts are documented to deliver it time-ordered anyway.
+            uint32_t i = timedCount++;
+            while (i > 0 && timed[i - 1].frame > (uint32_t)offset) {
+                timed[i] = timed[i - 1];
+                i--;
+            }
+            timed[i].frame = (uint32_t)offset;
+            timed[i].address = (uint32_t)event->parameter.parameterAddress;
+            timed[i].value = (double)event->parameter.value;
         }
 
         // Pull the upstream audio straight into the output buffers, then
@@ -292,20 +365,22 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
             }
         }
 
-        skuiz_auv3_render(instance, channels, channelCount, (uint32_t)frameCount);
-
-        // Hand any MIDI the DSP produced to the host, timestamped within
-        // this block.
-        if (midiOut != NULL) {
-            uint32_t midiCount = skuiz_auv3_midi_count(instance);
-            for (uint32_t i = 0; i < midiCount; i++) {
-                uint32_t frame = 0;
-                uint8_t bytes[3] = {0, 0, 0};
-                if (skuiz_auv3_midi_event(instance, i, &frame, bytes)) {
-                    midiOut((AUEventSampleTime)(timestamp->mSampleTime) + (AUEventSampleTime)frame,
-                            0, sizeof(bytes), bytes);
-                }
+        // Split the block at event times: render up to the next event,
+        // apply it, continue. The render-safe setter allocates nothing and
+        // does not broadcast — host automation is not shared over IPC,
+        // matching the other adapters.
+        uint32_t pos = 0;
+        for (uint32_t i = 0; i < timedCount; i++) {
+            if (timed[i].frame > pos) {
+                SkuizRenderSegment(instance, channels, channelCount, pos, timed[i].frame,
+                                   midiOut, timestamp);
+                pos = timed[i].frame;
             }
+            skuiz_auv3_set_param_from_render(instance, timed[i].address, timed[i].value);
+        }
+        if (pos < (uint32_t)frameCount) {
+            SkuizRenderSegment(instance, channels, channelCount, pos, (uint32_t)frameCount,
+                               midiOut, timestamp);
         }
         return noErr;
     };
@@ -410,6 +485,43 @@ int skuiz_auv3_selftest(void) {
             }
         }
 
+        // A parameter event scheduled mid-block must take effect at its
+        // frame: frames before it keep the current gain, frames after it
+        // use the new one.
+        AURenderEvent paramEvent;
+        memset(&paramEvent, 0, sizeof(paramEvent));
+        paramEvent.head.eventSampleTime = frames / 2;
+        paramEvent.head.eventType = AURenderEventParameter;
+        paramEvent.parameter.parameterAddress = first.address;
+        paramEvent.parameter.value = 0.5f;
+        status = render(&flags, &timestamp, frames, 0, bufferList, &paramEvent, pull);
+        if (status != noErr) {
+            return 14;
+        }
+        for (AUAudioFrameCount i = 0; i < frames; i++) {
+            float expect = i < frames / 2 ? 0.25f : 0.5f;
+            if (fabsf(left[i] - expect) > 1e-5f || fabsf(right[i] - expect) > 1e-5f) {
+                return 15;
+            }
+        }
+        // The scheduled value must stick for subsequent renders: render
+        // again with no events and the whole block comes back at 0.5.
+        // (Not via `first.value`: the render-safe setter deliberately
+        // doesn't notify the parameter tree.)
+        status = render(&flags, &timestamp, frames, 0, bufferList, NULL, pull);
+        if (status != noErr) {
+            return 16;
+        }
+        for (AUAudioFrameCount i = 0; i < frames; i++) {
+            if (fabsf(left[i] - 0.5f) > 1e-5f) {
+                return 17;
+            }
+        }
+        // Back to 0.25 through the tree, so the state round-trip below
+        // starts from a tree-coherent value (the render-safe setter above
+        // deliberately left the tree unnotified).
+        first.value = 0.25f;
+
         // MIDI the DSP produced must reach the host's output block.
         __block int midiSeen = 0;
         __block uint8_t midiStatus = 0;
@@ -441,6 +553,9 @@ int skuiz_auv3_selftest(void) {
         if (fabs(first.value - 0.25f) > 1e-4) {
             return 11;
         }
+
+        // The deactivate half of the lifecycle must run cleanly too.
+        [unit deallocateRenderResources];
 
         return 0;
     }

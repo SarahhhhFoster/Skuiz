@@ -190,7 +190,7 @@ unsafe fn instantiate() -> ComPtr<IComponent> {
         .to_com_ptr::<IPluginFactory>()
         .unwrap();
 
-    let mut count = factory.countClasses();
+    let count = factory.countClasses();
     assert_eq!(count, 1, "single-component plugin exposes one class");
 
     let mut info: PClassInfo = std::mem::zeroed();
@@ -211,8 +211,6 @@ unsafe fn instantiate() -> ComPtr<IComponent> {
     assert_eq!(res, kResultOk, "createInstance failed");
     assert!(!obj.is_null());
 
-    count = factory.countClasses();
-    let _ = count;
     ComPtr::from_raw(obj as *mut IComponent).unwrap()
 }
 
@@ -286,13 +284,24 @@ fn processes_audio_and_emits_events() {
                 channelBuffers32: out_ptrs.as_mut_ptr(),
             },
         };
+        // The host connects an input; here it is the same memory, since
+        // in-place processing must be handled anyway.
+        let mut in_ptrs = out_ptrs;
+        let mut in_bus = AudioBusBuffers {
+            numChannels: 2,
+            silenceFlags: 0,
+            __field0: AudioBusBuffers__type0 {
+                channelBuffers32: in_ptrs.as_mut_ptr(),
+            },
+        };
 
         let sink = ComWrapper::new(EventSink::default());
         let sink_ptr = sink.to_com_ptr::<IEventList>().unwrap();
 
         let mut data: ProcessData = std::mem::zeroed();
         data.numSamples = 64;
-        data.numInputs = 0;
+        data.numInputs = 1;
+        data.inputs = &mut in_bus;
         data.numOutputs = 1;
         data.outputs = &mut out_bus;
         data.symbolicSampleSize = SymbolicSampleSizes_::kSample32 as int32;
@@ -316,6 +325,176 @@ fn processes_audio_and_emits_events() {
         assert_eq!(ev.r#type, Event_::EventTypes_::kNoteOnEvent as u16);
         assert_eq!(ev.__field0.noteOn.pitch, 64);
         assert!((ev.__field0.noteOn.velocity - 100.0 / 127.0).abs() < 1e-6);
+
+        // With no input connected the output is silenced before processing,
+        // not left holding whatever the buffers contained.
+        left.fill(1.0);
+        right.fill(1.0);
+        data.numInputs = 0;
+        data.inputs = std::ptr::null_mut();
+        assert_eq!(processor.process(&mut data), kResultOk);
+        assert!(
+            left.iter().all(|s| *s == 0.0),
+            "no input must render silence, got {}",
+            left[0]
+        );
+        assert!(right.iter().all(|s| *s == 0.0));
+
+        assert_eq!(component.terminate(), kResultOk);
+    }
+}
+
+/// Minimal IParamValueQueue: a fixed list of (sampleOffset, value) points.
+struct ParamQueue {
+    id: ParamID,
+    points: Vec<(int32, ParamValue)>,
+}
+
+impl Class for ParamQueue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for ParamQueue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id
+    }
+    unsafe fn getPointCount(&self) -> int32 {
+        self.points.len() as int32
+    }
+    unsafe fn getPoint(
+        &self,
+        index: int32,
+        sampleOffset: *mut int32,
+        value: *mut ParamValue,
+    ) -> tresult {
+        match self.points.get(index as usize) {
+            Some(&(off, val)) if !sampleOffset.is_null() && !value.is_null() => {
+                *sampleOffset = off;
+                *value = val;
+                kResultTrue
+            }
+            _ => kInvalidArgument,
+        }
+    }
+    unsafe fn addPoint(
+        &self,
+        _sampleOffset: int32,
+        _value: ParamValue,
+        _index: *mut int32,
+    ) -> tresult {
+        kInvalidArgument // the adapter never adds points
+    }
+}
+
+/// Minimal IParameterChanges: one queue.
+struct ParamChanges {
+    queue: ComPtr<IParamValueQueue>,
+}
+
+impl Class for ParamChanges {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for ParamChanges {
+    unsafe fn getParameterCount(&self) -> int32 {
+        1
+    }
+    unsafe fn getParameterData(&self, index: int32) -> *mut IParamValueQueue {
+        if index == 0 {
+            self.queue.as_ptr()
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+    unsafe fn addParameterData(
+        &self,
+        _id: *const ParamID,
+        _index: *mut int32,
+    ) -> *mut IParamValueQueue {
+        std::ptr::null_mut()
+    }
+}
+
+/// Timed automation points must take effect at their sample offsets, not at
+/// the top of the block: the adapter splits the block and renders segments.
+#[test]
+fn timed_param_points_split_the_block() {
+    unsafe {
+        let component = instantiate();
+        assert_eq!(component.initialize(std::ptr::null_mut()), kResultOk);
+        let processor = component
+            .cast::<IAudioProcessor>()
+            .expect("IAudioProcessor");
+
+        let mut setup = ProcessSetup {
+            processMode: ProcessModes_::kRealtime as int32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
+            maxSamplesPerBlock: 512,
+            sampleRate: 48_000.0,
+        };
+        assert_eq!(processor.setupProcessing(&mut setup), kResultOk);
+
+        // Out of order within the queue: gain 0.5 at frame 48 (normalized
+        // 0.25 of 0..2), then gain 0.0 at frame 16. Default gain is 1.0.
+        let queue = ComWrapper::new(ParamQueue {
+            id: 0,
+            points: vec![(48, 0.25), (16, 0.0)],
+        });
+        let queue_ptr = queue.to_com_ptr::<IParamValueQueue>().unwrap();
+        let changes = ComWrapper::new(ParamChanges { queue: queue_ptr });
+        let changes_ptr = changes.to_com_ptr::<IParameterChanges>().unwrap();
+
+        let mut left = [1.0f32; 64];
+        let mut right = [1.0f32; 64];
+        let mut out_ptrs = [left.as_mut_ptr(), right.as_mut_ptr()];
+        let mut out_bus = AudioBusBuffers {
+            numChannels: 2,
+            silenceFlags: 0,
+            __field0: AudioBusBuffers__type0 {
+                channelBuffers32: out_ptrs.as_mut_ptr(),
+            },
+        };
+        let mut in_ptrs = out_ptrs;
+        let mut in_bus = AudioBusBuffers {
+            numChannels: 2,
+            silenceFlags: 0,
+            __field0: AudioBusBuffers__type0 {
+                channelBuffers32: in_ptrs.as_mut_ptr(),
+            },
+        };
+
+        let mut data: ProcessData = std::mem::zeroed();
+        data.numSamples = 64;
+        data.numInputs = 1;
+        data.inputs = &mut in_bus;
+        data.numOutputs = 1;
+        data.outputs = &mut out_bus;
+        data.symbolicSampleSize = SymbolicSampleSizes_::kSample32 as int32;
+        data.inputParameterChanges = changes_ptr.as_ptr();
+
+        assert_eq!(processor.process(&mut data), kResultOk);
+
+        assert!(
+            left[0..16].iter().all(|s| (s - 1.0).abs() < 1e-6),
+            "default gain before frame 16, got {}",
+            left[8]
+        );
+        assert!(
+            left[16..48].iter().all(|s| s.abs() < 1e-6),
+            "gain 0.0 from frame 16, got {}",
+            left[32]
+        );
+        assert!(
+            left[48..64].iter().all(|s| (s - 0.5).abs() < 1e-6),
+            "gain 0.5 from frame 48, got {}",
+            left[56]
+        );
+
+        // The final point's value must stick for the next block.
+        let controller = component
+            .cast::<IEditController>()
+            .expect("IEditController");
+        assert_eq!(controller.getParamNormalized(0), 0.25);
 
         assert_eq!(component.terminate(), kResultOk);
     }

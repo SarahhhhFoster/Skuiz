@@ -6,6 +6,7 @@
 //! back with [`Editor::eval`]. The protocol is plain strings — plugin authors
 //! layer whatever they like on top.
 
+#![warn(missing_docs)]
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use wry::dpi::{LogicalPosition, LogicalSize};
 
@@ -55,6 +56,9 @@ impl HasWindowHandle for ParentView {
 }
 
 /// A live webview editor attached to a host view. Drop to detach.
+///
+/// Drop it on the main thread: detaching tears down the native webview,
+/// which is as main-thread-bound as creating it was.
 pub struct Editor {
     webview: wry::WebView,
 }
@@ -80,11 +84,14 @@ impl Editor {
         Ok(Self { webview })
     }
 
-    /// Run JavaScript in the page (Rust -> UI channel).
+    /// Run JavaScript in the page (Rust -> UI channel). Main thread only:
+    /// wry hands the call straight to the native webview (WKWebView /
+    /// WebView2), which requires the thread the webview was created on.
     pub fn eval(&self, js: &str) -> Result<(), wry::Error> {
         self.webview.evaluate_script(js)
     }
 
+    /// Resize the webview to `size` in logical pixels. Main thread only.
     pub fn resize(&self, size: (u32, u32)) -> Result<(), wry::Error> {
         self.webview.set_bounds(wry::Rect {
             position: LogicalPosition::new(0, 0).into(),

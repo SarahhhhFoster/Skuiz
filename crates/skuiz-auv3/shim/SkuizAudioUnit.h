@@ -20,7 +20,9 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 /// Instances inside one host share a single extension process and sync by
 /// direct call, so nil is correct unless you also want to sync with
-/// instances in *other* hosts. For that, set this before the unit renders,
+/// instances in *other* hosts. For that, set this before the unit is
+/// instantiated — the value is consumed in `initWithComponentDescription`,
+/// so a `+load` method or another early initialiser is the reliable place —
 /// to the App Group container from
 /// `-[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]`.
 @property (class, nonatomic, copy, nullable) NSString *skuizAppGroupDirectory;

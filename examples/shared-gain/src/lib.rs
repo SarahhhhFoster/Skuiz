@@ -62,6 +62,8 @@ impl Processor for SharedGain {
     }
 
     fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut MidiOut) {
+        // No gain ramping: slider drags click. Deliberate for brevity —
+        // see solid-synth for the smoothing pattern.
         let g = self.gain as f32;
         for ch in channels.iter_mut() {
             for s in ch.iter_mut() {

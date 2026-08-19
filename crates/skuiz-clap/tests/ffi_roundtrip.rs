@@ -69,6 +69,49 @@ unsafe extern "C" fn ev_get(
     (*list).ctx as *const clap_event_header
 }
 
+/// Writes the current gain into every sample, so a test can see where in
+/// the block a parameter change took effect.
+struct Fill(f64);
+
+impl Default for Fill {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl Processor for Fill {
+    fn info() -> PluginInfo {
+        PluginInfo {
+            id: "test.fill",
+            name: "f",
+            vendor: "t",
+            version: "0",
+            description: "",
+        }
+    }
+    fn params() -> &'static [ParamDef] {
+        &[ParamDef {
+            id: 0,
+            name: "Gain",
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+            choices: &[],
+        }]
+    }
+    fn set_param(&mut self, _id: u32, v: f64) {
+        self.0 = v;
+    }
+    fn get_param(&self, _id: u32) -> f64 {
+        self.0
+    }
+    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {
+        for ch in channels.iter_mut() {
+            ch.fill(self.0 as f32);
+        }
+    }
+}
+
 // ostream appending to a Vec<u8>, one byte at a time (worst case)
 unsafe extern "C" fn sink_write(
     stream: *const clap_ostream,
@@ -177,7 +220,109 @@ fn param_flush_then_state_roundtrip() {
         ));
         assert_eq!(parsed, 0.5);
 
+        // unknown param ids must be refused, not formatted/parsed as numbers
+        assert!(!(params.value_to_text.unwrap())(
+            a,
+            42,
+            0.5,
+            buf.as_mut_ptr(),
+            64
+        ));
+        assert!(!(params.text_to_value.unwrap())(
+            a,
+            42,
+            buf.as_ptr(),
+            &mut parsed
+        ));
+
         ((*a).destroy.unwrap())(a);
         ((*b).destroy.unwrap())(b);
+    }
+}
+
+// two-event input list, delivered out of time order on purpose
+unsafe extern "C" fn ev2_size(_: *const clap_input_events) -> u32 {
+    2
+}
+unsafe extern "C" fn ev2_get(
+    list: *const clap_input_events,
+    index: u32,
+) -> *const clap_event_header {
+    let events = &*((*list).ctx as *const [clap_event_param_value; 2]);
+    &events[index as usize].header
+}
+
+fn param_event(time: u32, value: f64) -> clap_event_param_value {
+    clap_event_param_value {
+        header: clap_event_header {
+            size: std::mem::size_of::<clap_event_param_value>() as u32,
+            time,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_: CLAP_EVENT_PARAM_VALUE,
+            flags: 0,
+        },
+        param_id: 0,
+        cookie: null_mut(),
+        note_id: -1,
+        port_index: -1,
+        channel: -1,
+        key: -1,
+        value,
+    }
+}
+
+/// A timed parameter event must take effect at its frame offset, not at the
+/// top of the block: the adapter splits the block and renders segments.
+#[test]
+fn timed_param_events_split_the_block() {
+    unsafe {
+        use clap_sys::audio_buffer::clap_audio_buffer;
+        use clap_sys::process::clap_process;
+
+        let desc = Box::leak(Box::new(ClapDescriptor::new::<Fill>()));
+        let plugin = skuiz_clap::instantiate::<Fill>(&desc.raw, std::ptr::null());
+        assert!(((*plugin).init.unwrap())(plugin));
+
+        // Out of order on the wire: 0.5 at frame 6, then 0.75 at frame 2.
+        let events = [param_event(6, 0.5), param_event(2, 0.75)];
+        let in_events = clap_input_events {
+            ctx: &events as *const _ as *mut c_void,
+            size: Some(ev2_size),
+            get: Some(ev2_get),
+        };
+
+        let mut out_storage = [0.0f32; 8];
+        let mut out_ptr = out_storage.as_mut_ptr();
+        let mut out_buf = clap_audio_buffer {
+            data32: &mut out_ptr,
+            data64: null_mut(),
+            channel_count: 1,
+            latency: 0,
+            constant_mask: 0,
+        };
+        let p = clap_process {
+            steady_time: 0,
+            frames_count: 8,
+            transport: std::ptr::null(),
+            audio_inputs: std::ptr::null(),
+            audio_outputs: &mut out_buf,
+            audio_inputs_count: 0,
+            audio_outputs_count: 1,
+            in_events: &in_events,
+            out_events: std::ptr::null(),
+        };
+        ((*plugin).process.unwrap())(plugin, &p);
+
+        assert_eq!(&out_storage[0..2], &[1.0; 2], "default before frame 2");
+        assert_eq!(&out_storage[2..6], &[0.75; 4], "first event at frame 2");
+        assert_eq!(&out_storage[6..8], &[0.5; 2], "second event at frame 6");
+
+        // The final value must stick for the next block.
+        let mut got = 0.0f64;
+        let params: &clap_plugin_params = ext(plugin, CLAP_EXT_PARAMS);
+        assert!((params.get_value.unwrap())(plugin, 0, &mut got));
+        assert_eq!(got, 0.5);
+
+        ((*plugin).destroy.unwrap())(plugin);
     }
 }
