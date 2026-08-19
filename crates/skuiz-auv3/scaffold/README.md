@@ -31,10 +31,15 @@ built or verified in this repo.
    library `cc` produces for it. Set the Info.plist
    `NSExtensionPrincipalClass` to `SkuizAudioUnit`, replacing the
    `$(PRODUCT_MODULE_NAME).SkuizAudioUnitViewController` placeholder if you
-   do not add a view controller of your own.
+   do not add a view controller of your own. Note the scaffold's extension
+   point is `com.apple.AudioUnit-UI` (Info.plist), which pairs with a view
+   controller; making the `AUAudioUnit` subclass itself the principal class
+   may need the plain audio-unit extension point instead — verify against
+   the host you target, as nothing in this repo can.
 3. Only if you want instances in *different hosts* to sync: set
-   `SkuizAudioUnit.skuizAppGroupDirectory` before the unit renders, to the
-   path from
+   `SkuizAudioUnit.skuizAppGroupDirectory` before the unit is instantiated
+   (a `+load` method or another early initialiser is the reliable place;
+   the value is read in `initWithComponentDescription`), to the path from
    `FileManager.default.containerURL(forSecurityApplicationGroupIdentifier:)`,
    and give the extension and its containing app the same App Group.
    Instances within one host share a process and sync without any of this.

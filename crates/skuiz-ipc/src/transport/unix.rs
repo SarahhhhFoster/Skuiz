@@ -8,6 +8,12 @@
 //! forever. An `flock` has no such failure mode, since the kernel releases
 //! it when the holder dies. (Windows named pipes need no equivalent: the
 //! name is a kernel object that disappears with its owner.)
+//!
+//! The lock file is never unlinked — there is no safe moment to do so, as
+//! another process may hold it open and be about to flock it. One
+//! consequence: in a multi-user `/tmp` the file keeps its first creator's
+//! owner, so other users cannot open it for writing and their cross-process
+//! tier silently stays down. In-process delivery is unaffected.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -15,6 +21,11 @@ use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Bounds how long a write to a stuck (but not yet dead) peer can stall the
+/// bus; on expiry the write fails and the connection is dropped.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Where one scope's socket and lock live.
 pub(crate) struct Endpoint {
@@ -35,6 +46,13 @@ impl Endpoint {
 pub(crate) struct Conn(UnixStream);
 
 impl Conn {
+    fn new(stream: UnixStream) -> Self {
+        // A blocking write with no timeout could stall the whole bus behind
+        // one stuck peer; bound it instead.
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        Conn(stream)
+    }
+
     pub(crate) fn try_clone(&self) -> Option<Conn> {
         self.0.try_clone().ok().map(Conn)
     }
@@ -70,7 +88,10 @@ pub(crate) struct Listener {
 impl Listener {
     /// Block until a peer connects. `None` means the listener is finished.
     pub(crate) fn accept(&self) -> Option<Conn> {
-        self.inner.accept().ok().map(|(stream, _)| Conn(stream))
+        self.inner
+            .accept()
+            .ok()
+            .map(|(stream, _)| Conn::new(stream))
     }
 }
 
@@ -94,7 +115,7 @@ pub(crate) fn try_become_server(endpoint: &Endpoint) -> Option<Listener> {
 
 /// Connect to whichever process won the election.
 pub(crate) fn connect(endpoint: &Endpoint) -> Option<Conn> {
-    UnixStream::connect(&endpoint.sock_path).ok().map(Conn)
+    UnixStream::connect(&endpoint.sock_path).ok().map(Conn::new)
 }
 
 /// Unblock a thread sitting in [`Listener::accept`].

@@ -11,15 +11,16 @@ MIT licensed. No GPL code is linked.
 | | macOS | Windows | Linux |
 | --- | --- | --- | --- |
 | Audio + parameters + state | tested | type-checked | type-checked |
-| Instance bus | tested (Unix socket) | type-checked (named pipe) | type-checked |
+| Instance bus | tested (Unix socket) | type-checked (named pipe); CI only | type-checked |
 | Webview editor | tested | written, unverified | not implemented |
 | Standalone shell | tested | type-checked | type-checked |
 
 **Windows and Linux are not verified at runtime.** Development happens on
 macOS; the Windows paths are type-checked with
-`cargo check --target x86_64-pc-windows-msvc` and nothing more. The named
-pipe transport in `crates/skuiz-ipc/src/transport/windows.rs` has never been
-executed — treat it as a starting point that needs a real test pass. Linux
+`cargo check --target x86_64-pc-windows-msvc`, and the named pipe transport
+in `crates/skuiz-ipc/src/transport/windows.rs` runs only in CI's Windows
+test job — it has never been exercised on real hardware, so treat it as a
+starting point that needs a real test pass. Linux
 compiles (its bus is the same Unix socket transport macOS uses) but the
 editor has no X11 backend yet.
 
@@ -103,7 +104,7 @@ cargo run -p solid-synth --bin solid-synth-standalone
 
 A SolidJS page whose signals *are* the synth's state: move a slider or pick
 a waveform and `createEffect` sends the change to a Rust oscillator. Solid is
-vendored as a prebuilt 30 KB bundle (`examples/solid-synth/src/vendor/`), so
+vendored as a prebuilt ~31 KB bundle (`examples/solid-synth/src/vendor/`), so
 building Skuiz still needs cargo and no JavaScript toolchain — that also
 shows the editor is a plain document, not a framework lock-in.
 
@@ -125,7 +126,8 @@ extension, VST3's `IPlugView`, and the standalone window all attach the same
 wry webview to a host-provided native view, so there is one editor and one
 HTML file rather than one per format. VST3 additionally wraps editor changes
 in `beginEdit`/`performEdit`/`endEdit`, which is what makes hosts record
-automation from the GUI. macOS (NSView) only for now.
+automation from the GUI. macOS (NSView) is tested; Windows (HWND) is
+written but unverified; Linux has no webview backend yet.
 
 ## DSP
 
@@ -178,13 +180,15 @@ via server promotion.
 
 ## Development
 
-CI (`.github/workflows/ci.yml`) enforces on every push and pull request:
+CI (`.github/workflows/ci.yml`) enforces on every push to `main` and every
+pull request:
 
 - `cargo fmt --all -- --check` — the tree is rustfmt-clean
 - `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings
 - `cargo test --workspace` on **macOS, Windows and Linux** — the Windows job
   is the only place the named-pipe transport actually executes, so treat a
   Windows failure as a real finding
+- the libpd integration test (`skuiz-dsp --features libpd`, macOS)
 - `cargo doc` with warnings denied — documentation links must resolve
 - clap-validator over every example plugin (macOS)
 - the SolidJS editor's headless DOM check (Linux)
@@ -192,12 +196,11 @@ CI (`.github/workflows/ci.yml`) enforces on every push and pull request:
 Run the same locally before pushing:
 
 ```sh
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   && cargo test --workspace
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
 ## Deferred (add when needed)
 
-- Sample-accurate parameter automation (events are block-quantized)
 - Lock-free parameter sync (currently a Mutex around the processor)
 - GPU spectral resynthesis example; a plugin example that embeds libpd
   (the engine and its tests exist, no example plugin uses it yet)

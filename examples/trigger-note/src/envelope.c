@@ -37,5 +37,3 @@ int skuiz_env_scan(skuiz_env *e, const float *samples, int frames,
     }
     return crossing;
 }
-
-float skuiz_env_level(const skuiz_env *e) { return e->env; }

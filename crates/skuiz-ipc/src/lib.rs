@@ -35,7 +35,10 @@
 //! *process* (the kernel releases it if that process dies, so it cannot go
 //! stale), and the longest-lived instance within that process is the owner.
 //! Both promote automatically — deleting the owning instance hands the role
-//! to the next one immediately, with no socket round trip.
+//! to the next instance *in the same process* immediately, with no socket
+//! round trip. When the owning *process* exits, the next process picks the
+//! role up on its lifecycle poll instead, typically within tens of
+//! milliseconds.
 //!
 //! # Semantics
 //!
@@ -54,6 +57,7 @@
 //! shared. The Windows backend type-checks but has not been run; see its
 //! module docs.
 
+#![warn(missing_docs)]
 mod transport;
 
 use std::collections::HashMap;
@@ -122,6 +126,10 @@ impl Bus {
     /// (`containerURL(forSecurityApplicationGroupIdentifier:)`) to sync with
     /// instances in *other* hosts. Instances within one host share a process
     /// and sync regardless of what `dir` says.
+    ///
+    /// Keep `dir` short: if the socket path exceeds the platform's
+    /// `sun_path` limit (~108 bytes on Linux, 104 on macOS), binding fails
+    /// and the bus silently degrades to in-process-only sync.
     pub fn join_in(
         dir: &Path,
         scope: &str,
@@ -138,48 +146,64 @@ impl Bus {
             })
             .collect();
         let key = format!("{}\u{0}{}", dir.display(), sane);
+        let on_message: Callback = Arc::new(on_message);
 
-        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        // Reuse a live group; a group already shutting down must not be
-        // handed out, or the newcomer would join a bus that is going away.
-        let group = match reg.get(&key).and_then(Weak::upgrade) {
-            Some(g) if !g.shutdown.load(Ordering::Acquire) => g,
-            _ => {
-                let group = Arc::new(Group {
-                    key: key.clone(),
-                    endpoint: transport::Endpoint::new(dir, &sane),
-                    members: Mutex::new(Vec::new()),
-                    next_member_id: AtomicU64::new(0),
-                    owns_lock: AtomicBool::new(false),
-                    shutdown: AtomicBool::new(false),
-                    tx: Mutex::new(None),
-                    clients: Mutex::new(Vec::new()),
-                    next_conn_id: AtomicU64::new(0),
+        loop {
+            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            // Reuse a live group; a group already shutting down must not be
+            // handed out, or the newcomer would join a bus that is going away.
+            let group = match reg.get(&key).and_then(Weak::upgrade) {
+                Some(g) if !g.shutdown.load(Ordering::Acquire) => g,
+                _ => {
+                    let group = Arc::new(Group {
+                        key: key.clone(),
+                        endpoint: transport::Endpoint::new(dir, &sane),
+                        members: Mutex::new(Vec::new()),
+                        next_member_id: AtomicU64::new(0),
+                        owns_lock: AtomicBool::new(false),
+                        shutdown: AtomicBool::new(false),
+                        tx: Mutex::new(None),
+                        clients: Mutex::new(Vec::new()),
+                        next_conn_id: AtomicU64::new(0),
+                    });
+                    reg.insert(key.clone(), Arc::downgrade(&group));
+                    let lc = Arc::clone(&group);
+                    thread::spawn(move || lifecycle(lc));
+                    group
+                }
+            };
+            drop(reg);
+
+            let id = group.next_member_id.fetch_add(1, Ordering::Relaxed);
+            let raced_shutdown = {
+                let mut members = group.members.lock().unwrap_or_else(|e| e.into_inner());
+                members.push(Member {
+                    id,
+                    on_message: Arc::clone(&on_message),
                 });
-                reg.insert(key, Arc::downgrade(&group));
-                let lc = Arc::clone(&group);
-                thread::spawn(move || lifecycle(lc));
-                group
+                // The last instance out flips `shutdown` while holding this
+                // same members lock (see Drop), so the push and this re-check
+                // are atomic against it: either our member was visible before
+                // the shutdown decision, or we see the flag here and start
+                // over with a fresh group.
+                let raced = group.shutdown.load(Ordering::Acquire);
+                if raced {
+                    members.retain(|m| m.id != id);
+                }
+                raced
+            };
+            if !raced_shutdown {
+                return Bus { group, id };
             }
-        };
-        drop(reg);
-
-        let id = group.next_member_id.fetch_add(1, Ordering::Relaxed);
-        group
-            .members
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(Member {
-                id,
-                on_message: Arc::new(on_message),
-            });
-        Bus { group, id }
+        }
     }
 
     /// Deliver `msg` to every other instance, in this process and beyond.
     ///
     /// In-process delivery is immediate; the cross-process hop is a socket
     /// write, so call this from the UI/main thread, not the audio thread.
+    /// Ordering between the two tiers is not guaranteed: a local and a
+    /// remote instance may observe two frames in different relative order.
     pub fn send(&self, msg: &[u8]) {
         self.group.deliver_locally(msg, Some(self.id));
         self.group.send_remote(msg);
@@ -197,18 +221,19 @@ impl Drop for Bus {
     fn drop(&mut self) {
         let mut members = self.group.members.lock().unwrap_or_else(|e| e.into_inner());
         members.retain(|m| m.id != self.id);
-        let last_one_out = members.is_empty();
-        drop(members);
-
-        if !last_one_out {
+        if !members.is_empty() {
             // Other instances remain in this process: the socket link stays
             // up, and the next member has already inherited the role.
             return;
         }
+        // Flip the flag while still holding the members lock: join_in pushes
+        // a member and re-checks shutdown under the same lock, so no new
+        // instance can slip into the group after this point.
+        self.group.shutdown.store(true, Ordering::Release);
+        drop(members);
 
         // No instances left here: tear the process's link down so another
         // process can take the election lock.
-        self.group.shutdown.store(true, Ordering::Release);
         if let Some(tx) = self
             .group
             .tx
@@ -227,8 +252,12 @@ impl Drop for Bus {
         {
             c.close();
         }
-        // Unblock the accept loop if this process is serving.
-        transport::wake_listener(&self.group.endpoint);
+        // Unblock the accept loop if this process is serving. A client has
+        // nothing to wake — connecting would just hand the real server a
+        // stray peer.
+        if self.group.owns_lock.load(Ordering::Acquire) {
+            transport::wake_listener(&self.group.endpoint);
+        }
 
         // Drop only our own entry: a later join may already have replaced
         // it with a fresh group under the same key.
@@ -277,15 +306,30 @@ impl Group {
     fn send_remote(&self, msg: &[u8]) {
         if self.owns_lock.load(Ordering::Acquire) {
             self.broadcast_except(None, msg);
-        } else if let Some(tx) = self.tx.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            let _ = write_frame(tx, msg);
+            return;
         }
-        // ponytail: frames sent during an election window (no link yet) are
-        // dropped; queue them if that gap ever matters.
+        let mut tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(conn) = tx.as_mut() else {
+            // ponytail: frames sent during an election window (no link yet)
+            // are dropped; queue them if that gap ever matters.
+            return;
+        };
+        if write_frame(conn, msg).is_err() {
+            // The link is broken: drop it so the lifecycle thread reconnects
+            // at once, instead of leaving a poisoned stream whose framing no
+            // longer matches the peer's.
+            if let Some(conn) = tx.take() {
+                conn.close();
+            }
+        }
     }
 
     fn broadcast_except(&self, skip: Option<u64>, msg: &[u8]) {
-        // Dead peers are detected by write failure and dropped.
+        // Dead peers are detected by write failure and dropped. Writes are
+        // bounded by the transport's send timeout, so one stuck client stalls
+        // this lock — and with it every send and drop on the bus — for at
+        // most that long per connection; doing better takes a per-connection
+        // writer thread.
         self.clients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -610,6 +654,60 @@ mod tests {
         assert!(status.success(), "child process failed: {status:?}");
 
         drop(parent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of `promotion_crosses_process_boundary`, run as a
+    /// child process. Ignored so it never runs on its own.
+    #[test]
+    #[ignore]
+    fn cross_process_promotion_child() {
+        let dir = PathBuf::from(std::env::var("SKUIZ_TEST_DIR").expect("SKUIZ_TEST_DIR"));
+        let scope = std::env::var("SKUIZ_TEST_SCOPE").expect("SKUIZ_TEST_SCOPE");
+
+        let bus = Bus::join_in(&dir, &scope, |_| {});
+        // The parent holds the election at spawn time and drops its bus once
+        // we are connected; from then on this process must win the lock.
+        wait_until("promotion after the parent left", || bus.is_server());
+    }
+
+    #[test]
+    fn promotion_crosses_process_boundary() {
+        // When the owning process's last instance goes away, a client process
+        // must take the role over on its next lifecycle poll.
+        let dir = scratch("xprom");
+        let scope = format!("xprom-{}", std::process::id());
+
+        let parent = Bus::join_in(&dir, &scope, |_| {});
+        wait_until("the parent to take the election lock", || {
+            parent.is_server()
+        });
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cross_process_promotion_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SKUIZ_TEST_DIR", &dir)
+            .env("SKUIZ_TEST_SCOPE", &scope)
+            .spawn()
+            .expect("spawn child test process");
+
+        // Wait for the child to be a connected client before leaving, or the
+        // child would win the election first and the test would prove nothing.
+        wait_until("the child to connect as a client", || {
+            !parent.group.clients.lock().unwrap().is_empty()
+        });
+        drop(parent);
+
+        let status = child.wait().expect("child exited");
+        assert!(
+            status.success(),
+            "child was not promoted to server: {status:?}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

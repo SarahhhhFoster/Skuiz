@@ -54,7 +54,20 @@ fn native_platform_type() -> FIDString {
 /// Events one block may emit before further MIDI is dropped.
 const MIDI_OUT_CAPACITY: usize = 512;
 
+/// Timed parameter points one block may carry before the excess is dropped.
+/// Like [`MidiOut`], the buffer is pre-allocated and fixed: a host sending
+/// more automation points than this in a single block is pathological.
+const PARAM_EVENT_CAPACITY: usize = 256;
+
 // --- small helpers ------------------------------------------------------
+
+/// Run `f`, returning `fallback` if it panics. A panic unwinding across the
+/// COM boundary is UB and would abort the host, so entry points that reach
+/// user code go through here.
+#[doc(hidden)]
+pub fn ffi_guard<R>(f: impl FnOnce() -> R, fallback: R) -> R {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(fallback)
+}
 
 fn copy_cstring(src: &str, dst: &mut [c_char]) {
     let c = CString::new(src).unwrap_or_default();
@@ -86,8 +99,10 @@ unsafe fn read_wstring(s: *const TChar) -> String {
     if s.is_null() {
         return String::new();
     }
+    // Hosts pass a String128 here; cap the scan so an unterminated buffer
+    // cannot send us walking off the end of it.
     let mut len = 0isize;
-    while *s.offset(len) != 0 {
+    while len < 128 && *s.offset(len) != 0 {
         len += 1;
     }
     String::from_utf16_lossy(std::slice::from_raw_parts(s.cast(), len as usize))
@@ -172,6 +187,11 @@ pub const fn derive_cid(plugin_id: &str) -> TUID {
 struct Shared<P: Processor> {
     processor: Mutex<P>,
     midi_out: Mutex<MidiOut>,
+    /// Timed parameter points collected from the host for the current
+    /// block: `(sample_offset, param_id, plain_value)`. Audio-thread only;
+    /// pre-allocated so `process` never allocates. The block is split at
+    /// these offsets so automation lands sample-accurately.
+    param_events: Mutex<Vec<(u32, u32, f64)>>,
     bus: Mutex<Option<skuiz_ipc::Bus>>,
     sync: Arc<SyncState>,
     /// The host's handler, retained while it is set. Editor-driven changes
@@ -191,9 +211,10 @@ impl<P: Processor> Shared<P> {
         let Some(def) = P::params().iter().find(|p| p.id == id) else {
             return;
         };
-        if let Ok(mut p) = self.processor.lock() {
-            p.set_param(id, value);
-        }
+        self.processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_param(id, value);
         // Clone the retained handler out and release the lock before the
         // COM calls: hosts may re-enter the controller synchronously from
         // performEdit, and holding our lock across that is a deadlock
@@ -234,11 +255,13 @@ impl<P: Processor + Default> Default for Vst3Plugin<P> {
 }
 
 impl<P: Processor + Default> Vst3Plugin<P> {
+    /// Create an instance with every parameter at its default.
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
                 processor: Mutex::new(P::default()),
                 midi_out: Mutex::new(MidiOut::with_capacity(MIDI_OUT_CAPACITY)),
+                param_events: Mutex::new(Vec::with_capacity(PARAM_EVENT_CAPACITY)),
                 bus: Mutex::new(None),
                 sync: Arc::new(SyncState::default()),
                 handler: Mutex::new(None),
@@ -265,10 +288,17 @@ impl<P: Processor> Vst3Plugin<P> {
         P::params().iter().find(|p| p.id == id)
     }
 
-    /// Apply parameter changes the host queued for this block. VST3 sends a
-    /// queue of timed points per parameter; we take the last one, matching
-    /// the block-quantised behaviour of the CLAP adapter.
-    unsafe fn apply_param_changes(&self, changes: *mut IParameterChanges) {
+    /// Collect the block's timed parameter points into `out`
+    /// (pre-allocated, never grows past [`PARAM_EVENT_CAPACITY`]). VST3
+    /// sends a queue of timed points per parameter; every point is kept,
+    /// converted to a plain value, clamped into the block, and sorted by
+    /// sample offset so the block can be split at event times.
+    unsafe fn collect_param_changes(
+        &self,
+        changes: *mut IParameterChanges,
+        frames: usize,
+        out: &mut Vec<(u32, u32, f64)>,
+    ) {
         let Some(changes) = ComRef::from_raw(changes) else {
             return;
         };
@@ -276,30 +306,34 @@ impl<P: Processor> Vst3Plugin<P> {
             let Some(queue) = ComRef::from_raw(changes.getParameterData(i)) else {
                 continue;
             };
-            let count = queue.getPointCount();
-            if count <= 0 {
-                continue;
-            }
             let id = queue.getParameterId();
             let Some(def) = Self::param_by_id(id) else {
                 continue;
             };
-            let mut offset = 0;
-            let mut normalized = 0.0;
-            if queue.getPoint(count - 1, &mut offset, &mut normalized) == kResultTrue {
-                if let Ok(mut p) = self.shared.processor.lock() {
-                    p.set_param(id, from_normalized(def, normalized));
+            for point in 0..queue.getPointCount() {
+                if out.len() >= out.capacity() {
+                    return; // full: drop the excess, same philosophy as MidiOut
+                }
+                let mut offset = 0;
+                let mut normalized = 0.0;
+                if queue.getPoint(point, &mut offset, &mut normalized) == kResultTrue {
+                    let frame = (offset.max(0) as usize).min(frames) as u32;
+                    out.push((frame, id, from_normalized(def, normalized)));
                 }
             }
         }
+        // Points across queues are not mutually ordered; sort them.
+        out.sort_unstable_by_key(|e| e.0);
     }
 
     /// Convert generated MIDI into VST3 events. Note on/off map to native
     /// note events; other messages need `kLegacyMIDICCOutEvent` handling
-    /// and are dropped for now.
+    /// and are dropped for now. `offset` is the segment's start within the
+    /// block (the block is split at parameter-point times, so the DSP's
+    /// frame numbers are segment-relative); `frames` is the whole block.
     // ponytail: notes only. Add CC/pitch-bend as legacy MIDI CC events when
     // an example needs them.
-    unsafe fn emit_events(&self, out: *mut IEventList, midi: &MidiOut) {
+    unsafe fn emit_events(&self, out: *mut IEventList, midi: &MidiOut, frames: usize, offset: u32) {
         let Some(list) = ComRef::from_raw(out) else {
             return;
         };
@@ -308,7 +342,9 @@ impl<P: Processor> Vst3Plugin<P> {
             let channel = (bytes[0] & 0x0F) as i16;
             let mut event: Event = std::mem::zeroed();
             event.busIndex = 0;
-            event.sampleOffset = frame as i32;
+            // The DSP is trusted for content, not for timing: an offset past
+            // the end of the block is clamped rather than handed to the host.
+            event.sampleOffset = (frame + offset).min(frames.saturating_sub(1) as u32) as i32;
             match status {
                 0x90 if bytes[2] > 0 => {
                     event.r#type = Event_::EventTypes_::kNoteOnEvent as u16;
@@ -337,6 +373,259 @@ impl<P: Processor> Vst3Plugin<P> {
             list.addEvent(&mut event);
         }
     }
+
+    /// The pair of `setupProcessing`'s `activate`: the host is tearing the
+    /// processing state down. Activation itself stays in `setupProcessing`,
+    /// which is where the sample rate arrives.
+    fn set_active_inner(&self, state: TBool) -> tresult {
+        if state == 0 {
+            self.shared
+                .processor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deactivate();
+        }
+        kResultOk
+    }
+
+    /// The whole stream is read before the processor lock is taken: stream
+    /// I/O is unbounded and the audio thread contends on the same lock.
+    unsafe fn set_state_inner(&self, state: *mut IBStream) -> tresult {
+        let Some(stream) = ComRef::from_raw(state) else {
+            return kInvalidArgument;
+        };
+        let mut data = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let mut read = 0i32;
+            let r = stream.read(
+                chunk.as_mut_ptr() as *mut c_void,
+                chunk.len() as i32,
+                &mut read,
+            );
+            if r != kResultOk && r != kResultTrue {
+                return kResultFalse;
+            }
+            if read <= 0 {
+                break;
+            }
+            data.extend_from_slice(&chunk[..read as usize]);
+        }
+        let mut p = self
+            .shared
+            .processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if p.load_state(&data) {
+            kResultOk
+        } else {
+            kResultFalse
+        }
+    }
+
+    unsafe fn get_state_inner(&self, state: *mut IBStream) -> tresult {
+        let Some(stream) = ComRef::from_raw(state) else {
+            return kInvalidArgument;
+        };
+        // Serialise under the lock, then release it before the stream writes
+        // — same reasoning as set_state_inner.
+        let data = self
+            .shared
+            .processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save_state();
+        let mut written_total = 0usize;
+        while written_total < data.len() {
+            let mut written = 0i32;
+            let r = stream.write(
+                data[written_total..].as_ptr() as *mut c_void,
+                (data.len() - written_total) as i32,
+                &mut written,
+            );
+            if (r != kResultOk && r != kResultTrue) || written <= 0 {
+                return kResultFalse;
+            }
+            written_total += written as usize;
+        }
+        kResultOk
+    }
+
+    fn setup_processing_inner(&self, setup: *mut ProcessSetup) -> tresult {
+        // SAFETY: caller (the trait wrapper) guarantees the host's pointer.
+        let Some(setup) = (unsafe { setup.as_ref() }) else {
+            return kInvalidArgument;
+        };
+        self.shared
+            .processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .activate(setup.sampleRate, setup.maxSamplesPerBlock as u32);
+        kResultOk
+    }
+
+    unsafe fn process_inner(&self, data: *mut ProcessData) -> tresult {
+        let Some(data) = data.as_ref() else {
+            return kInvalidArgument;
+        };
+        let frames = data.numSamples.max(0) as usize;
+
+        // The block's timed automation points, sorted by sample offset.
+        let mut events = self
+            .shared
+            .param_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        events.clear();
+        self.collect_param_changes(data.inputParameterChanges, frames, &mut events);
+
+        // One processor lock for the whole block. Values that arrived over
+        // IPC carry no timing, so they apply at block top; host automation
+        // lands sample-accurately in the segment loop below.
+        let mut proc_ = self
+            .shared
+            .processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            // Drained in place so the Vec's allocation survives — dropping
+            // it here would free on the audio thread.
+            let mut pending = self
+                .shared
+                .sync
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for &(id, value) in pending.iter() {
+                if Self::param_by_id(id).is_some() {
+                    proc_.set_param(id, value);
+                }
+            }
+            pending.clear();
+        }
+
+        // Output channel pointers. A host that connects no outputs still
+        // gets the processor run with zero channels, so DSP that only emits
+        // MIDI keeps running.
+        let mut outs: [*mut f32; 2] = [std::ptr::null_mut(); 2];
+        let mut n_ch = 0;
+        if data.numOutputs >= 1 && !data.outputs.is_null() {
+            let out_bus = &*data.outputs;
+            let out_ptrs = out_bus.__field0.channelBuffers32;
+            if !out_ptrs.is_null() {
+                n_ch = (out_bus.numChannels.max(0) as usize).min(outs.len());
+                let out_bufs = std::slice::from_raw_parts(out_ptrs, n_ch);
+
+                // Copy input to output unless the host processes in place.
+                let mut copied = 0;
+                if data.numInputs >= 1 && !data.inputs.is_null() {
+                    let in_bus = &*data.inputs;
+                    let in_ptrs = in_bus.__field0.channelBuffers32;
+                    if !in_ptrs.is_null() {
+                        let n_in = (in_bus.numChannels.max(0) as usize).min(n_ch);
+                        let ins = std::slice::from_raw_parts(in_ptrs, n_in);
+                        for c in 0..n_in {
+                            if !ins[c].is_null() && !out_bufs[c].is_null() && ins[c] != out_bufs[c]
+                            {
+                                std::ptr::copy_nonoverlapping(ins[c], out_bufs[c], frames);
+                            }
+                        }
+                        copied = n_in;
+                    }
+                }
+
+                // Channels no input was copied into — every channel when the
+                // host connects none — must be silenced, not left holding
+                // whatever the buffer already contained.
+                for out in out_bufs.iter().take(n_ch).skip(copied) {
+                    if !out.is_null() {
+                        std::ptr::write_bytes(*out, 0, frames);
+                    }
+                }
+
+                for (c, slot) in outs.iter_mut().enumerate().take(n_ch) {
+                    if out_bufs[c].is_null() {
+                        n_ch = c;
+                        break;
+                    }
+                    *slot = out_bufs[c];
+                }
+            }
+        }
+
+        // Split the block at point times: render up to the next point,
+        // apply it, continue. Segments re-slice the same output buffers.
+        let mut midi = self
+            .shared
+            .midi_out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pos = 0usize;
+        for &(time, id, value) in events.iter() {
+            let t = (time as usize).min(frames);
+            if t > pos {
+                self.process_segment(&mut proc_, &outs, n_ch, pos, t, &mut midi, data);
+                pos = t;
+            }
+            proc_.set_param(id, value);
+        }
+        if pos < frames {
+            self.process_segment(&mut proc_, &outs, n_ch, pos, frames, &mut midi, data);
+        }
+        kResultOk
+    }
+
+    /// Render one segment of a block: `outs[segment]` per channel, in
+    /// place. MIDI queued by the DSP carries segment-relative frame numbers,
+    /// so it is emitted with `segment.start` added back.
+    #[allow(clippy::too_many_arguments)] // one concept per argument; a struct would be ceremony
+    unsafe fn process_segment(
+        &self,
+        proc_: &mut P,
+        outs: &[*mut f32; 2],
+        n_ch: usize,
+        start: usize,
+        end: usize,
+        midi: &mut MidiOut,
+        data: &ProcessData,
+    ) {
+        let mut chans: [&mut [f32]; 2] = [&mut [], &mut []];
+        for (c, chan) in chans.iter_mut().enumerate().take(n_ch) {
+            *chan = std::slice::from_raw_parts_mut(outs[c].add(start), end - start);
+        }
+        midi.clear();
+        proc_.process(&mut chans[..n_ch], midi);
+        self.emit_events(
+            data.outputEvents,
+            midi,
+            data.numSamples.max(0) as usize,
+            start as u32,
+        );
+    }
+
+    fn get_param_normalized_inner(&self, id: u32) -> f64 {
+        let Some(def) = Self::param_by_id(id) else {
+            return 0.0;
+        };
+        let p = self
+            .shared
+            .processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        to_normalized(def, p.get_param(id))
+    }
+
+    fn set_param_normalized_inner(&self, id: u32, value: f64) -> tresult {
+        let Some(def) = Self::param_by_id(id) else {
+            return kInvalidArgument;
+        };
+        self.shared
+            .processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_param(id, from_normalized(def, value));
+        kResultOk
+    }
 }
 
 impl<P: Processor + Default> Class for Vst3Plugin<P> {
@@ -362,10 +651,14 @@ impl<P: Processor + Default> IPluginBaseTrait for Vst3Plugin<P> {
             ) else {
                 return;
             };
-            sync.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((id, value));
+            let mut pending = sync.pending.lock().unwrap_or_else(|e| e.into_inner());
+            // Coalesce by param id: only the latest value matters, and this
+            // bounds the queue to the parameter count even if the host
+            // stops calling process while messages keep arriving.
+            match pending.iter_mut().find(|(pid, _)| *pid == id) {
+                Some(entry) => entry.1 = value,
+                None => pending.push((id, value)),
+            }
         });
         *self.shared.bus.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus);
         kResultOk
@@ -461,65 +754,16 @@ impl<P: Processor + Default> IComponentTrait for Vst3Plugin<P> {
         kResultOk
     }
 
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
-        kResultOk
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        ffi_guard(|| self.set_active_inner(state), kResultFalse)
     }
 
     unsafe fn setState(&self, state: *mut IBStream) -> tresult {
-        let Some(stream) = ComRef::from_raw(state) else {
-            return kInvalidArgument;
-        };
-        let mut data = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let mut read = 0i32;
-            let r = stream.read(
-                chunk.as_mut_ptr() as *mut c_void,
-                chunk.len() as i32,
-                &mut read,
-            );
-            if r != kResultOk && r != kResultTrue {
-                return kResultFalse;
-            }
-            if read <= 0 {
-                break;
-            }
-            data.extend_from_slice(&chunk[..read as usize]);
-        }
-        match self.shared.processor.lock() {
-            Ok(mut p) => {
-                if p.load_state(&data) {
-                    kResultOk
-                } else {
-                    kResultFalse
-                }
-            }
-            Err(_) => kResultFalse,
-        }
+        ffi_guard(|| self.set_state_inner(state), kResultFalse)
     }
 
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
-        let Some(stream) = ComRef::from_raw(state) else {
-            return kInvalidArgument;
-        };
-        let Ok(p) = self.shared.processor.lock() else {
-            return kResultFalse;
-        };
-        let data = p.save_state();
-        let mut written_total = 0usize;
-        while written_total < data.len() {
-            let mut written = 0i32;
-            let r = stream.write(
-                data[written_total..].as_ptr() as *mut c_void,
-                (data.len() - written_total) as i32,
-                &mut written,
-            );
-            if (r != kResultOk && r != kResultTrue) || written <= 0 {
-                return kResultFalse;
-            }
-            written_total += written as usize;
-        }
-        kResultOk
+        ffi_guard(|| self.get_state_inner(state), kResultFalse)
     }
 }
 
@@ -568,13 +812,7 @@ impl<P: Processor + Default> IAudioProcessorTrait for Vst3Plugin<P> {
     }
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
-        let Some(setup) = setup.as_ref() else {
-            return kInvalidArgument;
-        };
-        if let Ok(mut p) = self.shared.processor.lock() {
-            p.activate(setup.sampleRate, setup.maxSamplesPerBlock as u32);
-        }
-        kResultOk
+        ffi_guard(|| self.setup_processing_inner(setup), kResultFalse)
     }
 
     unsafe fn setProcessing(&self, _state: TBool) -> tresult {
@@ -582,69 +820,7 @@ impl<P: Processor + Default> IAudioProcessorTrait for Vst3Plugin<P> {
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
-        let Some(data) = data.as_ref() else {
-            return kInvalidArgument;
-        };
-        self.apply_param_changes(data.inputParameterChanges);
-
-        // Values that arrived over IPC since the last block.
-        if let Ok(mut pending) = self.shared.sync.pending.lock() {
-            if !pending.is_empty() {
-                if let Ok(mut p) = self.shared.processor.lock() {
-                    for (id, value) in pending.drain(..) {
-                        if Self::param_by_id(id).is_some() {
-                            p.set_param(id, value);
-                        }
-                    }
-                }
-            }
-        }
-
-        let frames = data.numSamples.max(0) as usize;
-        let mut chans: [&mut [f32]; 2] = [&mut [], &mut []];
-        let mut n_ch = 0;
-
-        if data.numOutputs >= 1 && !data.outputs.is_null() {
-            let out_bus = &*data.outputs;
-            let out_ptrs = out_bus.__field0.channelBuffers32;
-            if !out_ptrs.is_null() {
-                n_ch = (out_bus.numChannels.max(0) as usize).min(chans.len());
-                let outs = std::slice::from_raw_parts(out_ptrs, n_ch);
-
-                // Copy input to output unless the host processes in place.
-                if data.numInputs >= 1 && !data.inputs.is_null() {
-                    let in_bus = &*data.inputs;
-                    let in_ptrs = in_bus.__field0.channelBuffers32;
-                    if !in_ptrs.is_null() {
-                        let n_in = (in_bus.numChannels.max(0) as usize).min(n_ch);
-                        let ins = std::slice::from_raw_parts(in_ptrs, n_in);
-                        for c in 0..n_in {
-                            if !ins[c].is_null() && !outs[c].is_null() && ins[c] != outs[c] {
-                                std::ptr::copy_nonoverlapping(ins[c], outs[c], frames);
-                            }
-                        }
-                    }
-                }
-
-                for (c, chan) in chans.iter_mut().enumerate().take(n_ch) {
-                    if outs[c].is_null() {
-                        n_ch = c;
-                        break;
-                    }
-                    *chan = std::slice::from_raw_parts_mut(outs[c], frames);
-                }
-            }
-        }
-
-        let Ok(mut midi) = self.shared.midi_out.lock() else {
-            return kResultOk;
-        };
-        midi.clear();
-        if let Ok(mut p) = self.shared.processor.lock() {
-            p.process(&mut chans[..n_ch], &mut midi);
-        }
-        self.emit_events(data.outputEvents, &midi);
-        kResultOk
+        ffi_guard(|| self.process_inner(data), kResultFalse)
     }
 
     unsafe fn getTailSamples(&self) -> u32 {
@@ -751,23 +927,11 @@ impl<P: Processor + Default> IEditControllerTrait for Vst3Plugin<P> {
     }
 
     unsafe fn getParamNormalized(&self, id: u32) -> f64 {
-        let (Some(def), Ok(p)) = (Self::param_by_id(id), self.shared.processor.lock()) else {
-            return 0.0;
-        };
-        to_normalized(def, p.get_param(id))
+        ffi_guard(|| self.get_param_normalized_inner(id), 0.0)
     }
 
     unsafe fn setParamNormalized(&self, id: u32, value: f64) -> tresult {
-        let Some(def) = Self::param_by_id(id) else {
-            return kInvalidArgument;
-        };
-        match self.shared.processor.lock() {
-            Ok(mut p) => {
-                p.set_param(id, from_normalized(def, value));
-                kResultOk
-            }
-            Err(_) => kResultFalse,
-        }
+        ffi_guard(|| self.set_param_normalized_inner(id, value), kResultFalse)
     }
 
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
@@ -782,11 +946,12 @@ impl<P: Processor + Default> IEditControllerTrait for Vst3Plugin<P> {
 
     unsafe fn createView(&self, name: *const c_char) -> *mut IPlugView {
         // Hosts ask for named views; only the editor exists, and a plugin
-        // without editor HTML has none at all.
+        // without editor HTML has none at all. The spec defines exactly one
+        // view name, "editor" — a null or foreign name gets nothing.
         if P::editor_html().is_none() || !EDITOR_SUPPORTED {
             return std::ptr::null_mut();
         }
-        if !name.is_null() && CStr::from_ptr(name) != CStr::from_ptr(ViewType::kEditor) {
+        if name.is_null() || CStr::from_ptr(name) != CStr::from_ptr(ViewType::kEditor) {
             return std::ptr::null_mut();
         }
         let view = Vst3PlugView::<P> {

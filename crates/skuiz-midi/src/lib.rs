@@ -12,6 +12,7 @@
 //! point: both need a wider event than the 3 bytes [`skuiz_core::MidiOut`]
 //! carries, so they land together with a wider event type.
 
+#![warn(missing_docs)]
 use skuiz_core::ParamDef;
 
 /// Channel argument for the message constructors: 0-15 on the wire,
@@ -28,6 +29,10 @@ fn data(v: u8) -> u8 {
     v.min(127)
 }
 
+// Out-of-range channels wrap here but clamp in `channel_of` — deliberate:
+// the constructors take a raw u8 from DSP code, where a bad channel is a
+// bug and the mask just keeps the status byte legal, while `channel_of`
+// reads a user-automatable value, where clamping is the kinder behaviour.
 fn status(kind: u8, channel: u8) -> u8 {
     kind | (channel & MAX_CHANNEL)
 }
@@ -38,10 +43,12 @@ pub fn note_on(channel: u8, key: u8, velocity: u8) -> [u8; 3] {
     [status(NOTE_ON, channel), data(key), data(velocity)]
 }
 
+/// Note off. `velocity` is release velocity, which most hosts ignore.
 pub fn note_off(channel: u8, key: u8, velocity: u8) -> [u8; 3] {
     [status(NOTE_OFF, channel), data(key), data(velocity)]
 }
 
+/// Control change (CC). `controller` is the CC number, e.g. 7 for volume.
 pub fn control_change(channel: u8, controller: u8, value: u8) -> [u8; 3] {
     [
         status(CONTROL_CHANGE, channel),
@@ -78,7 +85,8 @@ pub const fn channel_param(id: u32) -> ParamDef {
     }
 }
 
-/// Read a choice parameter back as a channel index, clamped to 0-15.
+/// Read a choice parameter back as a channel index, clamped to 0-15
+/// (unlike the message constructors, which wrap — see `status`).
 pub fn channel_of(value: f64) -> u8 {
     (value.round().clamp(0.0, MAX_CHANNEL as f64)) as u8
 }

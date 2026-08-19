@@ -83,6 +83,7 @@ extern "C" {
     fn skuiz_auv3_init(app_group_dir: *const std::ffi::c_char) -> *mut c_void;
     fn skuiz_auv3_destroy(inst: *mut c_void);
     fn skuiz_auv3_activate(inst: *mut c_void, sample_rate: f64, max_frames: u32);
+    fn skuiz_auv3_deactivate(inst: *mut c_void);
     fn skuiz_auv3_render(
         inst: *mut c_void,
         channels: *const *mut f32,
@@ -158,6 +159,7 @@ fn renders_audio_and_reports_midi() {
             bytes.as_mut_ptr()
         ));
 
+        skuiz_auv3_deactivate(inst);
         skuiz_auv3_destroy(inst);
         let _ = std::fs::remove_dir_all(&dir);
     }
