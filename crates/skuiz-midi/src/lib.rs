@@ -109,6 +109,7 @@ pub const fn channel_param(id: u32) -> ParamDef {
         max: 15.0,
         default: 0.0,
         choices: CHANNEL_LABELS,
+        shared: true,
     }
 }
 

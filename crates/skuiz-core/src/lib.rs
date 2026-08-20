@@ -4,6 +4,12 @@
 //! (skuiz-clap, skuiz-vst3, ...) translate host callbacks into calls on it.
 
 #![warn(missing_docs)]
+
+pub mod diag;
+pub mod engine;
+pub mod lww;
+pub mod rt;
+
 /// Static metadata identifying a plugin to hosts.
 pub struct PluginInfo {
     /// Reverse-DNS unique id, e.g. `"com.example.shared-gain"`.
@@ -27,9 +33,9 @@ pub struct PluginInfo {
 ///
 /// A parameter with a non-empty `choices` list is a discrete config item:
 /// hosts show it as a stepped enum and Skuiz editors render it as a
-/// dropdown. This is the mechanism behind PLAN.md's configuration menu —
-/// output interface, bit depth, tuning and so on are all just choice
-/// parameters, so they automate, save, and sync over IPC like anything else.
+/// dropdown. Configuration menus — output interface, bit depth, tuning and
+/// so on — are all just choice parameters, so they automate, save, and sync
+/// over IPC like anything else.
 pub struct ParamDef {
     /// Stable id, also the key in saved state and IPC messages. Like
     /// [`PluginInfo::id`], changing it breaks saved projects.
@@ -46,6 +52,12 @@ pub struct ParamDef {
     pub default: f64,
     /// Labels for a discrete parameter, or `&[]` for a continuous one.
     pub choices: &'static [&'static str],
+    /// Whether this parameter participates in instance sync: editor moves
+    /// on a shared parameter broadcast to every other instance (and the
+    /// standalone) on the bus; local parameters never leave the instance,
+    /// and incoming bus frames for them are ignored. Host automation and
+    /// state loads never cross the bus either way (invariant 10).
+    pub shared: bool,
 }
 
 impl ParamDef {
@@ -140,11 +152,13 @@ impl MidiEvent {
 /// MIDI emitted during one processing block, with the frame offset each
 /// event lands on. Events are UMP words (see [`MidiEvent`]): MIDI 1.0 and
 /// MIDI 2.0 both fit. Adapters drain this into the host's event output.
-/// Fixed capacity: [`MidiOut::push`] never allocates, and silently drops
-/// events once full — a full buffer means the DSP is emitting thousands of
-/// events per block, which is a bug in the DSP, not here.
+/// Fixed capacity: [`MidiOut::push`] never allocates and returns `false`
+/// once full (invariant 8 — the adapter bumps a diag counter, so the drop
+/// is counted, not silent).
 pub struct MidiOut {
     events: Vec<(u32, MidiEvent)>,
+    /// Events refused because the buffer was full since the last `clear`.
+    dropped: usize,
 }
 
 impl MidiOut {
@@ -152,14 +166,26 @@ impl MidiOut {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             events: Vec::with_capacity(capacity),
+            dropped: 0,
         }
     }
 
     /// Queue `event` at `frame` within the current block. Realtime-safe.
-    pub fn push(&mut self, frame: u32, event: MidiEvent) {
+    /// Returns `false` when full — the event was not queued.
+    pub fn push(&mut self, frame: u32, event: MidiEvent) -> bool {
         if self.events.len() < self.events.capacity() {
             self.events.push((frame, event));
+            true
+        } else {
+            self.dropped += 1;
+            false
         }
+    }
+
+    /// Events dropped for lack of capacity since the last [`MidiOut::clear`].
+    /// Adapters report this through the diag counters (invariant 8).
+    pub fn dropped(&self) -> usize {
+        self.dropped
     }
 
     /// Every queued event as `(frame_offset, event)`, in push order.
@@ -172,6 +198,7 @@ impl MidiOut {
     /// before each block, which is why `process` receives it already empty.
     pub fn clear(&mut self) {
         self.events.clear();
+        self.dropped = 0;
     }
 }
 
@@ -181,9 +208,97 @@ impl MidiOut {
 /// three private copies of the same parser is three chances for them to
 /// drift apart.
 pub mod protocol {
+    /// A frame version: `(lamport sequence, origin id)` — see
+    /// [`crate::lww`].
+    pub type ParamVersion = (u64, u64);
+
     /// Render a parameter change: `"set_param <id> <value>"`.
     pub fn set_param(id: u32, value: f64) -> String {
         format!("set_param {id} {value}")
+    }
+
+    /// Render a versioned parameter change for the bus:
+    /// `"set_param <id> <value> <seq> <origin>"`. The version is a lamport
+    /// clock plus origin id — see [`crate::lww`]. Editors use the plain
+    /// 3-token form (they have no versions); the bus uses this one.
+    pub fn set_param_versioned(id: u32, value: f64, seq: u64, origin: u64) -> String {
+        format!("set_param {id} {value} {seq} {origin}")
+    }
+
+    /// A late joiner's request for current shared state:
+    /// `"sync_request <origin>"`. Every instance that hears it answers with
+    /// the shared parameters it holds a version for (i.e. ones actually
+    /// edited over the bus); last-writer-wins makes duplicate answers safe.
+    pub fn sync_request(origin: u64) -> String {
+        format!("sync_request {origin}")
+    }
+
+    /// A full shared-state answer: `"sync_state <id> <value> <seq>
+    /// <origin> ..."` — one quadruple per shared parameter. Frames are
+    /// capped at 1 MiB by the transport; a plugin with enough shared
+    /// parameters to exceed that has other problems.
+    pub fn sync_state(entries: &[(u32, f64, u64, u64)]) -> String {
+        let mut out = String::from("sync_state");
+        for (id, value, seq, origin) in entries {
+            out.push_str(&format!(" {id} {value} {seq} {origin}"));
+        }
+        out
+    }
+
+    /// Parse a bus `set_param` frame, versioned or legacy. The version is
+    /// `None` for the plain 3-token form editors and old peers speak.
+    pub fn parse_set_param_versioned(msg: &str) -> Option<(u32, f64, Option<ParamVersion>)> {
+        let mut it = msg.split_whitespace();
+        if it.next() != Some("set_param") {
+            return None;
+        }
+        let id = it.next()?.parse().ok()?;
+        let value = it.next()?.parse().ok()?;
+        let version = match (it.next(), it.next()) {
+            (None, _) => None,
+            (Some(seq), Some(origin)) => Some((seq.parse().ok()?, origin.parse().ok()?)),
+            (Some(_), None) => return None,
+        };
+        if it.next().is_some() {
+            return None;
+        }
+        Some((id, value, version))
+    }
+
+    /// Parse a [`sync_request`] frame.
+    pub fn parse_sync_request(msg: &str) -> Option<u64> {
+        let mut it = msg.split_whitespace();
+        if it.next() != Some("sync_request") {
+            return None;
+        }
+        let origin = it.next()?.parse().ok()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some(origin)
+    }
+
+    /// Parse a [`sync_state`] frame into its `(id, value, seq, origin)`
+    /// quadruples.
+    pub fn parse_sync_state(msg: &str) -> Option<Vec<(u32, f64, u64, u64)>> {
+        let mut it = msg.split_whitespace();
+        if it.next() != Some("sync_state") {
+            return None;
+        }
+        let mut out = Vec::new();
+        loop {
+            match (it.next(), it.next(), it.next(), it.next()) {
+                (None, _, _, _) => break,
+                (Some(id), Some(value), Some(seq), Some(origin)) => out.push((
+                    id.parse().ok()?,
+                    value.parse().ok()?,
+                    seq.parse().ok()?,
+                    origin.parse().ok()?,
+                )),
+                _ => return None,
+            }
+        }
+        Some(out)
     }
 
     /// The JavaScript call editors receive for a parameter value; pages
@@ -192,18 +307,35 @@ pub mod protocol {
         format!("window.skuizOnParam && window.skuizOnParam({id}, {value})")
     }
 
+    /// The page → plugin diagnostics query: the page posts this exact
+    /// string and the plugin answers with [`on_diag_js`]. Typed beyond
+    /// `set_param` — the editor protocol's second message kind.
+    pub const DIAG_QUERY: &str = "skuiz_diag";
+
+    /// The JavaScript call answering a [`DIAG_QUERY`]; pages implement
+    /// `window.skuizOnDiag(counters)` to receive it. `counters` is a plain
+    /// object mapping counter name to value — see
+    /// [`crate::diag::DiagCounters::snapshot`].
+    pub fn on_diag_js(diag: &crate::diag::DiagCounters) -> String {
+        let mut out = String::from("window.skuizOnDiag && window.skuizOnDiag({");
+        for (i, (name, value)) in diag.snapshot().into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("{name}:{value}"));
+        }
+        out.push_str("})");
+        out
+    }
+
     /// Parse a message produced by [`set_param`]. Anything else is `None`.
     pub fn parse_set_param(msg: &str) -> Option<(u32, f64)> {
-        let mut it = msg.split_whitespace();
-        if it.next() != Some("set_param") {
+        let (id, value, version) = parse_set_param_versioned(msg)?;
+        // The editor-facing form carries no version tail.
+        if version.is_some() {
             return None;
         }
-        let parsed = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
-        // Trailing junk means this is not our message.
-        if it.next().is_some() {
-            return None;
-        }
-        Some(parsed)
+        Some((id, value))
     }
 
     #[cfg(test)]
@@ -222,28 +354,72 @@ pub mod protocol {
             assert_eq!(parse_set_param("set_param x 0.5"), None);
             assert_eq!(parse_set_param(""), None);
         }
+
+        #[test]
+        fn versioned_frames_round_trip() {
+            let msg = set_param_versioned(3, 0.25, 41, 9);
+            assert_eq!(
+                parse_set_param_versioned(&msg),
+                Some((3, 0.25, Some((41, 9))))
+            );
+            // The legacy 3-token form parses with no version.
+            assert_eq!(
+                parse_set_param_versioned("set_param 3 0.25"),
+                Some((3, 0.25, None))
+            );
+            // Editors reject the versioned form, and vice versa.
+            assert_eq!(parse_set_param(&msg), None);
+            assert_eq!(parse_set_param_versioned("set_param 3 0.25 41"), None);
+            assert_eq!(parse_set_param_versioned("set_param 3 0.25 41 9 0"), None);
+        }
+
+        #[test]
+        fn sync_frames_round_trip() {
+            assert_eq!(parse_sync_request(&sync_request(77)), Some(77));
+            assert_eq!(parse_sync_request("sync_request"), None);
+
+            let entries = [(1, 0.5, 3, 10), (2, 1.0, 4, 11)];
+            assert_eq!(
+                parse_sync_state(&sync_state(&entries)),
+                Some(entries.to_vec())
+            );
+            assert_eq!(parse_sync_state("sync_state 1 0.5 3"), None);
+            assert_eq!(parse_sync_state(&sync_state(&[])), Some(vec![]));
+        }
+
+        #[test]
+        fn diag_query_answers_with_a_guarded_js_object() {
+            let diag = crate::diag::DiagCounters::default();
+            crate::diag::DiagCounters::bump(&diag.midi_events_dropped);
+            let js = on_diag_js(&diag);
+            assert!(js.starts_with("window.skuizOnDiag && window.skuizOnDiag({"));
+            assert!(js.contains("midi_events_dropped:1"));
+            assert!(js.contains("commands_dropped:0"));
+            assert!(js.ends_with("})"));
+            // The query itself must not parse as a parameter change.
+            assert_eq!(parse_set_param(DIAG_QUERY), None);
+            assert_eq!(parse_set_param_versioned(DIAG_QUERY), None);
+        }
     }
 }
 
-/// Snapshot every parameter value under one short lock.
-///
-/// Adapters use this before pushing values into an editor: the audio thread
-/// contends on the same mutex, so the lock must never be held across a
-/// webview call of unbounded cost. A poisoned lock is recovered rather than
-/// propagated — a panic elsewhere must not cascade into an abort at a
-/// plugin's FFI boundary.
-pub fn snapshot_params<P: Processor>(processor: &std::sync::Mutex<P>) -> Vec<(u32, f64)> {
-    let p = processor.lock().unwrap_or_else(|e| e.into_inner());
-    P::params()
-        .iter()
-        .map(|def| (def.id, p.get_param(def.id)))
-        .collect()
+/// Whether `id` names a shared parameter of `P`: one whose editor moves
+/// sync across instances over the bus (see [`ParamDef::shared`]). Adapters
+/// filter both broadcast and receive through this, so local parameters
+/// never leave the instance and bus frames for them are ignored.
+pub fn syncs_over_bus<P: Processor>(id: u32) -> bool {
+    P::params().iter().any(|p| p.id == id && p.shared)
 }
 
 /// The one trait a Skuiz plugin implements.
 ///
-/// Methods are called from the host's threads per the plugin format's
-/// threading rules; `process` is realtime — no allocation or blocking there.
+/// The engine ([`crate::engine`]) owns every instance and enforces the
+/// threading contract: while blocks flow, the **audio thread** has exclusive
+/// access to the processor; while stopped, the **main thread** does. Hosts,
+/// editors and the IPC bus never call into the processor directly while
+/// running — parameter changes travel the engine's realtime-safe command
+/// queue, and reads are answered by its parameter mirror. See
+/// `docs/concepts/invariants.md` for the rules this rests on.
 pub trait Processor: Send + 'static {
     /// Static identity and metadata. See [`PluginInfo`].
     ///
@@ -271,17 +447,29 @@ pub trait Processor: Send + 'static {
     /// Release anything [`Processor::activate`] set up. **Main thread.**
     fn deactivate(&mut self) {}
 
+    /// Reset DSP state — delay lines, envelopes, filter memory, LFO phases —
+    /// without touching parameter values. Hosts call this when the transport
+    /// jumps or a unit is recycled, so after `reset` the plugin must sound
+    /// as if freshly [`Processor::activate`]d with the current parameters.
+    ///
+    /// Called on the **audio thread** between blocks while running, on the
+    /// **main thread** when stopped; same realtime rules as
+    /// [`Processor::set_param`]. Default: no state, nothing to do.
+    fn reset(&mut self) {}
+
     /// Apply a parameter change.
     ///
-    /// Called from the **audio thread** (host automation, and values
-    /// arriving from other instances) *and* the **main thread** (the editor,
-    /// state loading), so keep it to arithmetic and assignment: no
-    /// allocation, no locking, no I/O. Clamp the value — hosts are not
-    /// obliged to respect your declared range.
+    /// Called on the **audio thread** while blocks flow (host automation,
+    /// plus editor and bus changes replayed from the engine's command
+    /// queue) and on the **main thread** when the transport is stopped.
+    /// Either way, keep it to arithmetic and assignment: no allocation, no
+    /// locking, no I/O. Clamp the value — hosts are not obliged to respect
+    /// your declared range.
     fn set_param(&mut self, id: u32, value: f64);
 
-    /// Read a parameter back. Called from **any thread**; same rules as
-    /// [`Processor::set_param`].
+    /// Read a parameter back. Same threading as [`Processor::set_param`].
+    /// While blocks flow, hosts and editors do **not** call this — they read
+    /// the engine's parameter mirror instead.
     fn get_param(&self, id: u32) -> f64;
 
     /// Process one block of audio, in place.
@@ -304,11 +492,13 @@ pub trait Processor: Send + 'static {
     ///
     /// Default 0. Adapters report it to the host through the format's
     /// latency mechanism, so the DAW can delay-compensate other tracks.
-    /// The value must be constant across the plugin's lifetime: adapters
-    /// answer the host's query but never push change notifications, so a
-    /// latency that only materialises in [`Processor::activate`] must still
-    /// be reported from the start. Called on the **main thread**; keep it
-    /// cheap.
+    ///
+    /// It **may change at runtime**: the engine re-reads it once per block
+    /// and, on change, updates the reported value and notifies the host
+    /// (CLAP `clap_host_latency.changed`, VST3 `kLatencyChanged`; AUv3 and
+    /// the standalone shell report no change notification). Because of that
+    /// poll it is also called on the **audio thread** — keep it
+    /// realtime-safe: no allocation, no locking, just read a field.
     fn latency(&self) -> u32 {
         0
     }
@@ -339,12 +529,25 @@ pub trait Processor: Send + 'static {
         (400, 300)
     }
 
-    /// Serialize state for the DAW project. Default: all param values.
+    /// Serialize state for the DAW project. Default: a versioned header
+    /// followed by all param values.
+    ///
+    /// The default format is `b"SKZ1"` followed by `(id: u32 LE, value:
+    /// f64 LE)` pairs. The magic's last byte is the format version: if the
+    /// default format ever changes, the version bumps and older versions
+    /// stay loadable. **If you override `save_state`, version your own
+    /// format the same way** — hosts keep project files for years.
+    ///
+    /// Called on the **main thread** when stopped; while running, the engine
+    /// routes it onto the audio thread between blocks. Allocation is
+    /// explicitly allowed here — the one exception to the audio-thread
+    /// rules (invariant 3).
     fn save_state(&self) -> Vec<u8>
     where
         Self: Sized,
     {
-        let mut out = Vec::with_capacity(Self::params().len() * 12);
+        let mut out = Vec::with_capacity(STATE_MAGIC.len() + Self::params().len() * 12);
+        out.extend_from_slice(STATE_MAGIC);
         for p in Self::params() {
             out.extend_from_slice(&p.id.to_le_bytes());
             out.extend_from_slice(&self.get_param(p.id).to_le_bytes());
@@ -355,10 +558,20 @@ pub trait Processor: Send + 'static {
     /// Restore state saved by [`Processor::save_state`]. Returns false if the
     /// data is not in the expected format; unknown param ids are skipped so
     /// states from other plugin versions still load.
+    ///
+    /// The default loader accepts both the versioned format and the legacy
+    /// pre-versioning raw `(id, value)` pairs, so projects saved by older
+    /// builds keep loading. (One collision: a legacy buffer is mistaken for
+    /// a versioned one if the first saved param id is `0x315A4B53` —
+    /// `"SKZ1"` little-endian. Don't use that id.)
+    ///
+    /// Same threading as [`Processor::save_state`]; the same allocation
+    /// exception applies.
     fn load_state(&mut self, data: &[u8]) -> bool
     where
         Self: Sized,
     {
+        let data = data.strip_prefix(STATE_MAGIC).unwrap_or(data);
         if data.is_empty() || !data.len().is_multiple_of(12) {
             return false;
         }
@@ -372,6 +585,10 @@ pub trait Processor: Send + 'static {
         true
     }
 }
+
+/// Magic header of the default state format; the last byte is the format
+/// version. See [`Processor::save_state`].
+pub const STATE_MAGIC: &[u8; 4] = b"SKZ1";
 
 #[cfg(test)]
 mod tests {
@@ -396,6 +613,7 @@ mod tests {
                 max: 1.0,
                 default: 0.5,
                 choices: &[],
+                shared: true,
             }]
         }
         fn set_param(&mut self, _id: u32, v: f64) {
@@ -411,6 +629,7 @@ mod tests {
     fn state_roundtrip() {
         let a = Gain(0.25);
         let saved = a.save_state();
+        assert!(saved.starts_with(STATE_MAGIC), "state must be versioned");
         let mut b = Gain(0.9);
         b.load_state(&saved);
         assert_eq!(b.get_param(7), 0.25);
@@ -425,6 +644,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_unversioned_state_still_loads() {
+        // The pre-versioning format: bare (id, value) pairs, no header.
+        let mut legacy = 7u32.to_le_bytes().to_vec();
+        legacy.extend_from_slice(&0.25f64.to_le_bytes());
+        let mut p = Gain(0.9);
+        assert!(p.load_state(&legacy));
+        assert_eq!(p.get_param(7), 0.25);
+    }
+
+    #[test]
     fn choice_param_range_and_labels() {
         let cont = ParamDef {
             id: 0,
@@ -433,6 +662,7 @@ mod tests {
             max: 6.0,
             default: 0.0,
             choices: &[],
+            shared: true,
         };
         assert_eq!((cont.low(), cont.high()), (-6.0, 6.0));
         assert_eq!(cont.label(0.0), None);
@@ -445,6 +675,7 @@ mod tests {
             max: 99.0,
             default: 0.0,
             choices: &["A", "B", "C"],
+            shared: true,
         };
         assert_eq!((modes.low(), modes.high()), (0.0, 2.0));
         assert_eq!(modes.label(0.0), Some("A"));

@@ -70,6 +70,13 @@ use std::time::Duration;
 
 const MAX_FRAME: u32 = 1 << 20;
 
+/// Synthetic frame the bus delivers to local instances every time this
+/// process (re)connects to the server process. Adapters answer it with a
+/// `sync_request`, which heals any frames dropped while the cross-process
+/// link was down (see `Group::send_remote`). Never travels the socket;
+/// it is generated locally on link-up.
+pub const LINK_UP_FRAME: &[u8] = b"\0skuiz:link-up";
+
 type Callback = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Process-wide table of live groups, so instances sharing a scope find each
@@ -215,6 +222,32 @@ impl Bus {
     pub fn is_server(&self) -> bool {
         self.group.owns_lock.load(Ordering::Acquire) && self.group.owner_id() == Some(self.id)
     }
+
+    /// A sender that outlives this `Bus` handle, for callbacks that must
+    /// answer a frame after `join` has returned (e.g. replying to a
+    /// `sync_request`). Sending after the owning instance dropped is a safe
+    /// no-op locally — the member is gone — and still reaches other
+    /// instances, whose version filters discard anything stale.
+    pub fn sender(&self) -> BusSender {
+        BusSender {
+            group: Arc::clone(&self.group),
+            id: self.id,
+        }
+    }
+}
+
+/// See [`Bus::sender`].
+pub struct BusSender {
+    group: Arc<Group>,
+    id: u64,
+}
+
+impl BusSender {
+    /// Deliver `msg` to every other instance, exactly as [`Bus::send`] would.
+    pub fn send(&self, msg: &[u8]) {
+        self.group.deliver_locally(msg, Some(self.id));
+        self.group.send_remote(msg);
+    }
 }
 
 impl Drop for Bus {
@@ -310,8 +343,9 @@ impl Group {
         }
         let mut tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
         let Some(conn) = tx.as_mut() else {
-            // ponytail: frames sent during an election window (no link yet)
-            // are dropped; queue them if that gap ever matters.
+            // Frames sent during an election window (no link yet) are
+            // dropped. Adapters heal the gap: when the link comes up the
+            // bus delivers LINK_UP_FRAME locally and they re-sync.
             return;
         };
         if write_frame(conn, msg).is_err() {
@@ -407,8 +441,8 @@ fn serve_conn(group: &Group, conn_id: u64, mut recv: transport::Conn) {
         // and every *other* process too.
         group.deliver_locally(&frame, None);
         group.broadcast_except(Some(conn_id), &frame);
-        // ponytail: frames are relayed verbatim; the map/reduce hook from
-        // PLAN.md slots in here when an example needs aggregation.
+        // ponytail: frames are relayed verbatim; a map/reduce hook could
+        // slot in here if an example ever needs aggregation.
     }
     let mut clients = group.clients.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(pos) = clients.iter().position(|(id, _)| *id == conn_id) {
@@ -422,6 +456,9 @@ fn run_client(group: &Group, stream: transport::Conn) {
         return;
     };
     *group.tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(stream);
+    // The cross-process link is (back) up: tell local instances so they can
+    // re-sync state that diverged while it was down.
+    group.deliver_locally(LINK_UP_FRAME, None);
     while let Ok(frame) = read_frame(&mut recv) {
         if group.shutdown.load(Ordering::Acquire) {
             break;
