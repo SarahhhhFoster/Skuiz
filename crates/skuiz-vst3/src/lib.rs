@@ -50,7 +50,8 @@ const EDITOR_SUPPORTED: bool = cfg!(any(
 ));
 
 /// The VST3 platform type matching this platform's `ParentView` constructor.
-fn native_platform_type() -> FIDString {
+#[doc(hidden)] // public for the roundtrip tests, not part of the API surface
+pub fn native_platform_type() -> FIDString {
     #[cfg(target_os = "windows")]
     {
         kPlatformTypeHWND
@@ -437,9 +438,11 @@ impl<P: Processor> Vst3Plugin<P> {
                     event.r#type = Event_::EventTypes_::kLegacyMIDICCOutEvent as u16;
                     event.__field0.midiCCOut = LegacyMIDICCOutEvent {
                         controlNumber: control_number,
-                        channel: channel as i8,
-                        value: value as i8,
-                        value2: value2 as i8,
+                        // int8 is `c_char` in the bindings: signedness varies
+                        // by target, so cast through the alias, not i8/u8.
+                        channel: channel as std::ffi::c_char,
+                        value: value as std::ffi::c_char,
+                        value2: value2 as std::ffi::c_char,
                     };
                 }
                 _ => continue,

@@ -629,12 +629,17 @@ fn offers_an_editor_view_with_the_right_size() {
         );
         let view = ComPtr::<IPlugView>::from_raw(view).unwrap();
 
-        // NSView is the platform we support; nonsense must be refused.
+        // The native platform type for this OS must be supported; a foreign
+        // one must be refused. Which is which depends on the OS.
         assert_eq!(
-            view.isPlatformTypeSupported(kPlatformTypeNSView),
+            view.isPlatformTypeSupported(skuiz_vst3::native_platform_type()),
             kResultTrue
         );
-        assert_ne!(view.isPlatformTypeSupported(kPlatformTypeHWND), kResultTrue);
+        #[cfg(not(target_os = "windows"))]
+        let foreign = kPlatformTypeHWND;
+        #[cfg(target_os = "windows")]
+        let foreign = kPlatformTypeNSView;
+        assert_ne!(view.isPlatformTypeSupported(foreign), kResultTrue);
 
         let mut rect = ViewRect {
             left: 0,
@@ -657,10 +662,7 @@ fn offers_an_editor_view_with_the_right_size() {
         assert_eq!((wrong.right, wrong.bottom), (321, 123));
 
         // Attaching to a bogus platform type must fail rather than crash.
-        assert_ne!(
-            view.attached(std::ptr::null_mut(), kPlatformTypeHWND),
-            kResultOk
-        );
+        assert_ne!(view.attached(std::ptr::null_mut(), foreign), kResultOk);
         // removed() before a successful attach must be harmless.
         assert_eq!(view.removed(), kResultOk);
 
