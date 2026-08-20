@@ -1,4 +1,4 @@
-//! pd-tremolo: the embedded-Pure-Data example from PLAN.md.
+//! pd-tremolo: a stereo tremolo whose DSP is an embedded Pure Data patch.
 //!
 //! The DSP is a Pd patch (`src/tremolo.pd`) running inside the plugin via
 //! `PdEngine`: a stereo tremolo whose gain law is
@@ -66,6 +66,7 @@ impl Processor for PdTremolo {
                 max: 10.0,
                 default: 5.0,
                 choices: &[],
+                shared: true,
             },
             ParamDef {
                 id: P_DEPTH,
@@ -74,6 +75,7 @@ impl Processor for PdTremolo {
                 max: 1.0,
                 default: 1.0,
                 choices: &[],
+                shared: true,
             },
         ];
         PARAMS

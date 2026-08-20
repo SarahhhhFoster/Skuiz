@@ -1,7 +1,7 @@
 //! shared-gain: the Skuiz example plugin.
 //!
-//! Phase 1: a plain stereo gain. Later phases add the webview UI and the
-//! IPC-shared parameter this example exists to demonstrate.
+//! A plain stereo gain, plus the webview UI and the IPC-shared parameter
+//! this example exists to demonstrate.
 
 use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
 
@@ -36,6 +36,7 @@ impl Processor for SharedGain {
             max: 1.0,
             default: 1.0,
             choices: &[],
+            shared: true,
         }]
     }
 
