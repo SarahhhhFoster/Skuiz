@@ -8,7 +8,8 @@
 //!
 //! # On Tauri
 //!
-//! PLAN.md named Tauri for this shell. What is used here is **tao + wry**:
+//! The obvious framework for this shell is Tauri. What is used here is
+//! **tao + wry**:
 //! Tauri's own window and webview layers, without the surrounding app
 //! framework. The reason is code sharing, not dislike of Tauri. `skuiz-ui`
 //! already drives wry to embed the editor in a plugin window, so building
@@ -29,8 +30,9 @@
 
 #![warn(missing_docs)]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use skuiz_core::engine::Engine;
 use skuiz_core::{MidiOut, Processor};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::run_return::EventLoopExtRunReturn;
@@ -131,14 +133,17 @@ impl Scratch {
 /// Fill `scratch` with this pass's input and run the processor over it.
 ///
 /// Split out from the stream callback so it can be tested without an audio
-/// device: it is where interleaving, the tone and the processor meet.
+/// device: it is where interleaving, the tone and the processor meet. The
+/// caller owns the processor for the duration — the stream callback gets it
+/// from the engine's audio side (invariant 1), so this function never
+/// locks anything.
 ///
 /// `channel_count` is the *device* channel count, used to deinterleave
 /// `out`; `scratch` holds the *processor* channel count, clamped to stereo.
 /// The two differ on devices with more than two outputs — the stream
 /// callback duplicates the last produced channel over the extras.
 fn render_pass<P: Processor>(
-    processor: &Mutex<P>,
+    processor: &mut P,
     midi: &mut MidiOut,
     scratch: &mut Scratch,
     out: &mut [f32],
@@ -162,13 +167,7 @@ fn render_pass<P: Processor>(
         for (view, chan) in views.iter_mut().zip(scratch.channels.iter_mut()) {
             *view = &mut chan[..frames];
         }
-        // A poisoned lock is recovered, not skipped: a panic on another
-        // thread must not silence the audio thread or drop edits. Same
-        // policy as `skuiz_core::snapshot_params`.
-        processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .process(&mut views[..used], midi);
+        processor.process(&mut views[..used], midi);
     }
 
     for frame in 0..frames {
@@ -185,12 +184,15 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
 
     // --- shared state -----------------------------------------------------
 
-    let processor = Arc::new(Mutex::new(P::default()));
+    // The engine owns the processor. The audio callback claims the audio
+    // state around each block; the UI thread and the bus reach the
+    // processor only through the engine's realtime-safe paths — no mutex
+    // ever crosses onto the audio thread (invariants 1-2).
+    let engine = Engine::<P>::new(512);
+    // Stopped, so these apply directly and publish the readback to the
+    // mirror (a processor may transform its defaults).
     for def in P::params() {
-        processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_param(def.id, def.default);
+        engine.set_param(def.id, def.default);
     }
 
     // --- window and event loop -------------------------------------------
@@ -208,15 +210,72 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     // The callback runs on a bus thread (or another instance's thread), so it
     // only hands the value to the UI thread rather than touching state here.
     let proxy = event_loop.create_proxy();
+    // Last-writer-wins versions for shared parameters (invariant 9); bus
+    // and UI threads only.
+    let lww = Arc::new(skuiz_core::lww::Lww::new());
+    let lww_cb = Arc::clone(&lww);
+    let bus_engine = Arc::clone(&engine);
+    let sender_slot: Arc<std::sync::Mutex<Option<skuiz_ipc::BusSender>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let cb_sender = Arc::clone(&sender_slot);
     let bus = Arc::new(skuiz_ipc::Bus::join(info.id, move |frame| {
+        use skuiz_core::protocol as proto;
+        if frame == skuiz_ipc::LINK_UP_FRAME {
+            // Link (back) up: re-sync so frames dropped while the
+            // cross-process link was down heal (invariant 9).
+            if let Some(sender) = cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                sender.send(proto::sync_request(lww_cb.origin()).as_bytes());
+            }
+            return;
+        }
         let Ok(msg) = std::str::from_utf8(frame) else {
             return;
         };
-        let Some((id, value)) = skuiz_core::protocol::parse_set_param(msg) else {
+        if let Some((id, value, version)) = proto::parse_set_param_versioned(msg) {
+            // Local parameters never sync: frames naming them are dropped
+            // here rather than posted (invariant 10). Stale versions lose.
+            if !skuiz_core::syncs_over_bus::<P>(id) || !lww_cb.accept(id, version) {
+                return;
+            }
+            let _ = proxy.send_event(UserEvent::RemoteParam(id, value));
             return;
-        };
-        let _ = proxy.send_event(UserEvent::RemoteParam(id, value));
+        }
+        if proto::parse_sync_request(msg).is_some() {
+            // A late joiner asked for shared state; answer from the mirror
+            // (wait-free, invariant 6) with the parameters we hold a version
+            // for — ones actually edited over the bus. Never-edited
+            // parameters are omitted: their value may be host automation,
+            // which is per-instance (invariant 10). LWW makes duplicate
+            // answers safe.
+            let entries: Vec<(u32, f64, u64, u64)> = bus_engine
+                .mirror()
+                .snapshot()
+                .into_iter()
+                .filter(|(id, _)| skuiz_core::syncs_over_bus::<P>(*id))
+                .filter_map(|(id, value)| {
+                    lww_cb
+                        .known_version(id)
+                        .map(|(seq, origin)| (id, value, seq, origin))
+                })
+                .collect();
+            if !entries.is_empty() {
+                if let Some(sender) = cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    sender.send(proto::sync_state(&entries).as_bytes());
+                }
+            }
+            return;
+        }
+        if let Some(entries) = proto::parse_sync_state(msg) {
+            for (id, value, seq, origin) in entries {
+                if skuiz_core::syncs_over_bus::<P>(id) && lww_cb.accept(id, Some((seq, origin))) {
+                    let _ = proxy.send_event(UserEvent::RemoteParam(id, value));
+                }
+            }
+        }
     }));
+    *sender_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus.sender());
+    // Late joiner: ask the bus for current shared state.
+    bus.send(skuiz_core::protocol::sync_request(lww.origin()).as_bytes());
 
     // --- audio ------------------------------------------------------------
 
@@ -231,15 +290,13 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     // fed from the last one we produce.
     let channel_count = device_channels.clamp(1, 2);
 
-    processor
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .activate(sample_rate, SCRATCH_FRAMES as u32);
+    let _ = engine.with_main(|core| {
+        core.processor.activate(sample_rate, SCRATCH_FRAMES as u32);
+    });
 
     let stream = {
-        let processor = Arc::clone(&processor);
+        let engine = Arc::clone(&engine);
         let mut scratch = Scratch::new(channel_count);
-        let mut midi = MidiOut::with_capacity(512);
         let mut tone = Tone::new(input, sample_rate as f32);
         let config: cpal::StreamConfig = supported.into();
 
@@ -247,18 +304,25 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
             .build_output_stream(
                 config,
                 move |data: &mut [f32], _| {
-                    // ponytail: generated MIDI is drained and dropped; the
-                    // standalone has no MIDI destination until a virtual
-                    // port (midir) is wired up.
-                    midi.clear();
+                    // Claim the audio side for the duration of the callback
+                    // (tolerates a backend that starts calling before play()
+                    // returns), drain anything the UI or the bus queued, then
+                    // process. MIDI scratch lives in the core.
+                    if !engine.is_processing() {
+                        engine.begin_audio();
+                    }
+                    let core = engine.audio_core();
+                    let report = engine.drain_commands(core);
+                    let _ = report; // no host to notify in a standalone shell
+                    core.midi_out.clear();
 
                     // Process in scratch-sized passes so no buffer size can
                     // force an allocation on the audio thread.
                     let max_chunk = SCRATCH_FRAMES * device_channels;
                     for chunk in data.chunks_mut(max_chunk) {
                         render_pass(
-                            &processor,
-                            &mut midi,
+                            &mut core.processor,
+                            &mut core.midi_out,
                             &mut scratch,
                             chunk,
                             device_channels,
@@ -278,6 +342,10 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                             }
                         }
                     }
+                    // ponytail: generated MIDI is drained and dropped; the
+                    // standalone has no MIDI destination until a virtual
+                    // port (midir) is wired up.
+                    engine.end_audio();
                 },
                 |err| eprintln!("skuiz: audio stream error: {err}"),
                 None,
@@ -292,45 +360,66 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
         "<!doctype html><body style='font:13px system-ui;padding:1rem'>\
          This processor has no editor.</body>",
     );
-    let ui_processor = Arc::clone(&processor);
+    let ui_engine = Arc::clone(&engine);
     let ui_bus = Arc::clone(&bus);
+    let ui_lww = Arc::clone(&lww);
+    // The IPC handler answers diag queries with an eval, but the webview
+    // only exists after build — hence the cell, filled below.
+    let webview_slot: std::rc::Rc<std::cell::RefCell<Option<wry::WebView>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let handler_slot = std::rc::Rc::clone(&webview_slot);
     let webview = wry::WebViewBuilder::new()
         .with_html(html)
         .with_ipc_handler(move |req| {
+            if req.body() == skuiz_core::protocol::DIAG_QUERY {
+                let js = skuiz_core::protocol::on_diag_js(ui_engine.diag());
+                if let Some(wv) = handler_slot.borrow().as_ref() {
+                    let _ = wv.evaluate_script(&js);
+                }
+                return;
+            }
             let Some((id, value)) = skuiz_core::protocol::parse_set_param(req.body()) else {
                 return;
             };
-            if !P::params().iter().any(|d| d.id == id) {
+            let Some(def) = P::params().iter().find(|d| d.id == id) else {
                 return;
-            }
-            ui_processor
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_param(id, value);
+            };
+            // Queued for the audio callback; the engine never locks the
+            // processor.
+            ui_engine.set_param(id, value);
             // Share the move with every other instance, in this process or
-            // in a DAW hosting the same plugin.
-            ui_bus.send(skuiz_core::protocol::set_param(id, value).as_bytes());
+            // in a DAW hosting the same plugin — if it is declared shared.
+            // The versioned frame lets receivers discard stale echoes.
+            if def.shared {
+                let (seq, origin) = ui_lww.stamp(id);
+                ui_bus.send(
+                    skuiz_core::protocol::set_param_versioned(id, value, seq, origin).as_bytes(),
+                );
+            }
         })
         .build(&window)
         .map_err(|e| Error::WebView(e.to_string()))?;
 
-    // Seed the page with the current values — snapshot first so the
-    // processor lock is not held across the eval calls, which the audio
-    // callback would otherwise block on.
+    // Seed the page with the current values — read from the mirror
+    // (wait-free, invariant 6), never from the processor.
     //
     // These evals race page load: one landing before the page has installed
     // `window.skuizOnParam` is a no-op (the generated call is guarded). The
     // editor contract therefore requires pages to push their own state on
     // mount — that, not this seeding, is what the examples rely on.
-    for (id, value) in skuiz_core::snapshot_params::<P>(&processor) {
+    for (id, value) in engine.mirror().snapshot() {
         let _ = webview.evaluate_script(&skuiz_core::protocol::on_param_js(id, value));
     }
+    // Hand the webview to the IPC handler's cell, so diag queries can be
+    // answered from inside a message.
+    *webview_slot.borrow_mut() = Some(webview);
 
     // --- run --------------------------------------------------------------
 
     // `run_return` rather than tao's `run`: `run` never returns, which would
     // make `deactivate` unreachable.
-    let rt_processor = Arc::clone(&processor);
+    let rt_engine = Arc::clone(&engine);
+    let rt_webview = std::rc::Rc::clone(&webview_slot);
     event_loop.run_return(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -344,24 +433,28 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                 if !P::params().iter().any(|d| d.id == id) {
                     return;
                 }
-                rt_processor
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .set_param(id, value);
+                // Queued for the audio callback, same as an editor move.
+                rt_engine.set_param(id, value);
                 // Update the page, but do not echo back onto the bus, or two
                 // instances would ping-pong a value forever.
-                let _ = webview.evaluate_script(&skuiz_core::protocol::on_param_js(id, value));
+                if let Some(wv) = rt_webview.borrow().as_ref() {
+                    let _ = wv.evaluate_script(&skuiz_core::protocol::on_param_js(id, value));
+                }
             }
             _ => {}
         }
     });
 
-    // The window has closed; release what `activate` set up, on the main
-    // thread as the Processor contract requires.
-    processor
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .deactivate();
+    // The window has closed. Stop the stream first so no callback can race
+    // `deactivate`, then release what `activate` set up, on the main thread
+    // as the Processor contract requires.
+    drop(stream);
+    while engine.is_processing() {
+        std::hint::spin_loop();
+    }
+    let _ = engine.with_main(|core| {
+        core.processor.deactivate();
+    });
     Ok(())
 }
 
@@ -396,6 +489,7 @@ mod tests {
                 max: 1.0,
                 default: 1.0,
                 choices: &[],
+                shared: true,
             }]
         }
         fn set_param(&mut self, _id: u32, v: f64) {
@@ -432,13 +526,20 @@ mod tests {
     /// the processor's effect on it.
     #[test]
     fn render_pass_interleaves_and_applies_the_processor() {
-        let processor = Mutex::new(Gain(1.0));
+        let mut processor = Gain(1.0);
         let mut midi = MidiOut::with_capacity(8);
         let mut scratch = Scratch::new(2);
         let mut out = vec![0.0f32; 64 * 2];
         let mut tone = Tone::new(Input::TestTone, 48_000.0);
 
-        render_pass(&processor, &mut midi, &mut scratch, &mut out, 2, &mut tone);
+        render_pass(
+            &mut processor,
+            &mut midi,
+            &mut scratch,
+            &mut out,
+            2,
+            &mut tone,
+        );
         assert!(
             out.iter().any(|s| s.abs() > 0.0),
             "test tone produced silence"
@@ -454,9 +555,16 @@ mod tests {
 
         // Gain of zero must silence it, proving the processor is in the path.
         let loud = out.clone();
-        processor.lock().unwrap().0 = 0.0;
+        processor.0 = 0.0;
         tone.phase = 0.0;
-        render_pass(&processor, &mut midi, &mut scratch, &mut out, 2, &mut tone);
+        render_pass(
+            &mut processor,
+            &mut midi,
+            &mut scratch,
+            &mut out,
+            2,
+            &mut tone,
+        );
         assert!(loud.iter().any(|s| s.abs() > 0.0));
         assert!(
             out.iter().all(|s| *s == 0.0),
@@ -466,13 +574,20 @@ mod tests {
 
     #[test]
     fn silence_input_produces_silence() {
-        let processor = Mutex::new(Gain(1.0));
+        let mut processor = Gain(1.0);
         let mut midi = MidiOut::with_capacity(8);
         let mut scratch = Scratch::new(1);
         let mut out = vec![1.0f32; 32];
         let mut tone = Tone::new(Input::Silence, 48_000.0);
 
-        render_pass(&processor, &mut midi, &mut scratch, &mut out, 1, &mut tone);
+        render_pass(
+            &mut processor,
+            &mut midi,
+            &mut scratch,
+            &mut out,
+            1,
+            &mut tone,
+        );
         assert!(
             out.iter().all(|s| *s == 0.0),
             "Silence input must clear the buffer"
@@ -483,7 +598,7 @@ mod tests {
     /// since that is the case where a naive implementation would allocate.
     #[test]
     fn oversized_buffers_are_processed_in_passes() {
-        let processor = Mutex::new(Gain(1.0));
+        let mut processor = Gain(1.0);
         let mut midi = MidiOut::with_capacity(8);
         let mut scratch = Scratch::new(1);
         let mut tone = Tone::new(Input::TestTone, 48_000.0);
@@ -491,7 +606,7 @@ mod tests {
         let total = SCRATCH_FRAMES * 2 + 37;
         let mut out = vec![f32::NAN; total];
         for chunk in out.chunks_mut(SCRATCH_FRAMES) {
-            render_pass(&processor, &mut midi, &mut scratch, chunk, 1, &mut tone);
+            render_pass(&mut processor, &mut midi, &mut scratch, chunk, 1, &mut tone);
         }
         assert!(
             out.iter().all(|s| s.is_finite()),
