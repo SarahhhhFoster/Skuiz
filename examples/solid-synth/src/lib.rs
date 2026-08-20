@@ -5,8 +5,8 @@
 //! Solid signals hold frequency, waveform, level and cutoff; a
 //! `createEffect` pushes each change down to this DSP, and sound follows.
 //!
-//! Solid is vendored as a prebuilt bundle (see `src/vendor/`), so building
-//! this needs cargo and no JavaScript toolchain.
+//! Solid and solid-knobs are vendored as prebuilt bundles (see
+//! `src/vendor/`), so building this needs cargo and no JavaScript toolchain.
 
 use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
 
@@ -191,11 +191,13 @@ impl Processor for SolidSynth {
     }
 
     fn editor_html() -> Option<&'static str> {
-        // `concat!` keeps this a &'static str: the vendored Solid bundle and
-        // the page are separate files but one compiled-in string.
+        // `concat!` keeps this a &'static str: the vendored Solid and
+        // solid-knobs bundles and the page are separate files but one
+        // compiled-in string.
         Some(concat!(
             include_str!("editor.head.html"),
             include_str!("vendor/solid.js"),
+            include_str!("vendor/solid-knobs.js"),
             include_str!("editor.tail.html"),
         ))
     }

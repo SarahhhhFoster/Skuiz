@@ -107,11 +107,13 @@ bit depth, scale, and microtuning selectors are written the same way.
 cargo run -p solid-synth --bin solid-synth-standalone
 ```
 
-A SolidJS page whose signals *are* the synth's state: move a slider or pick
-a waveform and `createEffect` sends the change to a Rust oscillator. Solid is
-vendored as a prebuilt ~31 KB bundle (`examples/solid-synth/src/vendor/`), so
-building Skuiz still needs cargo and no JavaScript toolchain — that also
-shows the editor is a plain document, not a framework lock-in.
+A SolidJS page whose signals *are* the synth's state: turn a knob or pick
+a waveform and `createEffect` sends the change to a Rust oscillator. The
+knobs come from [solid-knobs](https://github.com/tahti-studio/solid-knobs);
+Solid and solid-knobs are vendored as prebuilt bundles
+(`examples/solid-synth/src/vendor/`), so building Skuiz still needs cargo
+and no JavaScript toolchain — that also shows the editor is a plain
+document, not a framework lock-in.
 
 The editor's logic has a headless check that does not need a plugin host:
 
