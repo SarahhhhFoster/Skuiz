@@ -56,7 +56,39 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --workspace
+
+      # Windows runs one crate at a time: a hanging test (named pipes are
+      # the least-verified code here) then names its crate in the log
+      # instead of disappearing into a workspace-wide run.
+      - name: Test (per crate)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -e
+          for c in skuiz-core skuiz-midi skuiz-dsp skuiz-ui \
+                   skuiz-clap skuiz-vst3 skuiz-auv3 skuiz-standalone \
+                   shared-gain trigger-note solid-synth pd-tremolo; do
+            echo "=== $c ==="
+            cargo test -p "$c"
+          done
+
+      # ...and skuiz-ipc one *test* at a time: its tests spawn child
+      # processes and hold global bus state, so a hang there needs the
+      # test's name in the log, and a captured panic must not hide until a
+      # summary that never prints.
+      - name: Test skuiz-ipc (per test)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -e
+          cargo test -p skuiz-ipc --no-run
+          bin=$(find target/debug/deps -name 'skuiz_ipc-*.exe' ! -name '*.d' | head -1)
+          for t in $("$bin" --list --format terse | sed -n 's/: test$//p'); do
+            echo "=== $t ==="
+            "$bin" --exact "$t" --nocapture
+          done
 
       # The libpd feature vendors and compiles Pure Data, so it is opt-in;
       # exercised on macOS where it is known to build. pd-tremolo is an empty
