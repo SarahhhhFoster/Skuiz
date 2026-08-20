@@ -204,10 +204,10 @@ via server promotion.
 
 ## Development
 
-CI (`.github/workflows/ci.yml`) is switched off to keep Actions cost at
-zero — the workflows stay in the tree and can be run manually from the
-Actions tab, or re-enabled by restoring the push/PR triggers. When run, CI
-enforces:
+CI (`.github/workflows/ci.yml`) runs automatically on pushes to `main` and
+on pull requests (scoped that way to keep Actions cost bounded; feature
+branches can trigger it manually from the Actions tab). The release
+workflow stays manual-only. CI enforces:
 
 - `cargo fmt --all -- --check` — the tree is rustfmt-clean
 - `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings

@@ -24,9 +24,13 @@ mechanics.
 an audible glitch. In `process` — and in anything it calls:
 
 - **No allocation.** Allocate in `activate` using the announced maximum
-  block size. (`save_state`/`load_state` are the one documented
-  exception: host (de)serialization may allocate, and hosts never call
-  it mid-block.)
+  block size. The one documented exception is host-initiated state
+  (de)serialization: while the transport runs, `save_state`/`load_state`
+  execute on the audio thread between blocks (that is where the
+  processor lives), and the plugin's `save_state` may allocate. The
+  framework around it does not — payload buffers are recycled back to
+  the main thread, and the post-load mirror republish walks the
+  parameter list without building anything.
 - **No locking.** No mutexes, no channels, no `RwLock`.
 - **No I/O.** No files, no sockets, no logging (most loggers lock and
   allocate).
@@ -49,12 +53,19 @@ thread**:
 - **Audio thread.** Claims the audio state when processing starts (the
   adapters do this in `start_processing`/`setProcessing`, or around each
   render call on AUv3, which has no such pair) and runs `process`
-  directly. While blocks flow, nothing else can touch the processor.
+  directly. The claim is structural: `begin_audio` returns an
+  `AudioToken`, and every audio-side entry point (`audio_core`,
+  `midi_out`) requires a borrow of it — safe code cannot reach the
+  processor without one. While blocks flow, nothing else can touch the
+  processor.
 - **Main thread.** `activate`, `deactivate`, and state save/load take
   the main state — but only while the transport is stopped. While
-  running, state save/load becomes a bounded round-trip: a command is
-  queued, the audio thread serializes between blocks, and the main
-  thread waits (bounded, 2 s) for the answer.
+  running, state save/load becomes a bounded round-trip on a *separate*
+  state-command queue (a mutex on the main side serializes round-trips,
+  so at most one is ever in flight), the audio thread services at most
+  one state op per block, and the main thread waits (bounded, 2 s) for
+  the answer. A flood of parameter commands can neither delay a state
+  op nor occupy its queue.
 - **Everyone else** — editor callbacks, the IPC bus thread — never
   touches the processor at all. Changes go into a bounded command queue
   the audio thread drains at block top; reads are answered wait-free by

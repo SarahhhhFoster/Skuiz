@@ -7,15 +7,14 @@
 
 name: CI
 
-# Switched off to keep Actions cost at zero: the workflow runs only when
-# triggered manually from the Actions tab. To re-enable automatic runs,
-# restore the triggers:
-#
-#   on:
-#     push:
-#       branches: [main]
-#     pull_request:
+# Automatic runs are scoped to keep Actions cost bounded: pushes to main
+# and pull requests only (not every feature-branch push), plus manual
+# dispatch from the Actions tab. The heavier release workflow stays
+# manual-only.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 env:
