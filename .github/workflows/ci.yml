@@ -82,13 +82,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          set -e
+          set -u
           cargo test -p skuiz-ipc --no-run
           bin=$(find target/debug/deps -name 'skuiz_ipc-*.exe' ! -name '*.d' | head -1)
+          fail=0
           for t in $("$bin" --list --format terse | sed -n 's/: test$//p'); do
             echo "=== $t ==="
-            "$bin" --exact "$t" --nocapture
+            # A wedged test must not eat the whole job: two minutes each,
+            # and the rest still run so one hang cannot hide the others.
+            if ! timeout 120 "$bin" --exact "$t" --nocapture; then
+              rc=$?
+              echo "=== $t FAILED (rc=$rc; 124 means the watchdog fired) ==="
+              fail=1
+            fi
           done
+          exit $fail
 
       # The libpd feature vendors and compiles Pure Data, so it is opt-in;
       # exercised on macOS where it is known to build. pd-tremolo is an empty

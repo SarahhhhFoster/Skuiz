@@ -187,7 +187,13 @@ fn rt_hammer() {
         let bus_done = Arc::new(AtomicBool::new(false));
 
         // Thread A (audio): pump blocks until the main thread says stop.
-        // The cap is a backstop so a failed test still terminates.
+        // State round-trips below only complete while blocks flow, so the
+        // loop must be bounded by `stop` alone — an iteration cap can be
+        // exhausted early on a loaded machine (the main thread stalls while
+        // the audio thread races ahead), after which a state op would time
+        // out and fail spuriously. The wall-clock backstop keeps a wedged
+        // main thread from hanging the suite; StopGuard sets `stop` on the
+        // panic path long before it can matter.
         let audio = {
             let plugin = SendPtr(plugin as *mut c_void);
             let stop = Arc::clone(&stop);
@@ -196,10 +202,8 @@ fn rt_hammer() {
                 let plugin = plugin.into_inner() as *const clap_plugin;
                 let mut left = [0.0f32; 64];
                 let mut right = [0.0f32; 64];
-                for _ in 0..500_000 {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
+                let backstop = Instant::now() + Duration::from_secs(60);
+                while !stop.load(Ordering::Relaxed) && Instant::now() < backstop {
                     run_block(plugin, &mut [left.as_mut_ptr(), right.as_mut_ptr()]);
                 }
                 audio_done.store(true, Ordering::Relaxed);

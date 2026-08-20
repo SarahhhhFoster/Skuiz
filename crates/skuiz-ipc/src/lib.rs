@@ -656,6 +656,7 @@ mod tests {
                 heard.fetch_add(1, Ordering::SeqCst);
             })
         };
+        eprintln!("child: joined");
         // Keep announcing until the parent acknowledges by replying.
         for _ in 0..200 {
             bus.send(b"from child");
@@ -664,10 +665,16 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(25));
         }
+        eprintln!(
+            "child: announce loop done, heard={}",
+            heard.load(Ordering::SeqCst)
+        );
         assert!(
             heard.load(Ordering::SeqCst) > 0,
             "child never heard the parent"
         );
+        drop(bus);
+        eprintln!("child: bus dropped, returning");
     }
 
     #[test]
@@ -684,9 +691,11 @@ mod tests {
                 got.fetch_add(1, Ordering::SeqCst);
             })
         };
+        eprintln!("parent: joined");
         wait_until("the parent to take the election lock", || {
             parent.is_server()
         });
+        eprintln!("parent: elected");
 
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -699,17 +708,21 @@ mod tests {
             .env("SKUIZ_TEST_SCOPE", &scope)
             .spawn()
             .expect("spawn child test process");
+        eprintln!("parent: child spawned");
 
         wait_until("a frame from another process", || {
             // Reply so the child can confirm the link both ways.
             parent.send(b"from parent");
             got.load(Ordering::SeqCst) > 0
         });
+        eprintln!("parent: heard the child");
 
         let status = wait_for_child("the cross-process child", &mut child);
+        eprintln!("parent: child exited: {status:?}");
         assert!(status.success(), "child process failed: {status:?}");
 
         drop(parent);
+        eprintln!("parent: bus dropped");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
