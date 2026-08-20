@@ -1,8 +1,8 @@
 # Skuiz
 
 A cross-platform Rust library for building audio plugin/DSP projects whose
-instances communicate over IPC. Targets: CLAP today; VST3, AUv3, and a
-standalone shell as the adapters land. See `PLAN.md` for the architecture.
+instances communicate over IPC. Targets: CLAP, VST3, AUv3, and a standalone
+shell. See `docs/` for the concepts and per-format guides.
 
 MIT licensed. No GPL code is linked.
 
@@ -89,13 +89,18 @@ writing shared state on save. Election is an `flock` for the owning process
 longest-lived instance within it; both promote automatically when the owner
 goes away.
 
+Sync is eventually convergent: every broadcast carries a lamport version, a
+late joiner pulls a snapshot of bus-edited values on join, and a reconnect
+re-syncs whatever was dropped while the link was down. See
+[instance sync](docs/concepts/instance-sync.md).
+
 Because in-process delivery never touches the socket, instances inside one
 host keep syncing even where the socket cannot be created at all — a
 misconfigured App Group on iOS costs you cross-host sync, not everything.
 
 ## Configuration menus are just parameters
 
-PLAN.md's configuration dropdown is not a separate system: a `ParamDef` with
+A configuration dropdown is not a separate system: a `ParamDef` with
 a non-empty `choices` list is a discrete parameter, so hosts render it as an
 enum, and it automates, saves with the project, and syncs over IPC like any
 other parameter. `skuiz-midi::channel_param` is one ready-made example;
@@ -230,15 +235,14 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 
 ## Deferred (add when needed)
 
-- Lock-free parameter sync (currently a Mutex around the processor)
 - GPU spectral resynthesis example
 - MPE per-note expression — the UMP event type (`MidiEvent`) and MIDI 2.0
   output are in; MPE note-expression events are still out
 - MIDI *input* (only output ports are declared today)
 - AUv3 Xcode project, provisioning and signing (the C ABI and the
   `AUAudioUnit` shim are done and tested; see crates/skuiz-auv3/scaffold)
-- VST3 CC / pitch-bend output (note on/off are converted today)
 - Standalone input capture (output-only today; the shell feeds a test tone)
   and MIDI output from the standalone (generated MIDI is currently dropped)
-- Linux webview editor (X11); Windows editor is written but unverified
+- Editor verification on Windows and Linux (the Linux editor embeds on X11
+  via WebKitGTK; both are written but unverified)
 - Running the Windows test suite on an actual Windows machine

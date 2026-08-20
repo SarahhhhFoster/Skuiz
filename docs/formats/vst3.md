@@ -49,16 +49,26 @@ entry-point symbols, same compiled library inside both bundles.
 - **Parameters are normalized** 0..1 at the boundary, with `stepCount`
   and `kIsList` for choice parameters.
 - **Editor**: the same wry webview as everywhere else, via `IPlugView`.
-  macOS tested; Windows written, unverified; none on Linux.
+  macOS tested; Windows written, unverified; Linux written, unverified
+  (X11 embed via WebKitGTK).
 
 ## Limitations
 
-- **MIDI 1.0-reducible events only from `MidiOut`.** Note on/off (and any
-  event that reduces to 3 MIDI 1.0 bytes) is converted; UMP-only MIDI 2.0
-  events are skipped — VST3 has no UMP event type (a documented ponytail).
+- **MIDI 1.0-reducible events only from `MidiOut`.** Note on/off and poly
+  pressure become native VST3 events; CC, pitch bend and channel pressure
+  become `kLegacyMIDICCOutEvent`. UMP-only MIDI 2.0 events are skipped —
+  VST3 has no UMP event type (a documented ponytail).
 - **No MIDI input** — same trait-level gap as CLAP.
 - MIDI event frame offsets are clamped into the block; DSP that
   timestamps past the block end loses that timing.
+- **Remote changes reach the host, not the open editor.** When a
+  parameter moves via the bus or a state load while blocks flow, the
+  host is told with `restartComponent(kParamValuesChanged)` at the next
+  `getParamNormalized`, so its automation lanes and generic editor
+  converge. The webview editor is *not* pushed a refresh: VST3 has no
+  equivalent of CLAP's `request_callback`, and a webview `eval` is only
+  legal on the thread that created it (a documented ponytail — a UI
+  timer would close it).
 
 ## Validating
 

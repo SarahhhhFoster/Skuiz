@@ -89,8 +89,10 @@ the threading discipline — it decides what reaches your `process` and when.
 See [threading](threading.md).
 
 **`skuiz-core`** owns the contracts both sides agree on: what a parameter
-is, how state is serialized, and the `set_param <id> <value>` message format
-that editors and the bus both speak.
+is, how state is serialized, and the message formats editors and the bus
+speak — `set_param <id> <value>` from editors, versioned
+`set_param <id> <value> <seq> <origin>` plus `sync_request`/`sync_state`
+on the bus (see [instance sync](instance-sync.md)).
 
 The practical consequence: if a plugin misbehaves in one host but not
 another, the bug is almost certainly in an adapter, not in your DSP — and

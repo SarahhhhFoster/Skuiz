@@ -2,7 +2,7 @@
 
 Skuiz owes JUCE the idea that one C++-adjacent codebase should ship
 every plugin format — and that is where the resemblance ends. The
-design is inspired-by but architecturally distinct (see `PLAN.md`), and
+design is inspired-by but architecturally distinct, and
 no JUCE code is used: Skuiz is MIT with a hard licensing-purity rule.
 
 ## The mapping

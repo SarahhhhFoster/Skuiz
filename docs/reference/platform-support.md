@@ -10,7 +10,7 @@ same labels the rest of the docs use.
 | --- | --- | --- | --- |
 | Audio + parameters + state | tested | type-checked | type-checked |
 | Instance bus | tested (Unix socket) | type-checked (named pipe); the Windows CI job is the only place it executes | type-checked (Unix socket) |
-| Webview editor | tested | written, unverified | not implemented |
+| Webview editor | tested | written, unverified | written, unverified (X11 via WebKitGTK; Wayland hosts via their X11-embedding support) |
 | Standalone shell | tested | type-checked | type-checked |
 
 If you are on Windows, `cargo test -p skuiz-ipc` is the place to start:
@@ -37,13 +37,12 @@ shim needs the App Group directory set **before instantiation**; see
 
 ## Deferred (add when needed)
 
-- Lock-free parameter sync (currently one Mutex around the processor)
 - MPE per-note expression (UMP events and MIDI 2.0 output are in;
   MPE note-expression events are still out)
 - MIDI *input* (only output ports exist today)
 - GPU spectral resynthesis example
 - AUv3 Xcode project, provisioning and signing
-- VST3 CC / pitch-bend output (note on/off are converted)
+- VST3 MIDI output covers note on/off, CC, pitch bend and poly pressure
 - Standalone input capture and MIDI output
-- Linux webview editor (X11); Windows editor verification
+- Windows editor verification; Linux editor (X11/WebKitGTK) verification
 - Running the Windows test suite on real Windows hardware

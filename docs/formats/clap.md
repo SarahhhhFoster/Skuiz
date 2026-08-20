@@ -23,7 +23,8 @@ advertised with the `instrument` feature; everything else is an
 - **Note ports**: one MIDI 1.0 *output* port, only when `emits_midi()`.
 - **State**: `save_state`/`load_state` streamed through the host's
   `clap_ostream`/`clap_istream`, with a host rescan after a load.
-- **GUI**: the webview editor, on macOS and Windows, when
+- **GUI**: the webview editor, on macOS (tested), Windows and Linux
+  (written, unverified — Linux embeds on X11 via WebKitGTK), when
   `editor_html()` is `Some`. See [editors](../concepts/editors.md).
 - **Instance sync**: the adapter joins the IPC bus at `init` and
   forwards parameter changes; no plugin code needed.

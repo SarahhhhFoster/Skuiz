@@ -10,6 +10,7 @@ ParamDef {
     max: 1.0,
     default: 1.0,
     choices: &[],          // ...or a non-empty list for a discrete one
+    shared: true,          // editor moves sync across instances; false = local only
 }
 ```
 
@@ -30,7 +31,7 @@ instead of a plausible lie.
 
 ## Configuration menus are just parameters
 
-The "configuration dropdown" from PLAN.md is not a separate system.
+A configuration dropdown is not a separate system.
 Output channel, bit depth, scale, microtuning — each is a choice
 parameter, so it automates, saves with the project, and syncs over IPC
 like anything else. `skuiz_midi::channel_param(id)` is a ready-made
@@ -67,10 +68,11 @@ Three paths call your `set_param`, and they are the whole story:
 
 - **Host → DSP**: automation events, applied at the top of each block.
 - **Editor → DSP**: the page posts `set_param <id> <value>`; the
-  adapter applies it, tells the host to rescan, and broadcasts it to
-  other instances.
+  adapter applies it, tells the host to rescan, and — for parameters
+  declared `shared` — broadcasts it to other instances.
 - **IPC → DSP**: values from other instances park in a queue and are
-  applied at block top — see [instance sync](instance-sync.md).
+  applied at block top — see [instance sync](instance-sync.md). Frames
+  naming a `shared: false` parameter are ignored, not applied.
 
 The reverse path — host automation reaching your editor — is the
 adapter calling `window.skuizOnParam(id, value)` in the page. See
@@ -78,9 +80,11 @@ adapter calling `window.skuizOnParam(id, value)` in the page. See
 
 ## Saved state
 
-The default `save_state`/`load_state` serializes every parameter as
-12-byte `(id, value)` little-endian chunks. `load_state` skips ids it
-doesn't know and rejects malformed data, so states from older or newer
-versions still load. Override the pair if your plugin has state beyond
-parameters — and when you do, keep the tolerant-skipping behavior;
-your future self shipping v2 will thank you.
+The default `save_state`/`load_state` writes a `SKZ1` version header
+followed by every parameter as 12-byte `(id, value)` little-endian
+chunks. `load_state` skips ids it doesn't know, accepts the legacy
+headerless format from pre-versioning builds, and rejects malformed
+data, so states from older or newer versions still load. Override the
+pair if your plugin has state beyond parameters — and when you do,
+keep the tolerant-skipping behavior and version your own format with a
+header; your future self shipping v2 will thank you.

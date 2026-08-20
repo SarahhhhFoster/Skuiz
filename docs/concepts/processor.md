@@ -48,6 +48,18 @@ allocates, and silently drops events once full — a full buffer means
 thousands of events per block, which is a bug in the DSP. This method
 is realtime: read [threading](threading.md) before shipping.
 
+**`reset()`** (default no-op) clears DSP state — delay lines, filter
+memory, LFO phase — without touching parameter values. Called between
+blocks on the audio thread while running, on the main thread when
+stopped. AUv3 hosts call it on resets; CLAP and VST3 have no reset
+concept, so there it only fires if you call `Engine::reset` yourself.
+
+**`latency()`** (default 0) reports the plugin's delay in frames. It may
+change at runtime: the engine re-reads it once per block and, on change,
+updates the value hosts see and notifies them (CLAP and VST3; AUv3 and
+standalone report no change notification). Because of that poll it runs
+on the audio thread — keep it to reading a field.
+
 **`emits_midi()`** (default `false`) tells adapters whether to
 advertise a note output port, so an audio-only plugin doesn't show
 hosts a MIDI out that never fires.
@@ -57,10 +69,12 @@ string (usually `include_str!`) plus a size in logical pixels. `None`
 (the default) means no GUI. See [editors](editors.md).
 
 **`save_state()` / `load_state(data)`** — the default implementation
-serializes every parameter as 12-byte `(id: u32 LE, value: f64 LE)`
-chunks; `load_state` skips unknown ids, so states from other versions
-still load, and returns `false` for malformed data. Override both if
-you have non-parameter state.
+writes a `SKZ1` version header followed by every parameter as 12-byte
+`(id: u32 LE, value: f64 LE)` chunks; `load_state` skips unknown ids,
+so states from other versions still load, accepts the legacy
+headerless format from pre-versioning builds, and returns `false` for
+malformed data. Override both if you have non-parameter state — and
+version your own format with a header the same way.
 
 ## Exporting
 

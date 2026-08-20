@@ -14,9 +14,9 @@ Symptom → likely cause → where to look.
 ## The editor is blank or missing
 
 - `editor_html()` returns `None` (the default) — did you override it?
-- GUI extension exists only on macOS and Windows. On Linux the host's
-  generic UI is what you get — no webview backend yet.
-- On Windows the editor path is written but unverified.
+- On Windows and Linux the editor path is written but unverified (Linux
+  embeds on X11 via WebKitGTK; on Wayland it depends on the host's
+  X11-embedding support).
 
 ## The editor opens but controls do nothing
 
@@ -52,10 +52,11 @@ arriving from the host must update the widget without emitting
 
 ## Audio glitches when a project loads or a preset lands
 
-The adapter holds the processor mutex while your `load_state` runs. If
-your override does slow work (parsing, allocation), the audio thread
-waits. Do the expensive preparation outside the locked section; the
-lock-free upgrade is a known deferred item. See
+While the transport runs, `load_state` is routed onto the audio thread
+between blocks (the engine's bounded state round-trip), so an override
+that does slow work — parsing, allocation — spends the audio thread's
+deadline. Do the expensive preparation lazily: parse into prepared
+structures once, and keep `load_state` itself to assignment. See
 [threading](../concepts/threading.md).
 
 ## My automation moves sound stepped

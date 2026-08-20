@@ -25,11 +25,14 @@ Read these in order; each assumes the one before it.
 3. **[Threading and realtime rules](concepts/threading.md)** — which thread
    calls what, and the short list of things that must never happen on the
    audio thread. **Read this before shipping anything.**
-4. **[Parameters](concepts/parameters.md)** — automation, saved state, and
+4. **[Invariants](concepts/invariants.md)** — the ten-point realtime and
+   concurrency contract the framework holds itself to, with an honest
+   status per invariant.
+5. **[Parameters](concepts/parameters.md)** — automation, saved state, and
    why configuration menus are just parameters with labels.
-5. **[Editors](concepts/editors.md)** — the webview model, the JavaScript
+6. **[Editors](concepts/editors.md)** — the webview model, the JavaScript
    bridge, and using a framework like SolidJS.
-6. **[Instance sync](concepts/instance-sync.md)** — the part with no JUCE
+7. **[Instance sync](concepts/instance-sync.md)** — the part with no JUCE
    equivalent: how instances find each other, elect an owner, and share
    state across processes.
 
