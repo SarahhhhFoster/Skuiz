@@ -73,7 +73,7 @@ impl Processor for Fixture {
                 *s *= g;
             }
         }
-        midi.push(7, [0x90, 64, 100]);
+        midi.push(7, skuiz_core::MidiEvent::from_midi1([0x90, 64, 100]));
     }
 }
 

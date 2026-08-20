@@ -11,3 +11,6 @@ skuiz-core.workspace = true
 skuiz-ui.workspace = true
 skuiz-ipc = { path = "../skuiz-ipc" }
 clap-sys.workspace = true
+
+[dev-dependencies]
+skuiz-midi.workspace = true

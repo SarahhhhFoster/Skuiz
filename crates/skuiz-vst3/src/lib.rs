@@ -7,13 +7,15 @@
 //!
 //! Skuiz is MIT and stays that way: this adapter builds on the clean-room
 //! MIT/Apache-2.0 `vst3` bindings, and no Steinberg SDK code is vendored or
-//! linked. That keeps *Skuiz* unencumbered, but it does not remove the
-//! obligation on anyone **shipping** a VST3 binary — Steinberg licenses the
-//! VST3 format itself under either GPLv3 or a separate (free of charge)
-//! proprietary agreement, and a closed-source plugin needs the latter.
-//! That is why this crate is excluded from the workspace's default members:
-//! building it should be a deliberate choice, not something a `cargo build`
-//! does on your behalf. CLAP carries no such obligation.
+//! linked. Since Steinberg relicensed the VST3 SDK under MIT in v3.8
+//! (October 2025), retiring the GPLv3-or-proprietary dual licence, shipping
+//! a VST3 binary carries no Steinberg licensing obligation at all. The one
+//! remaining condition is trademark: using the "VST" name or logo is
+//! optional, but if you do, Steinberg's usage guidelines (bundled with the
+//! SDK) apply.
+//!
+//! This crate was excluded from the workspace's default members before the
+//! MIT relicensing; it is an ordinary member now.
 //!
 //! # Shape
 //!
@@ -326,18 +328,24 @@ impl<P: Processor> Vst3Plugin<P> {
         out.sort_unstable_by_key(|e| e.0);
     }
 
-    /// Convert generated MIDI into VST3 events. Note on/off map to native
-    /// note events; other messages need `kLegacyMIDICCOutEvent` handling
-    /// and are dropped for now. `offset` is the segment's start within the
-    /// block (the block is split at parameter-point times, so the DSP's
-    /// frame numbers are segment-relative); `frames` is the whole block.
-    // ponytail: notes only. Add CC/pitch-bend as legacy MIDI CC events when
-    // an example needs them.
+    /// Convert generated MIDI into VST3 events. MIDI 1.0 note on/off map to
+    /// native note events; other messages need `kLegacyMIDICCOutEvent`
+    /// handling and are dropped for now, as are MIDI 2.0 UMP events (VST3
+    /// has no UMP event type; a MIDI 2.0 note could be lossily converted,
+    /// but silent-and-documented beats wrong-velocity).
+    /// `offset` is the segment's start within the block (the block is split
+    /// at parameter-point times, so the DSP's frame numbers are
+    /// segment-relative); `frames` is the whole block.
+    // ponytail: MIDI 1.0 notes only. Add CC/pitch-bend as legacy MIDI CC
+    // events when an example needs them.
     unsafe fn emit_events(&self, out: *mut IEventList, midi: &MidiOut, frames: usize, offset: u32) {
         let Some(list) = ComRef::from_raw(out) else {
             return;
         };
-        for &(frame, bytes) in midi.events() {
+        for &(frame, ev) in midi.events() {
+            let Some(bytes) = ev.midi1_bytes() else {
+                continue;
+            };
             let status = bytes[0] & 0xF0;
             let channel = (bytes[0] & 0x0F) as i16;
             let mut event: Event = std::mem::zeroed();
@@ -808,7 +816,11 @@ impl<P: Processor + Default> IAudioProcessorTrait for Vst3Plugin<P> {
     }
 
     unsafe fn getLatencySamples(&self) -> u32 {
-        0
+        self.shared
+            .processor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .latency()
     }
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
@@ -1182,15 +1194,17 @@ macro_rules! export_vst3 {
                     .unwrap_or(::std::ptr::null_mut())
             }
 
+            // macOS entry points per the SDK's macmain.cpp: lowerCamelCase,
+            // and Steinberg's validator rejects the bundle without them.
             #[cfg(target_os = "macos")]
             #[no_mangle]
-            extern "system" fn BundleEntry(_bundle: *mut ::std::ffi::c_void) -> bool {
+            extern "system" fn bundleEntry(_bundle: *mut ::std::ffi::c_void) -> bool {
                 true
             }
 
             #[cfg(target_os = "macos")]
             #[no_mangle]
-            extern "system" fn BundleExit() -> bool {
+            extern "system" fn bundleExit() -> bool {
                 true
             }
 

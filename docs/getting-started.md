@@ -8,6 +8,18 @@ finished result matches `examples/shared-gain` in this repository.
 need Xcode Command Line Tools (`xcode-select --install`). Nothing else — no
 JavaScript toolchain, no plugin SDK to download.
 
+> **Rather start from working code?** The scaffolder copies an example out
+> of the repo, renames it, and rewires its manifest so it builds standalone:
+>
+> ```sh
+> ./tools/new-plugin.sh my-gain                 # from examples/shared-gain
+> ./tools/new-plugin.sh my-synth solid-synth    # or any other example
+> cd my-gain && ./install.sh                    # build + install for the current user
+> ```
+>
+> The generated project carries its own `bundle.sh` and `install.sh`. The
+> steps below explain what that generated code actually does.
+
 ## 1. Create the crate
 
 A plugin is a `cdylib`: a shared library the host loads.
@@ -242,9 +254,11 @@ One line each, no other changes:
 skuiz_vst3::export_vst3!(MyGain);   // also needs the skuiz-vst3 dependency
 ```
 
-**Before you ship a VST3 binary**, read [the VST3 licensing
-section](formats/vst3.md#licensing) — it carries an obligation CLAP does
-not. For AUv3 see [its guide](formats/auv3.md); for a desktop app see
+Shipping a VST3 binary is obligation-free: [the VST3 SDK has been
+MIT-licensed](formats/vst3.md#licensing) since v3.8 (October 2025). The
+only condition is trademark — branding with the "VST" name or logo means
+following Steinberg's usage guidelines. For AUv3 see [its
+guide](formats/auv3.md); for a desktop app see
 [standalone](formats/standalone.md).
 
 ## Where to go next

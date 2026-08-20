@@ -13,12 +13,12 @@ members = [
     "examples/shared-gain",
     "examples/trigger-note",
     "examples/solid-synth",
+    "examples/pd-tremolo",
 ]
 
-# skuiz-vst3 is deliberately NOT a default member: shipping a VST3 binary
-# carries a Steinberg licensing obligation (GPLv3 or their free proprietary
-# agreement) that CLAP does not, so building it is an explicit choice.
-# `cargo build -p skuiz-vst3` and `cargo test --workspace` still include it.
+# Every member is a default member: the reason skuiz-vst3 was excluded
+# (Steinberg's GPLv3-or-proprietary licence on shipping a VST3 binary) ended
+# when the VST3 SDK went MIT in v3.8 (October 2025).
 default-members = [
     "crates/skuiz-core",
     "crates/skuiz-clap",
@@ -26,11 +26,13 @@ default-members = [
     "crates/skuiz-ipc",
     "crates/skuiz-midi",
     "crates/skuiz-dsp",
+    "crates/skuiz-vst3",
     "crates/skuiz-auv3",
     "crates/skuiz-standalone",
     "examples/shared-gain",
     "examples/trigger-note",
     "examples/solid-synth",
+    "examples/pd-tremolo",
 ]
 
 [workspace.package]

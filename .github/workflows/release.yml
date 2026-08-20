@@ -1,0 +1,77 @@
+# Prebuilt example plugins, attached to a GitHub release on version tags.
+# No upstream licensing obligation anywhere: CLAP is MIT, and the VST3 SDK
+# has been MIT since v3.8 (October 2025). macOS and Linux are the CI-tested
+# platforms; Windows binaries join once the Windows paths are verified on
+# real hardware.
+name: Release
+
+# Switched off to keep Actions cost at zero: the workflow runs only when
+# triggered manually from the Actions tab. To re-enable automatic releases,
+# restore the tag trigger:
+#
+#   on:
+#     push:
+#       tags: ["v*"]
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS bundles
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release bundles
+        run: |
+          set -eu
+          mkdir -p dist
+          for example in shared-gain trigger-note solid-synth pd-tremolo; do
+            BUILD_TYPE=release ./examples/$example/bundle.sh
+            (cd target && tar czf "$OLDPWD/dist/$example-macos.clap.tgz" "$example.clap")
+          done
+          BUILD_TYPE=release ./examples/shared-gain/bundle-vst3.sh
+          (cd target && tar czf "$OLDPWD/dist/shared-gain-macos.vst3.tgz" "shared-gain.vst3")
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tgz
+
+  linux:
+    name: Linux .clap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Same system libraries the CI test job needs.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev libasound2-dev
+
+      # pd-tremolo is macOS-only here: the libpd build is verified on macOS
+      # only, and a release is no place to discover a Linux build failure.
+      - name: Build release libraries
+        run: |
+          set -eu
+          mkdir -p dist
+          cargo build --release -p shared-gain -p trigger-note -p solid-synth
+          # A Linux .clap is the bare shared library, renamed.
+          for example in shared-gain trigger-note solid-synth; do
+            lib=$(echo "$example" | tr - _)
+            cp "target/release/lib$lib.so" "dist/$example-linux.clap"
+          done
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

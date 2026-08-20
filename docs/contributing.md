@@ -10,10 +10,9 @@
 - `examples/` — three complete plugins; every change should keep them
   working and CI-green.
 
-`skuiz-vst3` is deliberately **not** a workspace default member:
-shipping a VST3 binary carries a Steinberg licensing obligation, so
-building it is an explicit choice. `cargo test --workspace` still
-includes it.
+`skuiz-vst3` is an ordinary default member: it was excluded while
+shipping a VST3 binary carried a Steinberg licensing obligation, which
+ended when the SDK went MIT in v3.8 (October 2025).
 
 ## Before you push
 
@@ -21,8 +20,9 @@ includes it.
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-CI (`.github/workflows/ci.yml`) runs on every push to `main` and every
-pull request, and enforces:
+CI (`.github/workflows/ci.yml`) is switched off to keep Actions cost at
+zero — it runs manually from the Actions tab, or re-enable the push/PR
+triggers in the workflow file. When run, it enforces:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
@@ -32,14 +32,25 @@ pull request, and enforces:
 - the libpd integration test on macOS
 - `cargo doc --workspace --no-deps` with warnings denied — doc links
   must resolve
-- clap-validator over every example plugin (macOS)
+- clap-validator over every example plugin (macOS), plus an end-to-end run
+  of the scaffold tooling: copy an example, build it standalone, install,
+  validate
+- Steinberg's official VST3 `validator`, built from the MIT SDK, over the
+  example `.vst3` bundle (macOS)
 - the SolidJS editor's headless DOM check (Linux)
+
+The release workflow (`.github/workflows/release.yml`, also manual-only)
+builds the example bundles in release mode and attaches them to a GitHub
+release.
 
 ## Conventions
 
 - **Licensing purity is a requirement.** Skuiz is MIT and links no GPL
-  code. Do not vendor or copy from JUCE or the Steinberg SDK — the VST3
-  side uses the clean-room `vst3` bindings for exactly this reason.
+  code. Do not vendor or copy from JUCE — the VST3 side uses the
+  clean-room `vst3` bindings for exactly this reason. (The Steinberg
+  SDK itself is MIT since v3.8, so consulting or vendoring it is no
+  longer a GPL concern — but keep the clean-room bindings anyway; they
+  are why nothing here depends on Steinberg's C++.)
 - **Docs are honest about verification.** Say *tested*, *type-checked*,
   or *not implemented* — never imply parity. If you change what is
   verified, update [platform support](reference/platform-support.md)
