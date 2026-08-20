@@ -23,6 +23,9 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    # A wedged test must fail with its log intact, not hang the job for
+    # hours (Windows named-pipe paths are the least-verified code here).
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

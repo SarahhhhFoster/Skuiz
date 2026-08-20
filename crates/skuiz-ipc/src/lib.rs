@@ -490,6 +490,23 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    /// `Child::wait` with a deadline: a wedged child must fail the test, not
+    /// hang the whole CI job for hours.
+    fn wait_for_child(what: &str, child: &mut std::process::Child) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll child") {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out waiting for {what}; killed it");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("skuiz-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -559,6 +576,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)] // the premise is a socket directory; Windows pipes have none
     #[test]
     fn in_process_sync_survives_an_unusable_socket_directory() {
         // The sandbox failure mode: no App Group configured, so the socket
@@ -586,6 +604,7 @@ mod tests {
         assert!(!b.is_server());
     }
 
+    #[cfg(unix)] // checks for the socket *file*; a Windows pipe name is not one
     #[test]
     fn socket_directory_is_configurable() {
         let dir = scratch("dir");
@@ -687,7 +706,7 @@ mod tests {
             got.load(Ordering::SeqCst) > 0
         });
 
-        let status = child.wait().expect("child exited");
+        let status = wait_for_child("the cross-process child", &mut child);
         assert!(status.success(), "child process failed: {status:?}");
 
         drop(parent);
@@ -848,7 +867,7 @@ mod tests {
         });
         drop(parent);
 
-        let status = child.wait().expect("child exited");
+        let status = wait_for_child("the promoted child", &mut child);
         assert!(
             status.success(),
             "child was not promoted to server: {status:?}"
