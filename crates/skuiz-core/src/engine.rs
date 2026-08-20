@@ -15,15 +15,23 @@
 //! spin is in [`Engine::begin_audio`], which runs on the audio thread
 //! *before* the first block — no deadline exists yet, so waiting out an
 //! in-flight main-thread access there is safe.
+//!
+//! Structural safety: entering the AUDIO state yields an [`AudioToken`],
+//! and every audio-thread entry point ([`Engine::audio_core`],
+//! [`Engine::midi_out`]) requires a borrow of one. The token cannot be
+//! constructed outside this module, cannot be cloned, and is consumed by
+//! [`Engine::end_audio`] — so safe code cannot reach the processor on the
+//! audio thread without provably holding the AUDIO state.
 
 use std::cell::{RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::diag::DiagCounters;
 use crate::rt::{
-    command_queue, spsc, Command, CommandConsumer, CommandProducer, Consumer, ParamMirror, Producer,
+    command_queue, spsc, Command, CommandConsumer, CommandProducer, Consumer, ParamMirror,
+    Producer, StateCommand, STATE_COMMAND_CAPACITY,
 };
 use crate::{MidiOut, Processor};
 
@@ -57,7 +65,21 @@ pub struct AudioCore<P: Processor> {
     /// MIDI scratch for the current block, preallocated.
     pub midi_out: MidiOut,
     cmd_rx: CommandConsumer,
+    state_cmd_rx: Consumer<StateCommand>,
     state_tx: Producer<StateResponse>,
+}
+
+/// Proof that the holder entered the AUDIO state via [`Engine::begin_audio`]
+/// and has not left it. Not constructible outside the engine module, not
+/// `Clone`, and consumed by [`Engine::end_audio`], so at most one exists
+/// and only while blocks are flowing. Adapters stash it in instance state
+/// for the duration of processing.
+pub struct AudioToken(());
+
+impl std::fmt::Debug for AudioToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AudioToken")
+    }
 }
 
 /// What [`Engine::drain_commands`] did at the top of a block.
@@ -90,10 +112,14 @@ impl<P: Processor> Clone for EngineHandle<P> {
 
 impl<P: Processor> EngineHandle<P> {
     /// Route a parameter change to the instance (direct when stopped,
-    /// queued when running). No-op after the instance is gone.
-    pub fn set_param(&self, id: u32, value: f64) {
-        if let Some(engine) = self.engine.upgrade() {
-            engine.set_param(id, value);
+    /// queued when running). Returns `false` when the change did not enter
+    /// the engine — instance gone, or the command queue full (counted via
+    /// `commands_dropped`) — so callers tracking versions never record a
+    /// change that went nowhere (invariant 9).
+    pub fn set_param(&self, id: u32, value: f64) -> bool {
+        match self.engine.upgrade() {
+            Some(engine) => engine.set_param(id, value),
+            None => false,
         }
     }
 
@@ -116,6 +142,12 @@ pub struct Engine<P: Processor> {
     mirror: ParamMirror,
     diag: Arc<DiagCounters>,
     cmd_tx: CommandProducer,
+    /// State-op commands, single-producer by way of this mutex. The lock is
+    /// held for the whole round-trip (push + wait for the response), so at
+    /// most one state op is ever in flight — which is the proof that the
+    /// audio thread's response ring (capacity 2) cannot overflow. Main
+    /// thread only.
+    state_cmd_tx: Mutex<Producer<StateCommand>>,
     /// Main-thread only, hence RefCell: the response half of state ops.
     state_rx: RefCell<Consumer<StateResponse>>,
     /// Main-thread stash of freed state buffers, reused across loads.
@@ -143,18 +175,21 @@ impl<P: Processor + Default> Engine<P> {
         let processor = P::default();
         let mirror = ParamMirror::new(P::params(), |id| processor.get_param(id));
         let (cmd_tx, cmd_rx) = command_queue();
+        let (state_cmd_tx, state_cmd_rx) = spsc(STATE_COMMAND_CAPACITY);
         let (state_tx, state_rx) = spsc(STATE_RESPONSE_CAPACITY);
         Arc::new(Self {
             core: UnsafeCell::new(AudioCore {
                 processor,
                 midi_out: MidiOut::with_capacity(midi_capacity),
                 cmd_rx,
+                state_cmd_rx,
                 state_tx,
             }),
             access: AtomicU8::new(IDLE),
             mirror,
             diag: Arc::new(DiagCounters::default()),
             cmd_tx,
+            state_cmd_tx: Mutex::new(state_cmd_tx),
             state_rx: RefCell::new(state_rx),
             buffers: RefCell::new(Vec::new()),
             latency: std::sync::atomic::AtomicU32::new(0),
@@ -184,10 +219,16 @@ impl<P: Processor> Engine<P> {
 
     // --- the access protocol ----------------------------------------------
 
-    /// Enter the AUDIO state. Called from `start_processing` (CLAP) /
-    /// `setProcessing(true)` (VST3) — before the first block, so no
-    /// deadline exists while this spins out an in-flight main access.
-    pub fn begin_audio(&self) {
+    /// Enter the AUDIO state, returning the token that proves it. Called
+    /// from `start_processing` (CLAP) / `setProcessing(true)` (VST3) —
+    /// before the first block, so no deadline exists while this spins out
+    /// an in-flight main access. The caller keeps the token in instance
+    /// state and hands it back to [`Engine::end_audio`].
+    pub fn begin_audio(&self) -> AudioToken {
+        debug_assert!(
+            self.access.load(Ordering::Relaxed) != AUDIO,
+            "begin_audio while already AUDIO"
+        );
         while self
             .access
             .compare_exchange_weak(IDLE, AUDIO, Ordering::Acquire, Ordering::Relaxed)
@@ -195,10 +236,12 @@ impl<P: Processor> Engine<P> {
         {
             std::hint::spin_loop();
         }
+        AudioToken(())
     }
 
-    /// Leave the AUDIO state (`stop_processing`). Audio thread.
-    pub fn end_audio(&self) {
+    /// Leave the AUDIO state (`stop_processing`). Audio thread; consumes
+    /// the token, so no audio-core access is possible afterwards.
+    pub fn end_audio(&self, _token: AudioToken) {
         self.access.store(IDLE, Ordering::Release);
     }
 
@@ -207,17 +250,17 @@ impl<P: Processor> Engine<P> {
         self.access.load(Ordering::Acquire) == AUDIO
     }
 
-    /// The audio-side state. Call only from the audio thread while
-    /// processing — i.e. inside `process`/`params_flush` after
-    /// [`Engine::begin_audio`] and before [`Engine::end_audio`].
+    /// The audio-side state. Audio thread only, and only with a borrow of
+    /// the live [`AudioToken`] — safe code cannot reach this without one.
     #[allow(clippy::mut_from_ref)]
-    pub fn audio_core(&self) -> &mut AudioCore<P> {
+    pub fn audio_core(&self, _token: &AudioToken) -> &mut AudioCore<P> {
         debug_assert!(
             self.access.load(Ordering::Relaxed) == AUDIO,
             "audio_core without begin_audio"
         );
-        // SAFETY: the caller holds the AUDIO state, so no other thread may
-        // touch `core` (protocol at the top of this module).
+        // SAFETY: the token proves the caller entered the AUDIO state and
+        // has not left it, so no other thread may touch `core` (protocol at
+        // the top of this module).
         unsafe { &mut *self.core.get() }
     }
 
@@ -254,7 +297,13 @@ impl<P: Processor> Engine<P> {
     /// when the transport is stopped, queued for the next block otherwise.
     /// Main or bus thread; realtime-safe by construction (never locks the
     /// processor).
-    pub fn set_param(&self, id: u32, value: f64) {
+    ///
+    /// Returns `false` when the change went nowhere (command queue full;
+    /// counted via `commands_dropped`). Callers tracking versions (LWW)
+    /// must only record a change that returned `true` — otherwise the
+    /// version is marked accepted for a value that never landed, and
+    /// convergence breaks (invariant 9).
+    pub fn set_param(&self, id: u32, value: f64) -> bool {
         let applied = self.with_main(|core| {
             core.processor.set_param(id, value);
             // Publish the readback, not the request: processors may round
@@ -263,12 +312,17 @@ impl<P: Processor> Engine<P> {
             core.processor.get_param(id)
         });
         match applied {
-            Some(actual) => self.mirror.publish(id, actual),
-            None => {
-                if self.cmd_tx.push(Command::SetParam { id, value }).is_err() {
-                    DiagCounters::bump(&self.diag.commands_dropped);
-                }
+            Some(actual) => {
+                self.mirror.publish(id, actual);
+                true
             }
+            None => match self.cmd_tx.push(Command::SetParam { id, value }) {
+                Ok(()) => true,
+                Err(_) => {
+                    DiagCounters::bump(&self.diag.commands_dropped);
+                    false
+                }
+            },
         }
     }
 
@@ -279,7 +333,11 @@ impl<P: Processor> Engine<P> {
         if let Some(data) = self.with_main(|core| core.processor.save_state()) {
             return Some(data);
         }
-        self.cmd_tx.push(Command::SaveState).ok()?;
+        // Serialize state ops: holding this lock across the round-trip
+        // guarantees at most one is in flight, which is what keeps the
+        // audio thread's response ring (capacity 2) from ever overflowing.
+        let mut state_tx = self.state_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+        state_tx.push(StateCommand::SaveState).ok()?;
         match self.wait_for_response()? {
             StateResponse::Saved(data) => Some(data),
             StateResponse::Loaded { .. } => None, // protocol bug; fail loud-ish
@@ -316,7 +374,9 @@ impl<P: Processor> Engine<P> {
                 None => data,
             }
         };
-        if self.cmd_tx.push(Command::LoadState(payload)).is_err() {
+        // Same one-op-in-flight serialization as save_state.
+        let mut state_tx = self.state_cmd_tx.lock().unwrap_or_else(|e| e.into_inner());
+        if state_tx.push(StateCommand::LoadState(payload)).is_err() {
             DiagCounters::bump(&self.diag.commands_dropped);
             return false;
         }
@@ -353,11 +413,19 @@ impl<P: Processor> Engine<P> {
 
     /// Reset DSP state (`Processor::reset`). Main thread. Direct when
     /// stopped; queued for the top of the next block when running, so the
-    /// reset lands between blocks rather than mid-buffer.
-    pub fn reset(&self) {
+    /// reset lands between blocks rather than mid-buffer. Returns `false`
+    /// when the command queue was full (counted via `commands_dropped`).
+    pub fn reset(&self) -> bool {
         let applied = self.with_main(|core| core.processor.reset());
-        if applied.is_none() && self.cmd_tx.push(Command::Reset).is_err() {
-            DiagCounters::bump(&self.diag.commands_dropped);
+        match applied {
+            Some(()) => true,
+            None => match self.cmd_tx.push(Command::Reset) {
+                Ok(()) => true,
+                Err(_) => {
+                    DiagCounters::bump(&self.diag.commands_dropped);
+                    false
+                }
+            },
         }
     }
 
@@ -379,11 +447,13 @@ impl<P: Processor> Engine<P> {
     /// The MIDI scratch of the last rendered block. Unlike the rest of the
     /// core, no `with_main` closure in any adapter touches this buffer — it
     /// is written only by the render thread (`process`/`clear`) — so the
-    /// render thread may read the events it just produced even after
-    /// [`Engine::end_audio`]. AUv3 needs exactly that: the shim enumerates
-    /// MIDI output after the render call returns, inside the same render
-    /// block.
-    pub fn midi_out(&self) -> &MidiOut {
+    /// render thread may re-claim the audio state to read the events it
+    /// just produced. AUv3 needs exactly that: the shim enumerates MIDI
+    /// output after the render call returns but inside the same host render
+    /// block, so the adapter briefly re-enters AUDIO (`begin_audio` → read
+    /// → `end_audio`) on the render thread rather than holding the token
+    /// across render calls.
+    pub fn midi_out(&self, _token: &AudioToken) -> &MidiOut {
         // SAFETY: per the contract above, `midi_out` has a single writer
         // (the render thread), so a render-thread read never races.
         unsafe { &(*self.core.get()).midi_out }
@@ -391,11 +461,18 @@ impl<P: Processor> Engine<P> {
 
     /// Drain pending commands at the top of a block. Audio thread; the
     /// caller holds AUDIO and passes the core from [`Engine::audio_core`].
-    /// Lock-free and allocation-free apart from the documented state-op
-    /// exception (invariant 3 names it: host-initiated (de)serialization).
+    ///
+    /// Ordinary commands (parameter changes, resets) are cheap and bounded,
+    /// so the queue is drained in full. State commands are potentially
+    /// expensive (whole-processor (de)serialization) and travel on their
+    /// own queue: at most one is serviced per block, so neither a flood of
+    /// parameter moves nor a heavyweight state op can extend this callback
+    /// beyond one bounded amount of work. Lock-free and allocation-free
+    /// apart from the documented state-op exception (invariant 3 names it:
+    /// host-initiated (de)serialization allocates inside the plugin's
+    /// `save_state`).
     pub fn drain_commands(&self, core: &mut AudioCore<P>) -> DrainReport {
         let mut report = DrainReport::default();
-        let mut loaded_ok = false;
         while let Some(cmd) = core.cmd_rx.pop() {
             match cmd {
                 Command::SetParam { id, value } => {
@@ -407,37 +484,51 @@ impl<P: Processor> Engine<P> {
                     self.mirror.publish(id, core.processor.get_param(id));
                     report.notify_main = true;
                 }
-                Command::LoadState(data) => {
-                    let ok = core.processor.load_state(&data);
-                    // Hand the buffer back for reuse; freeing it here would
-                    // put an allocator call on the audio thread.
-                    let _ = core
-                        .state_tx
-                        .push(StateResponse::Loaded { ok, buffer: data });
-                    if ok {
-                        loaded_ok = true;
-                        report.notify_main = true;
-                    }
-                }
-                Command::SaveState => {
-                    let data = core.processor.save_state();
-                    let _ = core.state_tx.push(StateResponse::Saved(data));
-                }
                 Command::Reset => {
                     core.processor.reset();
                 }
             }
         }
-        // A load rewrote everything: republish the whole mirror from the
-        // processor. Reading it here is fine — the audio thread owns it
-        // during a block. (Cheap: state loads are rare, and the Vec is
-        // covered by the documented state-op allocation exception.)
-        if loaded_ok {
-            let values: Vec<(u32, f64)> = P::params()
-                .iter()
-                .map(|d| (d.id, core.processor.get_param(d.id)))
-                .collect();
-            self.mirror.publish_all(&values);
+        // At most one state op per block: these can be arbitrarily heavy,
+        // and the queue holds at most one more behind it.
+        if let Some(cmd) = core.state_cmd_rx.pop() {
+            match cmd {
+                StateCommand::LoadState(data) => {
+                    let ok = core.processor.load_state(&data);
+                    // Hand the buffer back for reuse; freeing it here would
+                    // put an allocator call on the audio thread. The push
+                    // cannot fail while the state-op lock serializes
+                    // round-trips (capacity 2, at most one in flight) — the
+                    // counter exists to catch a violation of that proof.
+                    if core
+                        .state_tx
+                        .push(StateResponse::Loaded { ok, buffer: data })
+                        .is_err()
+                    {
+                        debug_assert!(false, "state response ring overflowed");
+                        DiagCounters::bump(&self.diag.state_responses_dropped);
+                    }
+                    if ok {
+                        // A load rewrote everything: republish the whole
+                        // mirror from the processor. Reading it here is fine
+                        // — the audio thread owns it during a block. One
+                        // publish per parameter: batching into a Vec would
+                        // allocate on the audio thread (invariant 3).
+                        for def in P::params() {
+                            self.mirror
+                                .publish(def.id, core.processor.get_param(def.id));
+                        }
+                        report.notify_main = true;
+                    }
+                }
+                StateCommand::SaveState => {
+                    let data = core.processor.save_state();
+                    if core.state_tx.push(StateResponse::Saved(data)).is_err() {
+                        debug_assert!(false, "state response ring overflowed");
+                        DiagCounters::bump(&self.diag.state_responses_dropped);
+                    }
+                }
+            }
         }
         // Dynamic latency: a processor may change its latency at runtime
         // (a lookahead limiter engaging, say). One atomic load per block
@@ -498,7 +589,7 @@ mod tests {
     fn stopped_engine_applies_directly() {
         let engine = Engine::<Gain>::new(64);
         assert!(!engine.is_processing());
-        engine.set_param(7, 0.9);
+        assert!(engine.set_param(7, 0.9));
         assert_eq!(engine.mirror().get(7), Some(0.9));
         let data = engine.save_state().unwrap();
         assert!(engine.load_state(data));
@@ -507,7 +598,7 @@ mod tests {
     #[test]
     fn running_engine_round_trips_state_and_params() {
         let engine = Engine::<Gain>::new(64);
-        engine.begin_audio();
+        let token = engine.begin_audio();
         assert!(engine.is_processing());
 
         // "Audio thread": drains until the main thread says stop — like a
@@ -519,22 +610,243 @@ mod tests {
             std::thread::spawn(move || {
                 let mut saw_notify = false;
                 while !stop.load(Ordering::Relaxed) {
-                    let core = engine.audio_core();
+                    let core = engine.audio_core(&token);
                     saw_notify |= engine.drain_commands(core).notify_main;
                 }
-                saw_notify
+                (saw_notify, token)
             })
         };
 
         // "Main thread": param change and a state round-trip while running.
-        engine.set_param(7, 0.25);
+        assert!(engine.set_param(7, 0.25));
         let saved = engine.save_state().expect("save round-trip timed out");
         assert!(engine.load_state(saved));
         assert_eq!(engine.mirror().get(7), Some(0.25));
 
         stop.store(true, Ordering::Relaxed);
-        assert!(audio.join().unwrap());
-        engine.end_audio();
+        let (saw_notify, token) = audio.join().unwrap();
+        assert!(saw_notify, "the queued change set notify_main");
+        engine.end_audio(token);
+    }
+
+    /// A state op must not starve behind a full param queue, and a pending
+    /// state op must not occupy param-queue slots: the queues are separate,
+    /// so a round-trip answers even with the param queue packed full.
+    #[test]
+    fn state_round_trip_works_with_a_full_param_queue() {
+        let engine = Engine::<Gain>::new(64);
+        let token = engine.begin_audio();
+
+        // Pack the param queue to capacity; the next push fails.
+        for _ in 0..crate::rt::COMMAND_CAPACITY {
+            assert!(engine.set_param(7, 0.5));
+        }
+        assert!(!engine.set_param(7, 0.5), "queue full: push reports it");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|s| {
+            // "Audio thread": render blocks until told to stop.
+            let engine = &engine;
+            let token = &token;
+            let stop = &stop;
+            let drainer = s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    engine.drain_commands(engine.audio_core(token));
+                    std::thread::yield_now();
+                }
+            });
+            // A save round-trip still works — it never touches the param
+            // queue, and the drainer services the state queue alongside.
+            let saved = engine.save_state().expect("save with full param queue");
+            assert!(engine.load_state(saved));
+            stop.store(true, Ordering::Relaxed);
+            drainer.join().unwrap();
+        });
+
+        assert_eq!(engine.mirror().get(7), Some(0.5));
+        assert!(
+            engine.diag().commands_dropped.load(Ordering::Relaxed) >= 1,
+            "the failed push was counted"
+        );
+        engine.end_audio(token);
+    }
+
+    /// State ops are serviced at most once per block and serialize on the
+    /// state-op lock: two concurrent round-trips (an adversarial host) both
+    /// complete, and the response ring never overflows.
+    #[test]
+    fn concurrent_state_round_trips_serialize_and_complete() {
+        let engine = Engine::<Gain>::new(64);
+        let token = engine.begin_audio();
+        let a = std::thread::spawn({
+            let engine = Arc::clone(&engine);
+            move || engine.save_state()
+        });
+        let b = std::thread::spawn({
+            let engine = Arc::clone(&engine);
+            move || engine.save_state()
+        });
+        // "Audio thread": keep rendering blocks until both round-trips have
+        // had ample time to complete (well under their internal timeout).
+        for _ in 0..100 {
+            engine.drain_commands(engine.audio_core(&token));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(a.join().unwrap().is_some(), "first round-trip completed");
+        assert!(b.join().unwrap().is_some(), "second round-trip completed");
+        assert_eq!(
+            engine
+                .diag()
+                .state_responses_dropped
+                .load(Ordering::Relaxed),
+            0,
+            "the one-in-flight proof held"
+        );
+        engine.end_audio(token);
+    }
+
+    /// The LWW/queue atomicity regression: an IPC frame whose command could
+    /// not enter the engine must leave no version mark, so the identical
+    /// version re-delivered later (a sync_state heal) still wins and the
+    /// instance converges instead of diverging permanently (invariant 9).
+    #[test]
+    fn ipc_frame_dropped_by_full_queue_is_not_marked_and_heals() {
+        use crate::lww::Lww;
+        use crate::rt::COMMAND_CAPACITY;
+
+        let engine = Engine::<Gain>::new(64);
+        let token = engine.begin_audio();
+        let lww = Lww::new();
+
+        // Fill the command queue with accepted frames.
+        for seq in 1..=COMMAND_CAPACITY as u64 {
+            assert!(lww.accept_with(7, Some((seq, 1)), || engine.set_param(7, 0.1)));
+        }
+        // The queue is full: this frame's command goes nowhere...
+        let lost = (COMMAND_CAPACITY as u64 + 1, 1);
+        assert!(!lww.accept_with(7, Some(lost), || engine.set_param(7, 0.9)));
+        // ...and it must NOT be marked accepted, or the heal below would be
+        // rejected as stale and the instance would stay diverged forever.
+        assert_eq!(
+            lww.known_version(7),
+            Some((COMMAND_CAPACITY as u64, 1)),
+            "the lost frame left no mark"
+        );
+
+        // Heal: the queue drains, then the same version arrives again (as a
+        // sync_state answer would re-deliver it).
+        let core = engine.audio_core(&token);
+        engine.drain_commands(core);
+        assert!(
+            lww.accept_with(7, Some(lost), || engine.set_param(7, 0.9)),
+            "the re-delivered version still wins"
+        );
+        let core = engine.audio_core(&token);
+        engine.drain_commands(core);
+        assert_eq!(engine.mirror().get(7), Some(0.9), "converged");
+        engine.end_audio(token);
+    }
+
+    /// An editor-originated change whose command cannot enter the engine is
+    /// neither stamped nor broadcast: the instance never claims a version
+    /// for a value it does not hold.
+    #[test]
+    fn local_edit_dropped_by_full_queue_is_not_stamped() {
+        use crate::lww::Lww;
+        use crate::rt::COMMAND_CAPACITY;
+
+        let engine = Engine::<Gain>::new(64);
+        let token = engine.begin_audio();
+        let lww = Lww::new();
+        for _ in 0..COMMAND_CAPACITY {
+            assert!(engine.set_param(7, 0.5));
+        }
+        assert_eq!(lww.stamp_with(7, || engine.set_param(7, 0.9)), None);
+        assert_eq!(lww.known_version(7), None, "no version was claimed");
+        engine.end_audio(token);
+    }
+
+    /// Simultaneous editors: the LWW record lock serializes apply order
+    /// with version order, so the engine must end up holding the value that
+    /// carries the highest version — never a stale one with a fresh mark.
+    #[test]
+    fn simultaneous_editors_converge_on_the_highest_version() {
+        use crate::lww::Lww;
+
+        let engine = Engine::<Gain>::new(64);
+        let token = engine.begin_audio();
+        let lww = Arc::new(Lww::new());
+        const EDITORS: usize = 8;
+        let threads: Vec<_> = (0..EDITORS)
+            .map(|n| {
+                let engine = Arc::clone(&engine);
+                let lww = Arc::clone(&lww);
+                std::thread::spawn(move || {
+                    let value = 0.5 + n as f64 * 0.01;
+                    lww.stamp_with(7, || engine.set_param(7, value))
+                        .map(|ver| (ver, value))
+                })
+            })
+            .collect();
+        let stamped: Vec<_> = threads
+            .into_iter()
+            .map(|t| t.join().unwrap().expect("queue has room for 8 edits"))
+            .collect();
+        let core = engine.audio_core(&token);
+        engine.drain_commands(core);
+        engine.end_audio(token);
+
+        let (best_version, best_value) = stamped.iter().max_by_key(|(v, _)| *v).unwrap();
+        assert_eq!(engine.mirror().get(7), Some(*best_value));
+        assert_eq!(lww.known_version(7), Some(*best_version));
+    }
+
+    /// Owner death during sync: the engine handle must fail cleanly rather
+    /// than touch freed state.
+    #[test]
+    fn handle_outlives_engine_safely() {
+        let handle = {
+            let engine = Engine::<Gain>::new(64);
+            engine.handle()
+            // engine dropped here
+        };
+        assert!(!handle.set_param(7, 0.5), "gone instance: not accepted");
+        assert!(handle.snapshot_params().is_empty());
+    }
+
+    /// Repeated lifecycle transitions with traffic in between: every cycle
+    /// must end with the queued changes applied exactly once.
+    #[test]
+    fn repeated_start_stop_cycles_apply_queued_changes() {
+        let engine = Engine::<Gain>::new(64);
+        for cycle in 0..20 {
+            let token = engine.begin_audio();
+            let want = (cycle as f64 + 1.0) / 100.0;
+            assert!(engine.set_param(7, want));
+            assert!(engine.reset());
+            let core = engine.audio_core(&token);
+            engine.drain_commands(core);
+            engine.end_audio(token);
+            assert_eq!(engine.mirror().get(7), Some(want));
+        }
+    }
+
+    /// Rapidly changing latency: every change is reported, none is lost,
+    /// and the flag fires once per observed change.
+    #[test]
+    fn rapidly_changing_latency_is_reported_each_time() {
+        let engine = Engine::<DynLatency>::new(64);
+        engine.set_latency(0);
+        let token = engine.begin_audio();
+        let mut prev = 0;
+        for want in [0, 64, 0, 512, 384, 384, 0] {
+            engine.audio_core(&token).processor.0 = want;
+            let report = engine.drain_commands(engine.audio_core(&token));
+            assert_eq!(engine.latency(), want);
+            assert_eq!(report.notify_main, want != prev);
+            prev = want;
+        }
+        engine.end_audio(token);
     }
 
     #[test]
@@ -543,8 +855,8 @@ mod tests {
         let audio = {
             let engine = Arc::clone(&engine);
             std::thread::spawn(move || {
-                engine.begin_audio();
-                engine.end_audio();
+                let token = engine.begin_audio();
+                engine.end_audio(token);
             })
         };
         // Hold a main access briefly; the audio starter must wait, then win.
@@ -589,21 +901,21 @@ mod tests {
         let initial = engine.with_main(|core| core.processor.latency()).unwrap();
         engine.set_latency(initial);
 
-        engine.begin_audio();
-        let report = engine.drain_commands(engine.audio_core());
+        let token = engine.begin_audio();
+        let report = engine.drain_commands(engine.audio_core(&token));
         assert!(!report.notify_main, "unchanged latency must stay quiet");
         assert!(!engine.take_latency_changed());
 
         // The processor's latency moves (main thread, transport stopped is
         // not required for the test — the flag is what matters).
-        engine.end_audio();
+        engine.end_audio(token);
         engine.with_main(|core| core.processor.0 = 384);
-        engine.begin_audio();
-        let report = engine.drain_commands(engine.audio_core());
+        let token = engine.begin_audio();
+        let report = engine.drain_commands(engine.audio_core(&token));
         assert!(report.notify_main, "a latency change asks for the bounce");
         assert_eq!(engine.latency(), 384, "the cached value updates at once");
         assert!(engine.take_latency_changed());
         assert!(!engine.take_latency_changed(), "the flag is consumed once");
-        engine.end_audio();
+        engine.end_audio(token);
     }
 }
