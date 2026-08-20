@@ -37,6 +37,7 @@ extern void skuiz_auv3_set_param(void *inst, uint32_t id, double value);
 extern void skuiz_auv3_set_param_from_render(void *inst, uint32_t id, double value);
 extern uint32_t skuiz_auv3_save_state(void *inst, uint8_t *buf, uint32_t cap);
 extern bool skuiz_auv3_load_state(void *inst, const uint8_t *buf, uint32_t len);
+extern void skuiz_auv3_reset(void *inst);
 extern uint32_t skuiz_auv3_midi_count(void *inst);
 extern bool skuiz_auv3_midi_event(void *inst, uint32_t index, uint32_t *frame, uint8_t *bytes3);
 
@@ -276,6 +277,13 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
     // The pair of allocateRenderResourcesAndReturnError's activate.
     skuiz_auv3_deactivate(_instance);
     [super deallocateRenderResources];
+}
+
+- (void)reset {
+    // Host-initiated DSP reset (transport jump, recycled unit): routed
+    // through the engine so it lands between blocks, never mid-buffer.
+    skuiz_auv3_reset(_instance);
+    [super reset];
 }
 
 - (NSArray<NSString *> *)MIDIOutputNames {

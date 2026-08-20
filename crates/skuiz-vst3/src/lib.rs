@@ -28,9 +28,13 @@
 
 #![allow(non_snake_case)]
 
+use skuiz_core::diag::DiagCounters;
+use skuiz_core::engine::Engine;
 use skuiz_core::{MidiOut, ParamDef, Processor};
+use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
@@ -39,7 +43,11 @@ use vst3::{Class, ComPtr, ComRef, ComWrapper};
 pub use vst3;
 
 /// Whether this platform has a webview editor backend in `skuiz-ui`.
-const EDITOR_SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+const EDITOR_SUPPORTED: bool = cfg!(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "linux"
+));
 
 /// The VST3 platform type matching this platform's `ParentView` constructor.
 fn native_platform_type() -> FIDString {
@@ -47,7 +55,11 @@ fn native_platform_type() -> FIDString {
     {
         kPlatformTypeHWND
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        kPlatformTypeX11EmbedWindowID
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
     {
         kPlatformTypeNSView
     }
@@ -187,36 +199,40 @@ pub const fn derive_cid(plugin_id: &str) -> TUID {
 /// `Arc` so the view cannot outlive it, and so a bus callback never points
 /// at memory the host has freed.
 struct Shared<P: Processor> {
-    processor: Mutex<P>,
-    midi_out: Mutex<MidiOut>,
+    /// The engine owns the processor and everything realtime (see
+    /// docs/concepts/invariants.md); Arc'd for the view and the bus
+    /// callback's Weak handle.
+    engine: Arc<Engine<P>>,
     /// Timed parameter points collected from the host for the current
     /// block: `(sample_offset, param_id, plain_value)`. Audio-thread only;
     /// pre-allocated so `process` never allocates. The block is split at
     /// these offsets so automation lands sample-accurately.
-    param_events: Mutex<Vec<(u32, u32, f64)>>,
+    param_events: UnsafeCell<Vec<(u32, u32, f64)>>,
     bus: Mutex<Option<skuiz_ipc::Bus>>,
-    sync: Arc<SyncState>,
+    /// Last-writer-wins versions for shared parameters (invariant 9); bus
+    /// and UI threads only.
+    lww: Arc<skuiz_core::lww::Lww>,
     /// The host's handler, retained while it is set. Editor-driven changes
     /// go through this, or the host never learns the GUI moved a parameter.
     handler: Mutex<Option<ComPtr<IComponentHandler>>>,
-}
-
-#[derive(Default)]
-struct SyncState {
-    pending: Mutex<Vec<(u32, f64)>>,
+    /// Remote (bus/state) changes landed since the host was last told.
+    /// Consumed in `getParamNormalized`, where the dirty flag becomes a
+    /// `restartComponent(kParamValuesChanged)` — VST3 has no equivalent of
+    /// CLAP's `request_callback`, and that getter is the closest thing to a
+    /// regular main-thread entry point the interface offers.
+    editor_dirty: AtomicBool,
 }
 
 impl<P: Processor> Shared<P> {
-    /// Apply an editor-driven parameter change: update the processor, tell
-    /// the host so it records automation, and share it with other instances.
+    /// Apply an editor-driven parameter change: update the processor (via
+    /// the engine — direct when stopped, queued for the next block when
+    /// running), tell the host so it records automation, and share it with
+    /// other instances.
     fn set_param_from_editor(&self, id: u32, value: f64) {
         let Some(def) = P::params().iter().find(|p| p.id == id) else {
             return;
         };
-        self.processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_param(id, value);
+        self.engine.set_param(id, value);
         // Clone the retained handler out and release the lock before the
         // COM calls: hosts may re-enter the controller synchronously from
         // performEdit, and holding our lock across that is a deadlock
@@ -236,9 +252,18 @@ impl<P: Processor> Shared<P> {
                 handler.endEdit(id);
             }
         }
-        if let Ok(bus) = self.bus.lock() {
-            if let Some(bus) = bus.as_ref() {
-                bus.send(skuiz_core::protocol::set_param(id, value).as_bytes());
+        // Only parameters declared shared leave the instance (invariant 10).
+        // The versioned frame lets receivers discard stale echoes
+        // (invariant 9).
+        if def.shared {
+            if let Ok(bus) = self.bus.lock() {
+                if let Some(bus) = bus.as_ref() {
+                    let (seq, origin) = self.lww.stamp(id);
+                    bus.send(
+                        skuiz_core::protocol::set_param_versioned(id, value, seq, origin)
+                            .as_bytes(),
+                    );
+                }
             }
         }
     }
@@ -261,12 +286,12 @@ impl<P: Processor + Default> Vst3Plugin<P> {
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
-                processor: Mutex::new(P::default()),
-                midi_out: Mutex::new(MidiOut::with_capacity(MIDI_OUT_CAPACITY)),
-                param_events: Mutex::new(Vec::with_capacity(PARAM_EVENT_CAPACITY)),
+                engine: Engine::new(MIDI_OUT_CAPACITY),
+                param_events: UnsafeCell::new(Vec::with_capacity(PARAM_EVENT_CAPACITY)),
                 bus: Mutex::new(None),
-                sync: Arc::new(SyncState::default()),
+                lww: Arc::new(skuiz_core::lww::Lww::new()),
                 handler: Mutex::new(None),
+                editor_dirty: AtomicBool::new(false),
             }),
             _marker: PhantomData,
         }
@@ -294,7 +319,8 @@ impl<P: Processor> Vst3Plugin<P> {
     /// (pre-allocated, never grows past [`PARAM_EVENT_CAPACITY`]). VST3
     /// sends a queue of timed points per parameter; every point is kept,
     /// converted to a plain value, clamped into the block, and sorted by
-    /// sample offset so the block can be split at event times.
+    /// sample offset so the block can be split at event times. Overflow
+    /// policy (invariant 8): drop the excess points, count each one.
     unsafe fn collect_param_changes(
         &self,
         changes: *mut IParameterChanges,
@@ -314,7 +340,8 @@ impl<P: Processor> Vst3Plugin<P> {
             };
             for point in 0..queue.getPointCount() {
                 if out.len() >= out.capacity() {
-                    return; // full: drop the excess, same philosophy as MidiOut
+                    DiagCounters::bump(&self.shared.engine.diag().param_events_dropped);
+                    continue;
                 }
                 let mut offset = 0;
                 let mut normalized = 0.0;
@@ -328,16 +355,15 @@ impl<P: Processor> Vst3Plugin<P> {
         out.sort_unstable_by_key(|e| e.0);
     }
 
-    /// Convert generated MIDI into VST3 events. MIDI 1.0 note on/off map to
-    /// native note events; other messages need `kLegacyMIDICCOutEvent`
-    /// handling and are dropped for now, as are MIDI 2.0 UMP events (VST3
-    /// has no UMP event type; a MIDI 2.0 note could be lossily converted,
-    /// but silent-and-documented beats wrong-velocity).
+    /// Convert generated MIDI into VST3 events. MIDI 1.0 note on/off and
+    /// poly pressure map to native event types; CC, pitch bend and channel
+    /// pressure travel as `kLegacyMIDICCOutEvent`. MIDI 2.0 UMP events are
+    /// dropped: VST3 has no UMP event type, and a MIDI 2.0 note's attribute
+    /// data would be lost in a lossy conversion — silent-and-documented
+    /// beats wrong.
     /// `offset` is the segment's start within the block (the block is split
     /// at parameter-point times, so the DSP's frame numbers are
     /// segment-relative); `frames` is the whole block.
-    // ponytail: MIDI 1.0 notes only. Add CC/pitch-bend as legacy MIDI CC
-    // events when an example needs them.
     unsafe fn emit_events(&self, out: *mut IEventList, midi: &MidiOut, frames: usize, offset: u32) {
         let Some(list) = ComRef::from_raw(out) else {
             return;
@@ -376,6 +402,32 @@ impl<P: Processor> Vst3Plugin<P> {
                         tuning: 0.0,
                     };
                 }
+                0xA0 => {
+                    // Poly pressure has a native VST3 event type.
+                    event.r#type = Event_::EventTypes_::kPolyPressureEvent as u16;
+                    event.__field0.polyPressure = PolyPressureEvent {
+                        channel,
+                        pitch: bytes[1] as i16,
+                        pressure: bytes[2] as f32 / 127.0,
+                        noteId: -1,
+                    };
+                }
+                0xB0 | 0xD0 | 0xE0 => {
+                    // CC as-is; channel pressure as kAfterTouch; pitch bend
+                    // as kPitchBend with value = LSB, value2 = MSB.
+                    let (control_number, value, value2) = match status {
+                        0xB0 => (bytes[1], bytes[2], 0),
+                        0xD0 => (ControllerNumbers_::kAfterTouch as u8, bytes[1], 0),
+                        _ => (ControllerNumbers_::kPitchBend as u8, bytes[1], bytes[2]),
+                    };
+                    event.r#type = Event_::EventTypes_::kLegacyMIDICCOutEvent as u16;
+                    event.__field0.midiCCOut = LegacyMIDICCOutEvent {
+                        controlNumber: control_number,
+                        channel: channel as i8,
+                        value: value as i8,
+                        value2: value2 as i8,
+                    };
+                }
                 _ => continue,
             }
             list.addEvent(&mut event);
@@ -388,16 +440,14 @@ impl<P: Processor> Vst3Plugin<P> {
     fn set_active_inner(&self, state: TBool) -> tresult {
         if state == 0 {
             self.shared
-                .processor
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .deactivate();
+                .engine
+                .with_main(|core| core.processor.deactivate());
         }
         kResultOk
     }
 
-    /// The whole stream is read before the processor lock is taken: stream
-    /// I/O is unbounded and the audio thread contends on the same lock.
+    /// The whole stream is read before the processor sees any of it:
+    /// stream I/O is unbounded and must not run under the access protocol.
     unsafe fn set_state_inner(&self, state: *mut IBStream) -> tresult {
         let Some(stream) = ComRef::from_raw(state) else {
             return kInvalidArgument;
@@ -419,12 +469,7 @@ impl<P: Processor> Vst3Plugin<P> {
             }
             data.extend_from_slice(&chunk[..read as usize]);
         }
-        let mut p = self
-            .shared
-            .processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if p.load_state(&data) {
+        if self.shared.engine.load_state(data) {
             kResultOk
         } else {
             kResultFalse
@@ -435,14 +480,11 @@ impl<P: Processor> Vst3Plugin<P> {
         let Some(stream) = ComRef::from_raw(state) else {
             return kInvalidArgument;
         };
-        // Serialise under the lock, then release it before the stream writes
-        // — same reasoning as set_state_inner.
-        let data = self
-            .shared
-            .processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .save_state();
+        // Direct when stopped, a bounded audio-thread round-trip when
+        // running; None means the round-trip timed out.
+        let Some(data) = self.shared.engine.save_state() else {
+            return kResultFalse;
+        };
         let mut written_total = 0usize;
         while written_total < data.len() {
             let mut written = 0i32;
@@ -464,11 +506,17 @@ impl<P: Processor> Vst3Plugin<P> {
         let Some(setup) = (unsafe { setup.as_ref() }) else {
             return kInvalidArgument;
         };
-        self.shared
-            .processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .activate(setup.sampleRate, setup.maxSamplesPerBlock as u32);
+        // setupProcessing is main-thread with the transport stopped; a
+        // host calling it while processing is breaking the spec, and we
+        // say no rather than race.
+        let Some(latency) = self.shared.engine.with_main(|core| {
+            core.processor
+                .activate(setup.sampleRate, setup.maxSamplesPerBlock as u32);
+            core.processor.latency()
+        }) else {
+            return kResultFalse;
+        };
+        self.shared.engine.set_latency(latency);
         kResultOk
     }
 
@@ -477,40 +525,28 @@ impl<P: Processor> Vst3Plugin<P> {
             return kInvalidArgument;
         };
         let frames = data.numSamples.max(0) as usize;
+        let engine = &*self.shared.engine;
+
+        // No locks below: the audio thread owns the processor (invariants
+        // 1-2). Queued remote/editor/state changes apply at block top; host
+        // automation lands sample-accurately in the segment loop.
+        //
+        // Hosts should call setProcessing(true) first; tolerate the ones
+        // (and the tests) that don't, rather than render silence.
+        if !engine.is_processing() {
+            engine.begin_audio();
+        }
+        let core = engine.audio_core();
+        let report = engine.drain_commands(core);
+        if report.notify_main {
+            self.shared.editor_dirty.store(true, Ordering::Release);
+        }
+        let proc_ = &mut core.processor;
 
         // The block's timed automation points, sorted by sample offset.
-        let mut events = self
-            .shared
-            .param_events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let events = &mut *self.shared.param_events.get();
         events.clear();
-        self.collect_param_changes(data.inputParameterChanges, frames, &mut events);
-
-        // One processor lock for the whole block. Values that arrived over
-        // IPC carry no timing, so they apply at block top; host automation
-        // lands sample-accurately in the segment loop below.
-        let mut proc_ = self
-            .shared
-            .processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        {
-            // Drained in place so the Vec's allocation survives — dropping
-            // it here would free on the audio thread.
-            let mut pending = self
-                .shared
-                .sync
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for &(id, value) in pending.iter() {
-                if Self::param_by_id(id).is_some() {
-                    proc_.set_param(id, value);
-                }
-            }
-            pending.clear();
-        }
+        self.collect_param_changes(data.inputParameterChanges, frames, events);
 
         // Output channel pointers. A host that connects no outputs still
         // gets the processor run with zero channels, so DSP that only emits
@@ -563,22 +599,22 @@ impl<P: Processor> Vst3Plugin<P> {
 
         // Split the block at point times: render up to the next point,
         // apply it, continue. Segments re-slice the same output buffers.
-        let mut midi = self
-            .shared
-            .midi_out
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let midi = &mut core.midi_out;
         let mut pos = 0usize;
         for &(time, id, value) in events.iter() {
             let t = (time as usize).min(frames);
             if t > pos {
-                self.process_segment(&mut proc_, &outs, n_ch, pos, t, &mut midi, data);
+                self.process_segment(proc_, &outs, n_ch, pos, t, midi, data);
                 pos = t;
             }
             proc_.set_param(id, value);
+            // Publish the readback, not the request: processors may round
+            // or clamp, and the mirror must hold the value actually in
+            // force.
+            engine.mirror().publish(id, proc_.get_param(id));
         }
         if pos < frames {
-            self.process_segment(&mut proc_, &outs, n_ch, pos, frames, &mut midi, data);
+            self.process_segment(proc_, &outs, n_ch, pos, frames, midi, data);
         }
         kResultOk
     }
@@ -603,6 +639,14 @@ impl<P: Processor> Vst3Plugin<P> {
         }
         midi.clear();
         proc_.process(&mut chans[..n_ch], midi);
+        // MIDI pushed past capacity is a counted drop (invariant 8).
+        if midi.dropped() > 0 {
+            self.shared
+                .engine
+                .diag()
+                .midi_events_dropped
+                .fetch_add(midi.dropped() as u64, Ordering::Relaxed);
+        }
         self.emit_events(
             data.outputEvents,
             midi,
@@ -612,25 +656,61 @@ impl<P: Processor> Vst3Plugin<P> {
     }
 
     fn get_param_normalized_inner(&self, id: u32) -> f64 {
+        // If remote (bus/state) changes landed since the last refresh, tell
+        // the host to re-query everything. `restartComponent` is the VST3
+        // mechanism for "parameter values changed without an edit"; it must
+        // run on the main thread, and this getter is as close to a regular
+        // main-thread entry as the interface offers — hosts poll it for
+        // their generic editors and automation lanes. The flag is consumed
+        // before the call, so a host answering the restart synchronously
+        // cannot recurse.
+        if self.shared.editor_dirty.swap(false, Ordering::Acquire) {
+            let handler = self
+                .shared
+                .handler
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(handler) = handler {
+                unsafe {
+                    handler.restartComponent(RestartFlags_::kParamValuesChanged);
+                }
+            }
+        }
+        // A runtime latency change (flagged by the engine's per-block poll)
+        // is announced the same way, with its own restart flag.
+        if self.shared.engine.take_latency_changed() {
+            let handler = self
+                .shared
+                .handler
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(handler) = handler {
+                unsafe {
+                    handler.restartComponent(RestartFlags_::kLatencyChanged);
+                }
+            }
+        }
         let Some(def) = Self::param_by_id(id) else {
             return 0.0;
         };
-        let p = self
-            .shared
-            .processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        to_normalized(def, p.get_param(id))
+        // The mirror answers host reads wait-free (invariant 6); a param the
+        // mirror doesn't know is not ours.
+        match self.shared.engine.mirror().get(id) {
+            Some(plain) => to_normalized(def, plain),
+            None => 0.0,
+        }
     }
 
     fn set_param_normalized_inner(&self, id: u32, value: f64) -> tresult {
         let Some(def) = Self::param_by_id(id) else {
             return kInvalidArgument;
         };
+        // Host-driven change: direct when stopped, queued for the next block
+        // when running; never locks the processor.
         self.shared
-            .processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .engine
             .set_param(id, from_normalized(def, value));
         kResultOk
     }
@@ -642,32 +722,73 @@ impl<P: Processor + Default> Class for Vst3Plugin<P> {
 
 impl<P: Processor + Default> IPluginBaseTrait for Vst3Plugin<P> {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        use skuiz_core::protocol as proto;
         // Join the IPC bus, exactly as the CLAP adapter does, so instances
-        // share state across formats and processes alike.
-        let sync = std::sync::Arc::clone(&self.shared.sync);
+        // share state across formats and processes alike. The callback holds
+        // only an engine handle (Weak), so a frame arriving after this
+        // instance is gone goes nowhere.
+        let handle = self.shared.engine.handle();
+        let lww = Arc::clone(&self.shared.lww);
+        let lww_cb = Arc::clone(&lww);
+        let sender_slot: Arc<Mutex<Option<skuiz_ipc::BusSender>>> = Arc::new(Mutex::new(None));
+        let cb_sender = Arc::clone(&sender_slot);
         let bus = skuiz_ipc::Bus::join(P::info().id, move |frame| {
+            if frame == skuiz_ipc::LINK_UP_FRAME {
+                // Link (back) up: re-sync so frames dropped while the
+                // cross-process link was down heal (invariant 9).
+                if let Some(sender) = cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    sender.send(proto::sync_request(lww_cb.origin()).as_bytes());
+                }
+                return;
+            }
             let Ok(msg) = std::str::from_utf8(frame) else {
                 return;
             };
-            let mut it = msg.split_whitespace();
-            if it.next() != Some("set_param") {
+            if let Some((id, value, version)) = proto::parse_set_param_versioned(msg) {
+                // Local parameters never sync (invariant 10); stale versions
+                // lose (invariant 9).
+                if !skuiz_core::syncs_over_bus::<P>(id) || !lww_cb.accept(id, version) {
+                    return;
+                }
+                handle.set_param(id, value);
                 return;
             }
-            let (Some(id), Some(value)) = (
-                it.next().and_then(|s| s.parse::<u32>().ok()),
-                it.next().and_then(|s| s.parse::<f64>().ok()),
-            ) else {
+            if proto::parse_sync_request(msg).is_some() {
+                // A late joiner asked for shared state; answer with the
+                // parameters we hold a version for — ones actually edited
+                // over the bus. Never-edited parameters are omitted: their
+                // value may be host automation, which is per-instance
+                // (invariant 10). LWW makes duplicate answers safe.
+                let entries: Vec<(u32, f64, u64, u64)> = handle
+                    .snapshot_params()
+                    .into_iter()
+                    .filter(|(id, _)| skuiz_core::syncs_over_bus::<P>(*id))
+                    .filter_map(|(id, value)| {
+                        lww_cb
+                            .known_version(id)
+                            .map(|(seq, origin)| (id, value, seq, origin))
+                    })
+                    .collect();
+                if entries.is_empty() {
+                    return;
+                }
+                if let Some(sender) = cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    sender.send(proto::sync_state(&entries).as_bytes());
+                }
                 return;
-            };
-            let mut pending = sync.pending.lock().unwrap_or_else(|e| e.into_inner());
-            // Coalesce by param id: only the latest value matters, and this
-            // bounds the queue to the parameter count even if the host
-            // stops calling process while messages keep arriving.
-            match pending.iter_mut().find(|(pid, _)| *pid == id) {
-                Some(entry) => entry.1 = value,
-                None => pending.push((id, value)),
+            }
+            if let Some(entries) = proto::parse_sync_state(msg) {
+                for (id, value, seq, origin) in entries {
+                    if skuiz_core::syncs_over_bus::<P>(id) && lww_cb.accept(id, Some((seq, origin)))
+                    {
+                        handle.set_param(id, value);
+                    }
+                }
             }
         });
+        *sender_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus.sender());
+        // Late joiner: ask the bus for current shared state.
+        bus.send(proto::sync_request(lww.origin()).as_bytes());
         *self.shared.bus.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus);
         kResultOk
     }
@@ -816,18 +937,19 @@ impl<P: Processor + Default> IAudioProcessorTrait for Vst3Plugin<P> {
     }
 
     unsafe fn getLatencySamples(&self) -> u32 {
-        self.shared
-            .processor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .latency()
+        self.shared.engine.latency()
     }
 
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
         ffi_guard(|| self.setup_processing_inner(setup), kResultFalse)
     }
 
-    unsafe fn setProcessing(&self, _state: TBool) -> tresult {
+    unsafe fn setProcessing(&self, state: TBool) -> tresult {
+        if state != 0 {
+            self.shared.engine.begin_audio();
+        } else {
+            self.shared.engine.end_audio();
+        }
         kResultOk
     }
 
@@ -968,7 +1090,7 @@ impl<P: Processor + Default> IEditControllerTrait for Vst3Plugin<P> {
         }
         let view = Vst3PlugView::<P> {
             shared: Arc::clone(&self.shared),
-            editor: std::cell::RefCell::new(None),
+            editor: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         match ComWrapper::new(view).to_com_ptr::<IPlugView>() {
             Some(ptr) => ptr.into_raw(),
@@ -985,8 +1107,9 @@ impl<P: Processor + Default> IEditControllerTrait for Vst3Plugin<P> {
 /// CLAP, so both formats share one editor and one HTML file.
 pub struct Vst3PlugView<P: Processor> {
     shared: Arc<Shared<P>>,
-    /// Main-thread only: VST3 calls the view on the UI thread.
-    editor: std::cell::RefCell<Option<skuiz_ui::Editor>>,
+    /// Main-thread only: VST3 calls the view on the UI thread. Shared with
+    /// the webview's IPC closure so it can answer queries with an eval.
+    editor: std::rc::Rc<std::cell::RefCell<Option<skuiz_ui::Editor>>>,
 }
 
 impl<P: Processor + Default> Class for Vst3PlugView<P> {
@@ -995,7 +1118,6 @@ impl<P: Processor + Default> Class for Vst3PlugView<P> {
 
 impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
     unsafe fn isPlatformTypeSupported(&self, type_: FIDString) -> tresult {
-        // ponytail: X11 is still missing, matching skuiz-ui.
         if !type_.is_null() && CStr::from_ptr(type_) == CStr::from_ptr(native_platform_type()) {
             kResultTrue
         } else {
@@ -1007,7 +1129,7 @@ impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
         if self.isPlatformTypeSupported(type_) != kResultTrue {
             return kInvalidArgument;
         }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         {
             let Some(html) = P::editor_html() else {
                 return kResultFalse;
@@ -1016,11 +1138,24 @@ impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
             let view = skuiz_ui::ParentView::from_ns_view(parent);
             #[cfg(target_os = "windows")]
             let view = skuiz_ui::ParentView::from_hwnd(parent);
+            // X11EmbedWindowID passes the window id as a pointer-sized value.
+            #[cfg(target_os = "linux")]
+            let view = skuiz_ui::ParentView::from_x11(parent as std::ffi::c_ulong);
             let Some(view) = view else {
                 return kInvalidArgument;
             };
             let shared = Arc::clone(&self.shared);
+            let editor_slot = std::rc::Rc::clone(&self.editor);
             let editor = skuiz_ui::Editor::attach(&view, html, P::editor_size(), move |msg| {
+                if msg == skuiz_core::protocol::DIAG_QUERY {
+                    // Diagnostics for the page: counters are atomics; the
+                    // eval back is main-thread editor work.
+                    let js = skuiz_core::protocol::on_diag_js(shared.engine.diag());
+                    if let Some(editor) = editor_slot.borrow().as_ref() {
+                        let _ = editor.eval(&js);
+                    }
+                    return;
+                }
                 let Some((id, value)) = skuiz_core::protocol::parse_set_param(&msg) else {
                     return;
                 };
@@ -1028,10 +1163,9 @@ impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
             });
             match editor {
                 Ok(editor) => {
-                    // Seed the page with the values the host currently
-                    // holds — snapshot first so the processor lock is not
-                    // held across the eval calls.
-                    for (id, value) in skuiz_core::snapshot_params::<P>(&self.shared.processor) {
+                    // Seed the page with the current values — read from the
+                    // mirror (wait-free), never from the processor.
+                    for (id, value) in self.shared.engine.mirror().snapshot() {
                         let _ = editor.eval(&skuiz_core::protocol::on_param_js(id, value));
                     }
                     *self.editor.borrow_mut() = Some(editor);
@@ -1040,7 +1174,7 @@ impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
                 Err(_) => kResultFalse,
             }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
             let _ = parent;
             kResultFalse
@@ -1265,6 +1399,7 @@ mod tests {
             max: 6.0,
             default: 0.0,
             choices: &[],
+            shared: true,
         };
         assert_eq!(to_normalized(&cont, -6.0), 0.0);
         assert_eq!(to_normalized(&cont, 6.0), 1.0);
@@ -1280,6 +1415,7 @@ mod tests {
             max: 0.0,
             default: 0.0,
             choices: &["A", "B", "C"],
+            shared: true,
         };
         // Every index must survive the trip through normalized space, or
         // hosts would land between choices.
