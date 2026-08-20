@@ -2,12 +2,18 @@
 # Wrap the built cdylib in a macOS .clap bundle (target/shared-gain.clap).
 set -eu
 cd "$(dirname "$0")/../.."
-cargo build -p shared-gain
+# Optimized build with BUILD_TYPE=release.
+BUILD_TYPE=${BUILD_TYPE:-debug}
+if [ "$BUILD_TYPE" = release ]; then
+  cargo build -p shared-gain --release
+else
+  cargo build -p shared-gain
+fi
 # Crate versions are workspace-inherited; the root manifest is the source.
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
 BUNDLE=target/shared-gain.clap
 mkdir -p "$BUNDLE/Contents/MacOS"
-cp target/debug/libshared_gain.dylib "$BUNDLE/Contents/MacOS/shared-gain"
+cp "target/$BUILD_TYPE/libshared_gain.dylib" "$BUNDLE/Contents/MacOS/shared-gain"
 cat > "$BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

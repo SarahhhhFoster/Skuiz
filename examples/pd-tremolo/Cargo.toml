@@ -1,0 +1,29 @@
+[package]
+name = "pd-tremolo"
+description = "Skuiz example: stereo tremolo whose DSP is an embedded Pure Data patch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Off by default: libpd vendors and compiles Pure Data, which is a slow build
+# default builds should not pay for. Without this feature the crate is empty;
+# build and test with `--features libpd`.
+default = []
+libpd = ["skuiz-dsp/libpd"]
+
+[dependencies]
+skuiz-core.workspace = true
+skuiz-clap.workspace = true
+skuiz-dsp.workspace = true
+
+# The plugin and its types exist only with the libpd feature, so the
+# integration test does too.
+[[test]]
+name = "clap"
+path = "tests/clap.rs"
+required-features = ["libpd"]

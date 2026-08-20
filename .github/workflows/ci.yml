@@ -7,10 +7,16 @@
 
 name: CI
 
+# Switched off to keep Actions cost at zero: the workflow runs only when
+# triggered manually from the Actions tab. To re-enable automatic runs,
+# restore the triggers:
+#
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,16 +53,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # --workspace deliberately includes skuiz-vst3, which is excluded from
-      # default *builds* for licensing reasons but must always stay tested.
       - name: Test
         run: cargo test --workspace
 
       # The libpd feature vendors and compiles Pure Data, so it is opt-in;
-      # exercised on macOS where it is known to build.
+      # exercised on macOS where it is known to build. pd-tremolo is an empty
+      # crate without the feature, so default workspace builds skip Pd.
       - name: Test libpd integration
         if: runner.os == 'macOS'
-        run: cargo test -p skuiz-dsp --features libpd
+        run: cargo test -p skuiz-dsp -p pd-tremolo --features libpd
 
       - name: Docs
         run: cargo doc --workspace --no-deps
@@ -78,10 +83,45 @@ jobs:
       - name: Validate example plugins
         run: |
           set -eu
-          for example in shared-gain trigger-note solid-synth; do
+          for example in shared-gain trigger-note solid-synth pd-tremolo; do
             ./examples/$example/bundle.sh
             clap-validator validate "target/$example.clap"
           done
+
+      # The scaffolding tooling is how users start their own plugin, so it
+      # gets the same end-to-end check: copy an example out of the tree,
+      # build it standalone, install it, validate the installed bundle.
+      - name: Scaffold, install and validate a copied example
+        run: |
+          set -eu
+          ./tools/new-plugin.sh ci-probe trigger-note "$RUNNER_TEMP"
+          CLAP_INSTALL_DIR="$RUNNER_TEMP/plugins" "$RUNNER_TEMP/ci-probe/install.sh"
+          clap-validator validate "$RUNNER_TEMP/plugins/ci-probe.clap"
+
+  # Same discipline for VST3: Steinberg's own validator. The SDK is MIT
+  # since v3.8, so CI clones and builds it from source. The Xcode generator
+  # is required — with Unix Makefiles, CMake never enables OBJCXX and the
+  # SDK's .mm files silently compile to nothing.
+  vst3-validation:
+    name: vst3-validator (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Steinberg's validator
+        run: |
+          git clone --depth 1 --recursive --shallow-submodules \
+            https://github.com/steinbergmedia/vst3sdk.git "$RUNNER_TEMP/vst3sdk"
+          cmake -G Xcode -S "$RUNNER_TEMP/vst3sdk" -B "$RUNNER_TEMP/vst3sdk/build"
+          cmake --build "$RUNNER_TEMP/vst3sdk/build" --target validator --config Release
+
+      - name: Validate example VST3 plugins
+        run: |
+          set -eu
+          ./examples/shared-gain/bundle-vst3.sh
+          "$RUNNER_TEMP/vst3sdk/build/bin/Release/validator" target/shared-gain.vst3
 
   # The SolidJS editor's reactive wiring, checked headlessly: mount effects
   # push every parameter, changes reach the DSP, incoming values are not

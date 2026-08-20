@@ -40,8 +40,9 @@ one instance controlling others — are the native case here.
 
 ## Licensing contrast
 
-JUCE is GPL/commercial; Skuiz is MIT. The one obligation that survives
-the move is Steinberg's: shipping a **VST3 binary** still requires
-their license (GPLv3 or the free proprietary agreement), which is why
-the VST3 adapter is opt-in. CLAP and standalone carry nothing. See
-[VST3 licensing](formats/vst3.md#licensing).
+JUCE is GPL/commercial; Skuiz is MIT. Nothing survives the move: CLAP
+and standalone never carried obligations, and Steinberg relicensed the
+VST3 SDK under MIT in v3.8 (October 2025), so shipping a VST3 binary no
+longer requires their licence either. (Branding with the "VST" name or
+logo is optional, but does mean following Steinberg's trademark usage
+guidelines.) See [VST3 licensing](formats/vst3.md#licensing).

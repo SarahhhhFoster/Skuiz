@@ -1792,6 +1792,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pd-tremolo"
+version = "0.1.0"
+dependencies = [
+ "skuiz-clap",
+ "skuiz-core",
+ "skuiz-dsp",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2217,6 +2226,7 @@ dependencies = [
  "clap-sys",
  "skuiz-core",
  "skuiz-ipc",
+ "skuiz-midi",
  "skuiz-ui",
 ]
 

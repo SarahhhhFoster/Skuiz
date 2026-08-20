@@ -7,8 +7,9 @@ pub use clap_sys;
 pub use skuiz_core;
 
 use clap_sys::events::{
-    clap_event_header, clap_event_midi, clap_event_param_value, clap_input_events,
-    clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI, CLAP_EVENT_PARAM_VALUE,
+    clap_event_header, clap_event_midi, clap_event_midi2, clap_event_param_value,
+    clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI,
+    CLAP_EVENT_MIDI2, CLAP_EVENT_PARAM_VALUE,
 };
 use clap_sys::ext::audio_ports::{
     clap_audio_port_info, clap_plugin_audio_ports, CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS,
@@ -19,8 +20,10 @@ use clap_sys::ext::gui::CLAP_WINDOW_API_COCOA;
 #[cfg(target_os = "windows")]
 use clap_sys::ext::gui::CLAP_WINDOW_API_WIN32;
 use clap_sys::ext::gui::{clap_gui_resize_hints, clap_plugin_gui, clap_window, CLAP_EXT_GUI};
+use clap_sys::ext::latency::{clap_plugin_latency, CLAP_EXT_LATENCY};
 use clap_sys::ext::note_ports::{
     clap_note_port_info, clap_plugin_note_ports, CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_MIDI,
+    CLAP_NOTE_DIALECT_MIDI2,
 };
 use clap_sys::ext::params::{
     clap_host_params, clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS,
@@ -246,30 +249,53 @@ unsafe fn collect_param_events<P: Processor>(
     out.sort_unstable_by_key(|e| e.0);
 }
 
-/// Push generated MIDI into the host's output queue. `offset` is the
-/// segment's start within the block (the block is split at parameter-event
-/// times, so the DSP's frame numbers are segment-relative); `frames` is the
-/// whole block. Events past the end of the block are clamped into it rather
-/// than dropped, since a host rejects out-of-range timestamps.
+/// Push generated MIDI into the host's output queue. MIDI 1.0 messages go
+/// out as native MIDI events; anything wider (MIDI 2.0) goes as a UMP
+/// `clap_event_midi2`. `offset` is the segment's start within the block
+/// (the block is split at parameter-event times, so the DSP's frame numbers
+/// are segment-relative); `frames` is the whole block. Events past the end
+/// of the block are clamped into it rather than dropped, since a host
+/// rejects out-of-range timestamps.
 unsafe fn emit_midi(midi: &MidiOut, out: *const clap_output_events, frames: usize, offset: u32) {
     let Some(list) = out.as_ref() else { return };
     let Some(try_push) = list.try_push else {
         return;
     };
     let last_frame = frames.saturating_sub(1) as u32;
-    for &(frame, data) in midi.events() {
-        let ev = clap_event_midi {
-            header: clap_event_header {
-                size: std::mem::size_of::<clap_event_midi>() as u32,
-                time: (frame + offset).min(last_frame),
-                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                type_: CLAP_EVENT_MIDI,
-                flags: 0,
-            },
-            port_index: 0,
-            data,
-        };
-        try_push(out, &ev.header);
+    let header = |type_, size, time| clap_event_header {
+        size,
+        time,
+        space_id: CLAP_CORE_EVENT_SPACE_ID,
+        type_,
+        flags: 0,
+    };
+    for &(frame, event) in midi.events() {
+        let time = (frame + offset).min(last_frame);
+        if let Some(data) = event.midi1_bytes() {
+            let ev = clap_event_midi {
+                header: header(
+                    CLAP_EVENT_MIDI,
+                    std::mem::size_of::<clap_event_midi>() as u32,
+                    time,
+                ),
+                port_index: 0,
+                data,
+            };
+            try_push(out, &ev.header);
+        } else {
+            let mut data = [0; 4];
+            data[..event.words().len()].copy_from_slice(event.words());
+            let ev = clap_event_midi2 {
+                header: header(
+                    CLAP_EVENT_MIDI2,
+                    std::mem::size_of::<clap_event_midi2>() as u32,
+                    time,
+                ),
+                port_index: 0,
+                data,
+            };
+            try_push(out, &ev.header);
+        }
     }
 }
 
@@ -558,6 +584,8 @@ impl<P: Processor> Vt<P> {
                 &Self::PARAMS as *const clap_plugin_params as *const c_void
             } else if id == CLAP_EXT_STATE {
                 &Self::STATE as *const clap_plugin_state as *const c_void
+            } else if id == CLAP_EXT_LATENCY {
+                &Self::LATENCY as *const clap_plugin_latency as *const c_void
             } else if id == CLAP_EXT_NOTE_PORTS && P::emits_midi() {
                 &Self::NOTE_PORTS as *const clap_plugin_note_ports as *const c_void
             } else if EDITOR_SUPPORTED && id == CLAP_EXT_GUI && P::editor_html().is_some() {
@@ -603,7 +631,23 @@ impl<P: Processor> Vt<P> {
         })
     }
 
-    // --- note-ports extension (one MIDI 1.0 output) -----------------------
+    // --- latency extension -------------------------------------------------
+
+    const LATENCY: clap_plugin_latency = clap_plugin_latency {
+        get: Some(Self::latency_get),
+    };
+
+    unsafe extern "C" fn latency_get(plugin: *const clap_plugin) -> u32 {
+        ffi_guard(0, || {
+            inst::<P>(plugin)
+                .processor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .latency()
+        })
+    }
+
+    // --- note-ports extension (one output: MIDI 1.0 + MIDI 2.0 UMP) ------
 
     const NOTE_PORTS: clap_plugin_note_ports = clap_plugin_note_ports {
         count: Some(Self::np_count),
@@ -627,7 +671,7 @@ impl<P: Processor> Vt<P> {
             let out = &mut *info;
             *out = clap_note_port_info {
                 id: 0,
-                supported_dialects: CLAP_NOTE_DIALECT_MIDI,
+                supported_dialects: CLAP_NOTE_DIALECT_MIDI | CLAP_NOTE_DIALECT_MIDI2,
                 preferred_dialect: CLAP_NOTE_DIALECT_MIDI,
                 name: [0; CLAP_NAME_SIZE],
             };

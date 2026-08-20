@@ -483,11 +483,16 @@ macro_rules! export_auv3 {
                 $crate::ffi_guard(
                     || {
                         let Some(i) = inst(ptr) else { return 0 };
+                        // This ABI carries 3-byte MIDI 1.0 only: UMP-only
+                        // (MIDI 2.0) events are invisible here. Widen the C
+                        // ABI when a plugin needs MIDI 2.0 out of AUv3.
                         i.midi_out
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .events()
-                            .len() as u32
+                            .iter()
+                            .filter(|(_, ev)| ev.midi1_bytes().is_some())
+                            .count() as u32
                     },
                     0,
                 )
@@ -507,12 +512,21 @@ macro_rules! export_auv3 {
                             return false;
                         }
                         let midi = i.midi_out.lock().unwrap_or_else(|e| e.into_inner());
-                        let Some(&(at, data)) = midi.events().get(index as usize) else {
-                            return false;
-                        };
-                        *frame = at;
-                        ::std::ptr::copy_nonoverlapping(data.as_ptr(), bytes3, 3);
-                        true
+                        // `index` counts only MIDI 1.0 events, matching
+                        // `skuiz_auv3_midi_count`; UMP-only events are skipped.
+                        let mut seen = 0u32;
+                        for &(at, ev) in midi.events() {
+                            let Some(data) = ev.midi1_bytes() else {
+                                continue;
+                            };
+                            if seen == index {
+                                *frame = at;
+                                ::std::ptr::copy_nonoverlapping(data.as_ptr(), bytes3, 3);
+                                return true;
+                            }
+                            seen += 1;
+                        }
+                        false
                     },
                     false,
                 )
