@@ -28,8 +28,20 @@ impl ParentView {
     }
 }
 
-// ponytail: X11/Wayland still missing; add a from_x11 constructor when
-// someone runs this on Linux. wry builds child webviews on X11 only.
+#[cfg(target_os = "linux")]
+impl ParentView {
+    /// # Safety
+    /// `window` must be a valid X11 window (an Xlib `Window`) that outlives
+    /// the [`Editor`] attached to it. wry's Linux backend embeds on X11
+    /// only; on Wayland this relies on the host's X11-embedding support
+    /// (XWayland), which is what the plugin window APIs specify.
+    pub unsafe fn from_x11(window: std::ffi::c_ulong) -> Option<Self> {
+        // wry reads only the window id; the visual is unused for a child.
+        let handle = raw_window_handle::XlibWindowHandle::new(window);
+        Some(Self(RawWindowHandle::Xlib(handle)))
+    }
+}
+
 #[cfg(target_os = "windows")]
 impl ParentView {
     /// # Safety
