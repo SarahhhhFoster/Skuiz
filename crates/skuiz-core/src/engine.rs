@@ -174,6 +174,10 @@ impl<P: Processor + Default> Engine<P> {
     pub fn new(midi_capacity: usize) -> Arc<Self> {
         let processor = P::default();
         let mirror = ParamMirror::new(P::params(), |id| processor.get_param(id));
+        // Seed the latency cache at construction: hosts may query latency
+        // before activate, and the processor's static latency is already
+        // valid then (activate refreshes it for sample-rate-dependent DSP).
+        let initial_latency = processor.latency();
         let (cmd_tx, cmd_rx) = command_queue();
         let (state_cmd_tx, state_cmd_rx) = spsc(STATE_COMMAND_CAPACITY);
         let (state_tx, state_rx) = spsc(STATE_RESPONSE_CAPACITY);
@@ -192,7 +196,7 @@ impl<P: Processor + Default> Engine<P> {
             state_cmd_tx: Mutex::new(state_cmd_tx),
             state_rx: RefCell::new(state_rx),
             buffers: RefCell::new(Vec::new()),
-            latency: std::sync::atomic::AtomicU32::new(0),
+            latency: std::sync::atomic::AtomicU32::new(initial_latency),
             latency_changed: std::sync::atomic::AtomicBool::new(false),
         })
     }
