@@ -41,6 +41,7 @@ impl Processor for Gain {
             max: 1.0,
             default: 1.0,
             choices: &[],
+            shared: true,
         }]
     }
     fn set_param(&mut self, _id: u32, v: f64) {
@@ -97,6 +98,7 @@ impl Processor for Fill {
             max: 1.0,
             default: 1.0,
             choices: &[],
+            shared: true,
         }]
     }
     fn set_param(&mut self, _id: u32, v: f64) {
