@@ -90,8 +90,9 @@ jobs:
             echo "=== $t ==="
             # A wedged test must not eat the whole job: two minutes each,
             # and the rest still run so one hang cannot hide the others.
-            if ! timeout 120 "$bin" --exact "$t" --nocapture; then
-              rc=$?
+            timeout 120 "$bin" --exact "$t" --nocapture
+            rc=$?
+            if [ $rc -ne 0 ]; then
               echo "=== $t FAILED (rc=$rc; 124 means the watchdog fired) ==="
               fail=1
             fi
