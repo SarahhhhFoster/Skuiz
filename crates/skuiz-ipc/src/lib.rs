@@ -694,8 +694,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The other half of `promotion_crosses_process_boundary`, run as a
-    /// child process. Ignored so it never runs on its own.
+    /// The other half of `traffic_survives_server_death`, run as a child
+    /// process. Ignored so it never runs on its own.
+    #[test]
+    #[ignore]
+    fn cross_process_reconnect_child() {
+        let dir = PathBuf::from(std::env::var("SKUIZ_TEST_DIR").expect("SKUIZ_TEST_DIR"));
+        let scope = std::env::var("SKUIZ_TEST_SCOPE").expect("SKUIZ_TEST_SCOPE");
+
+        let heard_p1 = Arc::new(AtomicUsize::new(0));
+        let heard_p2 = Arc::new(AtomicUsize::new(0));
+        let bus = {
+            let p1 = Arc::clone(&heard_p1);
+            let p2 = Arc::clone(&heard_p2);
+            Bus::join_in(&dir, &scope, move |m| {
+                match m {
+                    b"p1" => p1.fetch_add(1, Ordering::SeqCst),
+                    b"p2" => p2.fetch_add(1, Ordering::SeqCst),
+                    _ => 0,
+                };
+            })
+        };
+        // Keep talking through the disruption; succeed only if frames sent
+        // by the parent both before its death and after its rejoin arrived.
+        for _ in 0..600 {
+            bus.send(b"child");
+            if heard_p1.load(Ordering::SeqCst) > 0 && heard_p2.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "link never healed: p1={}, p2={}",
+            heard_p1.load(Ordering::SeqCst),
+            heard_p2.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Adversarial: the server process dies while updates are in flight.
+    /// Whoever wins the re-election, traffic in both directions must resume
+    /// — and the client side's LINK_UP delivery is what triggers the
+    /// adapters' re-sync (invariant 9), so a silent reconnect is a bug.
+    #[test]
+    fn traffic_survives_server_death() {
+        let dir = scratch("reconn");
+        let scope = format!("reconn-{}", std::process::id());
+
+        let heard_from_child = Arc::new(AtomicUsize::new(0));
+        let a = {
+            let heard = Arc::clone(&heard_from_child);
+            Bus::join_in(&dir, &scope, move |m| {
+                if m == b"child" {
+                    heard.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        wait_until("the first parent to take the election lock", || {
+            a.is_server()
+        });
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cross_process_reconnect_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SKUIZ_TEST_DIR", &dir)
+            .env("SKUIZ_TEST_SCOPE", &scope)
+            .spawn()
+            .expect("spawn child test process");
+
+        // Phase 1: the child is connected and hears us.
+        wait_until("the child to connect", || {
+            a.send(b"p1");
+            heard_from_child.load(Ordering::SeqCst) > 0
+        });
+
+        // The server dies mid-stream. Rejoin as a fresh group; whoever wins
+        // the election, the pair must re-establish traffic both ways.
+        drop(a);
+        let heard_after = Arc::new(AtomicUsize::new(0));
+        let b = {
+            let heard = Arc::clone(&heard_after);
+            Bus::join_in(&dir, &scope, move |m| {
+                if m == b"child" {
+                    heard.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            b.send(b"p2");
+            if let Some(status) = child.try_wait().expect("child poll") {
+                assert!(
+                    status.success(),
+                    "child never heard both phases: {status:?}"
+                );
+                assert!(
+                    heard_after.load(Ordering::SeqCst) > 0,
+                    "no frames from the child after the rejoin"
+                );
+                drop(b);
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child did not exit within the deadline");
+    }
     #[test]
     #[ignore]
     fn cross_process_promotion_child() {
