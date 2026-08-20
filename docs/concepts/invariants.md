@@ -17,11 +17,15 @@ only `process`/`params_flush` can reach — not mutual exclusion.
 
 - **Enforced by:** `Engine`'s three-state access machine
   (`crates/skuiz-core/src/engine.rs`): the processor lives behind an
-  `UnsafeCell` reachable only through `audio_core()`, which requires the
-  AUDIO state; the main thread gets access only while the transport is
-  stopped (`with_main`).
-- **Status: held.** All four adapters route through the engine; no
-  adapter code touches the processor outside the state machine.
+  `UnsafeCell` reachable only through `audio_core()`, which requires a
+  borrow of an `AudioToken` — obtainable only from `begin_audio`, not
+  constructible or cloneable outside the engine, and consumed by
+  `end_audio`. Safe code therefore cannot reach the audio core without
+  provably holding the AUDIO state; the main thread gets access only
+  while the transport is stopped (`with_main`).
+- **Status: held.** All four adapters route through the engine and stash
+  the token in instance state between start/stop; no adapter code
+  touches the processor outside the state machine.
 
 ## 2. No mutex may be acquired by the audio thread
 
@@ -43,10 +47,18 @@ preallocated and fixed-capacity.
 
 - **Enforced by:** `MidiOut::with_capacity` (never reallocates —
   tested), preallocated param-event staging, bounded command queues
-  allocated at instance setup.
-- **Status: held** for the structures Skuiz owns. Plugins can still
-  allocate in their own `process` — the trait docs forbid it, but Rust
-  cannot enforce it.
+  allocated at instance setup, and state-payload buffers recycled back
+  to the main thread so the audio thread never frees them.
+- **Status: held, with one documented exception.** While the transport
+  runs, host-initiated `save_state`/`load_state` must execute where the
+  processor lives — the audio thread, between blocks — and the plugin's
+  own `save_state` implementation returns a freshly allocated `Vec`.
+  That allocation is inherent to the `Processor` trait's signature and
+  is the *only* sanctioned audio-thread allocation; everything the
+  framework itself does on that path (payload recycling, per-parameter
+  mirror republish without batching) is allocation-free. Plugins can
+  still allocate in their own `process` — the trait docs forbid it, but
+  Rust cannot enforce it.
 
 ## 4. No blocking IPC, filesystem, logging, or UI operation on the audio thread
 
@@ -64,11 +76,18 @@ bounded structure with a documented overflow policy, and none of them
 lock the processor.
 
 - **Enforced by:** the host's own event list (CLAP/VST3), and the
-  engine's bounded command queue for everything else.
+  engine's bounded command queues for everything else — one queue for
+  ordinary realtime commands (parameter changes, resets; cheap, drained
+  in full each block) and a separate one for expensive state commands
+  (serviced at most one per block), so a flood of parameter moves can
+  neither delay a state op nor extend a callback beyond one bounded
+  amount of state work.
 - **Status: held.** Host automation is bounded (256 points/block,
-  excess counted via `param_events_dropped`), and the editor/IPC path is
-  the bounded command queue (`commands_dropped` on overflow). Neither
-  path locks the processor.
+  excess counted via `param_events_dropped`), the editor/IPC path is
+  the bounded command queue (1024, `commands_dropped` on overflow), and
+  the state queue holds at most two commands (capacity 2, and the
+  engine's state-op lock keeps at most one round-trip in flight).
+  Neither path locks the processor.
 
 ## 6. Parameter reads exposed to non-audio threads do not require locking the `Processor`
 
@@ -105,8 +124,12 @@ Capacity is finite, so the full case is named, counted, and documented
   of the bound.
 - **Status: held.** Every bound counts its drops: `MidiOut` (512),
   param events (256/block, per-parameter overflow drops only that
-  point), the command queue (1024), the state-response ring. Nothing
-  overflows silently.
+  point), the command queue (1024), the state-response ring. The
+  state-response ring additionally has a *proof* it cannot overflow —
+  the state-op lock serializes round-trips, so at most one response is
+  ever in flight against a capacity of two — and the audio thread still
+  counts (`state_responses_dropped`) and debug-asserts on a push
+  failure, so a violation of that proof is caught rather than silent.
 
 ## 9. Shared IPC state is eventually convergent; transient message loss cannot leave an instance permanently divergent
 
@@ -119,11 +142,22 @@ convergence but must never prevent it.
   `LINK_UP_FRAME` the bus delivers locally whenever the cross-process
   link (re)connects — answered by a fresh `sync_request`, so frames
   dropped during an election window heal instead of vanishing.
+  Crucially, version recording is *atomic with delivery*: `accept_with`
+  and `stamp_with` run the engine push while holding the record lock
+  and mark a version only if the command actually entered the engine.
+  A frame dropped by a full command queue therefore leaves no mark, so
+  the identical version re-delivered later still wins; and because the
+  lock serializes apply order with version order, concurrent updates
+  can never leave the engine holding a stale value under a fresh
+  version.
 - **Status: held.** Stale or reordered frames lose by version; a late
-  joiner converges from the snapshot exchange (tested in
-  `crates/skuiz-clap/tests/ipc_sync.rs`). Legacy unversioned frames
-  still apply but never displace versioned state permanently — the next
-  sync round heals them.
+  joiner converges from the snapshot exchange; server death mid-stream
+  is survived (traffic resumes after re-election, tested cross-process
+  in `crates/skuiz-ipc/src/lib.rs`). The full-queue regression —
+  dropped frame, no mark, re-delivery heals — is tested in
+  `crates/skuiz-core/src/engine.rs`. Legacy unversioned frames still
+  apply but never displace versioned state permanently — the next sync
+  round heals them.
 
 ## 10. Host automation and shared-state synchronization have explicitly defined semantics and are not accidentally conflated
 

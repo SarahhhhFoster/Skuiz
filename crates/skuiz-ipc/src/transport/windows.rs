@@ -1,10 +1,5 @@
 //! Windows transport: a named pipe.
 //!
-//! **Unverified at runtime.** This compiles and type-checks for
-//! `x86_64-pc-windows-msvc`, but it has not been executed — the project has
-//! no Windows machine to run it on. Treat it as a starting point that needs
-//! a real test pass, not as proven code.
-//!
 //! Named pipes make the election simpler than on Unix rather than harder.
 //! `FILE_FLAG_FIRST_PIPE_INSTANCE` fails if the name already exists, so
 //! creating the pipe *is* the election, and because the name is a kernel
@@ -12,34 +7,46 @@
 //! dies. There is no stale-name problem and so no equivalent of the Unix
 //! `flock` is needed.
 //!
-//! Pipes are byte mode and blocking, giving the same stream semantics as a
-//! Unix socket, so the length-prefixed framing above this layer is identical
-//! on both platforms.
+//! Pipes are byte mode, giving the same stream semantics as a Unix socket,
+//! so the length-prefixed framing above this layer is identical on both
+//! platforms.
 //!
-//! Unlike the Unix backend, writes carry no timeout: a stuck peer can block
-//! a `WriteFile` call — and with it the bus's client lock — indefinitely.
-//! Bounding that needs overlapped I/O, which this unverified backend does
-//! not yet implement.
+//! All I/O is overlapped (`FILE_FLAG_OVERLAPPED`). This is not optional
+//! here: a handle opened for synchronous I/O serializes operations, so a
+//! `WriteFile` queues behind a pending `ReadFile` *on the same handle* —
+//! with a reader thread and a writer sharing one duplex handle, both sides
+//! of every connection deadlock the moment real traffic flows. Overlapped
+//! operations carry their own `OVERLAPPED` and are not serialized, and as a
+//! bonus `CancelIoEx` (which only cancels overlapped I/O) genuinely unblocks
+//! a parked reader, and writes can carry the same timeout the Unix backend
+//! gets from `SO_SNDTIMEO`.
 
 use std::io::{Error, ErrorKind, Read, Result, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX,
+    CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const PIPE_BUFFER: u32 = 64 * 1024;
+
+/// Bounds how long a write to a stuck (but not yet dead) peer can stall the
+/// bus, matching the Unix backend; on expiry the write fails and the
+/// connection is dropped.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Wide, NUL-terminated string for the Win32 `W` entry points.
 fn wide(s: &str) -> Vec<u16> {
@@ -58,6 +65,59 @@ impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if self.0 != INVALID_HANDLE_VALUE && !self.0.is_null() {
             unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// A manual-reset event plus the `OVERLAPPED` that references it, scoped to
+/// one I/O call. Overlapped operations on one handle each need their own
+/// `OVERLAPPED`, and it must stay valid until the operation completes — so
+/// every call site waits (or cancels and waits) before this drops.
+struct Op {
+    overlapped: OVERLAPPED,
+}
+
+impl Op {
+    fn new() -> Option<Self> {
+        // Safety: null attributes/name, manual reset, initially unsignalled.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return None;
+        }
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.hEvent = event;
+        Some(Self { overlapped })
+    }
+
+    /// Wait for the operation to finish (or until `timeout`), then harvest
+    /// the byte count. On timeout the operation is cancelled and the cancel
+    /// is awaited, so the stack `OVERLAPPED` is never touched after return.
+    /// Safety: `handle` must be the handle the operation was issued on.
+    unsafe fn finish(&mut self, handle: HANDLE, timeout: u32) -> Result<u32> {
+        let waited = unsafe { WaitForSingleObject(self.overlapped.hEvent, timeout) };
+        if waited != WAIT_OBJECT_0 {
+            unsafe {
+                CancelIoEx(handle, &self.overlapped);
+                // Wait out the cancellation: the driver must be done with
+                // `overlapped` before it goes out of scope.
+                WaitForSingleObject(self.overlapped.hEvent, INFINITE);
+            }
+            return Err(Error::new(ErrorKind::TimedOut, "pipe I/O timed out"));
+        }
+        let mut done: u32 = 0;
+        // Safety: the operation has completed; harvesting its result.
+        let ok = unsafe { GetOverlappedResult(handle, &self.overlapped, &mut done, 0) };
+        if ok == 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(done)
+    }
+}
+
+impl Drop for Op {
+    fn drop(&mut self) {
+        if !self.overlapped.hEvent.is_null() {
+            unsafe { CloseHandle(self.overlapped.hEvent) };
         }
     }
 }
@@ -86,9 +146,10 @@ impl Endpoint {
 
 /// A connection to one peer process.
 pub(crate) struct Conn {
-    /// Shared with the reader clone, not duplicated: `CancelIoEx` only
-    /// cancels I/O issued on the handle it is given, so `close` must act on
-    /// the very handle the reader thread blocks on.
+    /// Shared with the reader clone, not duplicated: overlapped operations
+    /// on one handle each carry their own `OVERLAPPED` and do not serialize,
+    /// so a blocked read no longer stalls a concurrent write (and vice
+    /// versa). `CancelIoEx` cancels any of them from any thread.
     handle: Arc<OwnedHandle>,
     /// Serialises writes: a frame must not interleave with another's.
     write_lock: Mutex<()>,
@@ -102,10 +163,10 @@ impl Conn {
         }
     }
 
-    /// A second handle to the same pipe for the reader thread. Concurrent
-    /// reads and writes on one pipe handle are supported, so sharing beats
-    /// duplicating: the handle closes when the last clone drops, and
-    /// `close` cancels the reader's blocked I/O.
+    /// A second reference to the same pipe for the reader thread. Sharing
+    /// one handle is safe because all I/O is overlapped (module docs); the
+    /// handle closes when the last clone drops, and `close` cancels the
+    /// reader's blocked I/O.
     pub(crate) fn try_clone(&self) -> Option<Conn> {
         Some(Conn {
             handle: Arc::clone(&self.handle),
@@ -116,8 +177,9 @@ impl Conn {
     /// Cancel any blocked I/O so a reader wakes up promptly.
     ///
     /// `CancelIoEx` rather than closing the handle: closing a handle another
-    /// thread is blocked on is not safe on Windows, whereas cancelling is
-    /// the documented way to unblock it.
+    /// thread is blocked on is not safe on Windows, whereas cancelling is the
+    /// documented way to unblock it — and because all I/O here is overlapped,
+    /// the cancel is actually honoured.
     pub(crate) fn close(&self) {
         unsafe { CancelIoEx(self.handle.0, std::ptr::null()) };
     }
@@ -129,20 +191,29 @@ impl Read for Conn {
             return Ok(0);
         }
         debug_assert!(u32::try_from(buf.len()).is_ok());
-        let mut read: u32 = 0;
-        // Safety: `buf` is valid for `buf.len()` bytes for the call's duration.
+        let mut op = Op::new().ok_or_else(Error::last_os_error)?;
+        // Safety: `buf` is valid for `buf.len()` bytes until `op.finish`
+        // reports the operation complete (or cancels and waits it out).
+        // Reader threads wait without a deadline; `close` unblocks them.
         let ok = unsafe {
             ReadFile(
                 self.handle.0,
                 buf.as_mut_ptr().cast(),
                 buf.len() as u32,
-                &mut read,
                 std::ptr::null_mut(),
+                &mut op.overlapped,
             )
         };
-        if ok == 0 {
-            return Err(Error::last_os_error());
-        }
+        let read = if ok == 0 {
+            let err = Error::last_os_error();
+            if err.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                return Err(err);
+            }
+            unsafe { op.finish(self.handle.0, INFINITE)? }
+        } else {
+            // Completed inline; the count still comes from the result call.
+            unsafe { op.finish(self.handle.0, 0)? }
+        };
         if read == 0 {
             // The peer closed: report EOF the way a socket would.
             return Err(Error::new(ErrorKind::UnexpectedEof, "pipe closed"));
@@ -153,25 +224,31 @@ impl Read for Conn {
 
 impl Write for Conn {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        // ponytail: a blocking WriteFile has no timeout, so a stuck peer can
-        // park this call — and the bus lock above it — forever. Overlapped
-        // I/O is the fix; see the module docs.
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         debug_assert!(u32::try_from(buf.len()).is_ok());
-        let mut written: u32 = 0;
-        // Safety: `buf` is valid for `buf.len()` bytes for the call's duration.
+        let mut op = Op::new().ok_or_else(Error::last_os_error)?;
+        // Safety: `buf` is valid for `buf.len()` bytes until `op.finish`
+        // reports the operation complete (or cancels and waits it out). The
+        // timeout bounds how long a stuck peer can stall the bus lock above.
         let ok = unsafe {
             WriteFile(
                 self.handle.0,
-                buf.as_ptr(),
+                buf.as_ptr().cast(),
                 buf.len() as u32,
-                &mut written,
                 std::ptr::null_mut(),
+                &mut op.overlapped,
             )
         };
-        if ok == 0 {
-            return Err(Error::last_os_error());
-        }
+        let written = if ok == 0 {
+            let err = Error::last_os_error();
+            if err.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                return Err(err);
+            }
+            let ms = u32::try_from(WRITE_TIMEOUT.as_millis()).unwrap_or(u32::MAX);
+            unsafe { op.finish(self.handle.0, ms)? }
+        } else {
+            unsafe { op.finish(self.handle.0, 0)? }
+        };
         Ok(written as usize)
     }
 
@@ -182,7 +259,7 @@ impl Write for Conn {
 
 /// Create one pipe instance. The first instance claims the name.
 fn create_instance(endpoint: &Endpoint, first: bool) -> Option<HANDLE> {
-    let mut open_mode = PIPE_ACCESS_DUPLEX;
+    let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if first {
         open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
@@ -219,13 +296,22 @@ impl Listener {
         let mut slot = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let waiting = slot.take()?;
 
-        // Safety: the handle is a valid pipe instance owned by `waiting`.
-        let connected = unsafe { ConnectNamedPipe(waiting.0, std::ptr::null_mut()) };
+        // Overlapped, because the handle is overlapped: the call pends and
+        // completes when a client arrives (or, with ERROR_PIPE_CONNECTED,
+        // when one arrived before we called). `wake_listener` connects a
+        // throwaway client to end the wait, so no deadline is needed here.
+        let mut op = Op::new()?;
+        // Safety: `waiting` is a valid pipe instance owned by us, and `op`
+        // outlives the wait below.
+        let connected = unsafe { ConnectNamedPipe(waiting.0, &mut op.overlapped) };
         if connected == 0 {
-            // ERROR_PIPE_CONNECTED means a client arrived first, which is
-            // success; anything else ends the listener.
             let err = Error::last_os_error().raw_os_error().unwrap_or(0);
-            if err != ERROR_PIPE_CONNECTED as i32 {
+            if err == ERROR_IO_PENDING as i32 {
+                // Safety: waits out or cancels the pending connect.
+                if unsafe { op.finish(waiting.0, INFINITE) }.is_err() {
+                    return None;
+                }
+            } else if err != ERROR_PIPE_CONNECTED as i32 {
                 return None;
             }
         }
@@ -272,7 +358,8 @@ pub(crate) fn try_become_server(endpoint: &Endpoint) -> Option<Listener> {
 /// Connect to whichever process won the election.
 pub(crate) fn connect(endpoint: &Endpoint) -> Option<Conn> {
     for _ in 0..2 {
-        // Safety: `name` is NUL-terminated and lives for the call.
+        // Safety: `name` is NUL-terminated and lives for the call. Overlapped
+        // like the server side, so our reads and writes never serialize.
         let handle = unsafe {
             CreateFileW(
                 endpoint.name.as_ptr(),
@@ -280,7 +367,7 @@ pub(crate) fn connect(endpoint: &Endpoint) -> Option<Conn> {
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 std::ptr::null_mut(),
             )
         };

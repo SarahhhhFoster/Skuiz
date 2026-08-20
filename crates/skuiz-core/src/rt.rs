@@ -8,12 +8,14 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// A command from a non-realtime thread to the audio thread.
+/// An ordinary realtime command from a non-realtime thread to the audio
+/// thread: cheap, bounded work the audio thread drains in full at the top
+/// of every block.
 ///
-/// `LoadState` and `SaveState` exist because project state can arrive while
-/// the transport is stopped *or* running; see the threading docs. `Vec`
-/// payloads are recycled back to the main thread after use so the audio
-/// thread never frees them.
+/// Expensive state operations are deliberately *not* here — they travel on
+/// their own queue ([`StateCommand`]) so a flood of parameter moves cannot
+/// delay a state op, and a heavyweight state op cannot extend the drain of
+/// ordinary commands.
 #[derive(Debug)]
 pub enum Command {
     /// Apply a parameter change at the top of the next block.
@@ -23,14 +25,24 @@ pub enum Command {
         /// New value; the processor clamps.
         value: f64,
     },
-    /// Restore project state (a `Processor::load_state` payload).
-    LoadState(Vec<u8>),
-    /// Serialize project state; the audio thread answers on the instance's
-    /// save-response ring with the `Processor::save_state` bytes.
-    SaveState,
     /// Reset DSP state (delay lines, envelopes, filter memory) between
     /// blocks. Never carries parameter changes.
     Reset,
+}
+
+/// A state operation for the audio thread: potentially expensive (the
+/// processor (de)serializes its whole state), so these travel on a
+/// separate, single-producer queue and the audio thread services at most
+/// one per block. Project state can arrive while the transport is stopped
+/// *or* running; see the threading docs. `Vec` payloads are recycled back
+/// to the main thread after use so the audio thread never frees them.
+#[derive(Debug)]
+pub enum StateCommand {
+    /// Restore project state (a `Processor::load_state` payload).
+    LoadState(Vec<u8>),
+    /// Serialize project state; the audio thread answers on the instance's
+    /// state-response ring with the `Processor::save_state` bytes.
+    SaveState,
 }
 
 /// One cache line apart so the two threads' counters never share one.
@@ -140,15 +152,20 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 unsafe impl<T: Send> Sync for Producer<T> {}
 unsafe impl<T: Send> Sync for Consumer<T> {}
 
-/// How many commands may be queued for the audio thread before pushes
-/// start failing. Overflow policy: the push fails and the caller bumps a
-/// diag counter; nothing is dropped silently.
+/// How many ordinary commands may be queued for the audio thread before
+/// pushes start failing. Overflow policy: the push fails and the caller
+/// bumps a diag counter; nothing is dropped silently.
 pub const COMMAND_CAPACITY: usize = 1024;
 
+/// How many state commands may be queued for the audio thread. State ops
+/// are host-initiated and serialized by the engine (at most one round-trip
+/// in flight), so a capacity of two can never overflow: one slot for the
+/// in-flight op's command, one spare. See `Engine`'s state-op lock.
+pub const STATE_COMMAND_CAPACITY: usize = 2;
+
 /// The producing half of the command queue: cloneable, callable from any
-/// non-realtime thread (editor handler, bus callback, state load). The
-/// mutex lives on the producer side only — the audio thread never sees it
-/// (invariant 2).
+/// non-realtime thread (editor handler, bus callback). The mutex lives on
+/// the producer side only — the audio thread never sees it (invariant 2).
 #[derive(Clone)]
 pub struct CommandProducer {
     inner: Arc<Mutex<Producer<Command>>>,
@@ -321,12 +338,12 @@ mod tests {
         let (prod, mut cons) = command_queue();
         let p2 = prod.clone();
         prod.push(Command::SetParam { id: 1, value: 0.5 }).unwrap();
-        p2.push(Command::SaveState).unwrap();
+        p2.push(Command::Reset).unwrap();
         match cons.pop() {
             Some(Command::SetParam { id, value }) => assert_eq!((id, value), (1, 0.5)),
             _ => panic!("expected SetParam"),
         }
-        assert!(matches!(cons.pop(), Some(Command::SaveState)));
+        assert!(matches!(cons.pop(), Some(Command::Reset)));
         assert!(cons.pop().is_none());
     }
 

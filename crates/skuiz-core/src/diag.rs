@@ -23,6 +23,11 @@ pub struct DiagCounters {
     /// Bus frames lost while no cross-process link existed (election
     /// window) or a write failed.
     pub bus_frames_dropped: AtomicU64,
+    /// State responses the audio thread could not hand back because the
+    /// response ring was full. Structurally impossible while the engine's
+    /// state-op lock serializes round-trips — the counter exists to catch
+    /// a violation of that proof rather than to report a real event.
+    pub state_responses_dropped: AtomicU64,
     /// Seqlock retries in `ParamMirror::snapshot`. Not an error — a high
     /// number just means the publisher is being hammered.
     pub mirror_retries: AtomicU64,
@@ -35,7 +40,7 @@ impl DiagCounters {
     }
 
     /// Read them all: `(name, value)` pairs, for tests and the debug dump.
-    pub fn snapshot(&self) -> [(&'static str, u64); 5] {
+    pub fn snapshot(&self) -> [(&'static str, u64); 6] {
         [
             (
                 "param_events_dropped",
@@ -52,6 +57,10 @@ impl DiagCounters {
             (
                 "bus_frames_dropped",
                 self.bus_frames_dropped.load(Ordering::Relaxed),
+            ),
+            (
+                "state_responses_dropped",
+                self.state_responses_dropped.load(Ordering::Relaxed),
             ),
             (
                 "mirror_retries",

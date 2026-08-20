@@ -30,7 +30,7 @@
 
 #![warn(missing_docs)]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use skuiz_core::engine::Engine;
+use skuiz_core::engine::{AudioToken, Engine};
 use skuiz_core::{MidiOut, Processor};
 use std::sync::Arc;
 use tao::event::{Event, WindowEvent};
@@ -234,10 +234,14 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
         if let Some((id, value, version)) = proto::parse_set_param_versioned(msg) {
             // Local parameters never sync: frames naming them are dropped
             // here rather than posted (invariant 10). Stale versions lose.
-            if !skuiz_core::syncs_over_bus::<P>(id) || !lww_cb.accept(id, version) {
+            // The version is recorded only if the change was queued to the
+            // UI thread, so a lost frame can still win when re-delivered.
+            if !skuiz_core::syncs_over_bus::<P>(id) {
                 return;
             }
-            let _ = proxy.send_event(UserEvent::RemoteParam(id, value));
+            lww_cb.accept_with(id, version, || {
+                proxy.send_event(UserEvent::RemoteParam(id, value)).is_ok()
+            });
             return;
         }
         if proto::parse_sync_request(msg).is_some() {
@@ -267,8 +271,10 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
         }
         if let Some(entries) = proto::parse_sync_state(msg) {
             for (id, value, seq, origin) in entries {
-                if skuiz_core::syncs_over_bus::<P>(id) && lww_cb.accept(id, Some((seq, origin))) {
-                    let _ = proxy.send_event(UserEvent::RemoteParam(id, value));
+                if skuiz_core::syncs_over_bus::<P>(id) {
+                    lww_cb.accept_with(id, Some((seq, origin)), || {
+                        proxy.send_event(UserEvent::RemoteParam(id, value)).is_ok()
+                    });
                 }
             }
         }
@@ -298,6 +304,9 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
         let engine = Arc::clone(&engine);
         let mut scratch = Scratch::new(channel_count);
         let mut tone = Tone::new(input, sample_rate as f32);
+        // Proof the engine is in the AUDIO state, held for the duration of
+        // each callback: claimed at the top, handed back at the bottom.
+        let mut audio_token: Option<AudioToken> = None;
         let config: cpal::StreamConfig = supported.into();
 
         device
@@ -309,9 +318,10 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                     // returns), drain anything the UI or the bus queued, then
                     // process. MIDI scratch lives in the core.
                     if !engine.is_processing() {
-                        engine.begin_audio();
+                        audio_token = Some(engine.begin_audio());
                     }
-                    let core = engine.audio_core();
+                    let core =
+                        engine.audio_core(audio_token.as_ref().expect("AUDIO implies a token"));
                     let report = engine.drain_commands(core);
                     let _ = report; // no host to notify in a standalone shell
                     core.midi_out.clear();
@@ -345,7 +355,9 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                     // ponytail: generated MIDI is drained and dropped; the
                     // standalone has no MIDI destination until a virtual
                     // port (midir) is wired up.
-                    engine.end_audio();
+                    if let Some(token) = audio_token.take() {
+                        engine.end_audio(token);
+                    }
                 },
                 |err| eprintln!("skuiz: audio stream error: {err}"),
                 None,
@@ -385,16 +397,23 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                 return;
             };
             // Queued for the audio callback; the engine never locks the
-            // processor.
-            ui_engine.set_param(id, value);
-            // Share the move with every other instance, in this process or
-            // in a DAW hosting the same plugin — if it is declared shared.
-            // The versioned frame lets receivers discard stale echoes.
+            // processor. For shared parameters the apply happens inside
+            // `stamp_with`: only a change that entered the engine claims a
+            // version and reaches the bus (invariant 9).
             if def.shared {
-                let (seq, origin) = ui_lww.stamp(id);
-                ui_bus.send(
-                    skuiz_core::protocol::set_param_versioned(id, value, seq, origin).as_bytes(),
-                );
+                // Share the move with every other instance, in this process
+                // or in a DAW hosting the same plugin. The versioned frame
+                // lets receivers discard stale echoes.
+                if let Some((seq, origin)) =
+                    ui_lww.stamp_with(id, || ui_engine.set_param(id, value))
+                {
+                    ui_bus.send(
+                        skuiz_core::protocol::set_param_versioned(id, value, seq, origin)
+                            .as_bytes(),
+                    );
+                }
+            } else {
+                ui_engine.set_param(id, value);
             }
         })
         .build(&window)

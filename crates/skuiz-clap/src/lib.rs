@@ -40,7 +40,7 @@ use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::string_sizes::{CLAP_NAME_SIZE, CLAP_PATH_SIZE};
 use clap_sys::version::CLAP_VERSION;
 use skuiz_core::diag::DiagCounters;
-use skuiz_core::engine::Engine;
+use skuiz_core::engine::{AudioToken, Engine};
 use skuiz_core::{MidiOut, Processor};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -121,6 +121,10 @@ struct Instance<P: Processor> {
     /// Mutex-around-everything design. Arc'd so the bus callback's Weak
     /// handle can never use-after-free.
     engine: Arc<Engine<P>>,
+    /// Proof the engine is in the AUDIO state, stashed between
+    /// `start_processing` and `stop_processing` (or created on the fly by
+    /// `process` for hosts that skip the pair). Audio-thread only.
+    audio_token: std::cell::RefCell<Option<AudioToken>>,
     /// Timed parameter events collected from the host's input list for the
     /// current block: `(frame_offset, param_id, value)`. Audio-thread only;
     /// pre-allocated so `process` never allocates. The block is split at
@@ -331,6 +335,7 @@ pub unsafe fn instantiate<P: Processor + Default>(
         editor: std::cell::RefCell::new(None),
         editor_alive: std::cell::RefCell::new(None),
         engine: Engine::new(MIDI_OUT_CAPACITY),
+        audio_token: std::cell::RefCell::new(None),
         param_events: UnsafeCell::new(Vec::with_capacity(PARAM_EVENT_CAPACITY)),
         bus: Mutex::new(None),
         lww: Arc::new(skuiz_core::lww::Lww::new()),
@@ -398,11 +403,14 @@ impl<P: Processor> Vt<P> {
                 if let Some((id, value, version)) = proto::parse_set_param_versioned(msg) {
                     // Local parameters never sync: frames naming them are
                     // ignored rather than applied (invariant 10). Stale
-                    // versions lose (invariant 9).
-                    if !skuiz_core::syncs_over_bus::<P>(id) || !lww_cb.accept(id, version) {
+                    // versions lose (invariant 9). The version is recorded
+                    // only if the change entered the engine, so a frame
+                    // dropped by a full command queue can still win when
+                    // re-delivered.
+                    if !skuiz_core::syncs_over_bus::<P>(id) {
                         return;
                     }
-                    handle.set_param(id, value);
+                    lww_cb.accept_with(id, version, || handle.set_param(id, value));
                     return;
                 }
                 if proto::parse_sync_request(msg).is_some() {
@@ -434,10 +442,10 @@ impl<P: Processor> Vt<P> {
                 }
                 if let Some(entries) = proto::parse_sync_state(msg) {
                     for (id, value, seq, origin) in entries {
-                        if skuiz_core::syncs_over_bus::<P>(id)
-                            && lww_cb.accept(id, Some((seq, origin)))
-                        {
-                            handle.set_param(id, value);
+                        if skuiz_core::syncs_over_bus::<P>(id) {
+                            lww_cb.accept_with(id, Some((seq, origin)), || {
+                                handle.set_param(id, value)
+                            });
                         }
                     }
                 }
@@ -496,13 +504,19 @@ impl<P: Processor> Vt<P> {
 
     unsafe extern "C" fn start_processing(plugin: *const clap_plugin) -> bool {
         ffi_guard(false, || {
-            inst::<P>(plugin).engine.begin_audio();
+            let inst = inst::<P>(plugin);
+            inst.audio_token.replace(Some(inst.engine.begin_audio()));
             true
         })
     }
 
     unsafe extern "C" fn stop_processing(plugin: *const clap_plugin) {
-        ffi_guard((), || inst::<P>(plugin).engine.end_audio())
+        ffi_guard((), || {
+            let inst = inst::<P>(plugin);
+            if let Some(token) = inst.audio_token.take() {
+                inst.engine.end_audio(token);
+            }
+        })
     }
 
     // ponytail: no-op. Processor has no reset hook, so there is nothing to
@@ -568,9 +582,12 @@ impl<P: Processor> Vt<P> {
             // Hosts should call start_processing first; tolerate the ones
             // (and the tests) that don't, rather than render silence.
             if !engine.is_processing() {
-                engine.begin_audio();
+                inst.audio_token.replace(Some(engine.begin_audio()));
             }
-            let core = engine.audio_core();
+            let core = {
+                let token = inst.audio_token.borrow();
+                engine.audio_core(token.as_ref().expect("AUDIO implies a token"))
+            };
             let report = engine.drain_commands(core);
             let proc_ = &mut core.processor;
 
@@ -935,10 +952,12 @@ impl<P: Processor> Vt<P> {
         _out_events: *const clap_sys::events::clap_output_events,
     ) {
         ffi_guard((), || {
-            let engine = &inst::<P>(plugin).engine;
+            let inst = inst::<P>(plugin);
+            let engine = &inst.engine;
             if engine.is_processing() {
                 // Audio-thread flush: same rules as process().
-                let core = engine.audio_core();
+                let token = inst.audio_token.borrow();
+                let core = engine.audio_core(token.as_ref().expect("AUDIO implies a token"));
                 apply_param_events::<P>(&mut core.processor, in_events, engine.mirror());
             } else {
                 engine.with_main(|core| {
@@ -1160,18 +1179,28 @@ impl<P: Processor> Vt<P> {
             return;
         };
         // Direct when stopped, queued for the next block when running;
-        // never locks the processor (invariants 2, 5).
-        inst.engine.set_param(id, value);
-        Self::host_rescan_params(inst.host);
-        // Share the UI move with every other instance on the bus — but only
-        // parameters declared shared; local ones stay in the instance. The
-        // versioned frame lets receivers discard stale echoes (invariant 9).
+        // never locks the processor (invariants 2, 5). For shared
+        // parameters the apply happens inside `stamp_with`: only a change
+        // that entered the engine claims a version and reaches the bus,
+        // so a dropped command never splits the instance from its peers
+        // (invariant 9).
         if def.shared {
+            let stamped = inst.lww.stamp_with(id, || inst.engine.set_param(id, value));
+            let Some((seq, origin)) = stamped else {
+                return;
+            };
+            Self::host_rescan_params(inst.host);
+            // Share the UI move with every other instance on the bus. The
+            // versioned frame lets receivers discard stale echoes.
             if let Some(bus) = inst.bus.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                let (seq, origin) = inst.lww.stamp(id);
                 bus.send(
                     skuiz_core::protocol::set_param_versioned(id, value, seq, origin).as_bytes(),
                 );
+            }
+        } else {
+            // Local parameters stay in the instance (invariant 10).
+            if inst.engine.set_param(id, value) {
+                Self::host_rescan_params(inst.host);
             }
         }
     }

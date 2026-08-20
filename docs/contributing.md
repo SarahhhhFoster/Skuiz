@@ -20,9 +20,9 @@ ended when the SDK went MIT in v3.8 (October 2025).
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-CI (`.github/workflows/ci.yml`) is switched off to keep Actions cost at
-zero — it runs manually from the Actions tab, or re-enable the push/PR
-triggers in the workflow file. When run, it enforces:
+CI (`.github/workflows/ci.yml`) runs on pushes to `main`, on pull
+requests, and manually from the Actions tab (feature-branch pushes are
+manual-only, to keep Actions cost bounded). It enforces:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`

@@ -7,15 +7,14 @@
 
 name: CI
 
-# Switched off to keep Actions cost at zero: the workflow runs only when
-# triggered manually from the Actions tab. To re-enable automatic runs,
-# restore the triggers:
-#
-#   on:
-#     push:
-#       branches: [main]
-#     pull_request:
+# Automatic runs are scoped to keep Actions cost bounded: pushes to main
+# and pull requests only (not every feature-branch push), plus manual
+# dispatch from the Actions tab. The heavier release workflow stays
+# manual-only.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -24,6 +23,9 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    # A wedged test must fail with its log intact, not hang the job for
+    # hours (Windows named-pipe paths are the least-verified code here).
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +56,48 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --workspace
+
+      # Windows runs one crate at a time: a hanging test (named pipes are
+      # the least-verified code here) then names its crate in the log
+      # instead of disappearing into a workspace-wide run.
+      - name: Test (per crate)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -e
+          for c in skuiz-core skuiz-midi skuiz-dsp skuiz-ui \
+                   skuiz-clap skuiz-vst3 skuiz-auv3 skuiz-standalone \
+                   shared-gain trigger-note solid-synth pd-tremolo; do
+            echo "=== $c ==="
+            cargo test -p "$c"
+          done
+
+      # ...and skuiz-ipc one *test* at a time: its tests spawn child
+      # processes and hold global bus state, so a hang there needs the
+      # test's name in the log, and a captured panic must not hide until a
+      # summary that never prints.
+      - name: Test skuiz-ipc (per test)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -u
+          cargo test -p skuiz-ipc --no-run
+          bin=$(find target/debug/deps -name 'skuiz_ipc-*.exe' ! -name '*.d' | head -1)
+          fail=0
+          for t in $("$bin" --list --format terse | sed -n 's/: test$//p'); do
+            echo "=== $t ==="
+            # A wedged test must not eat the whole job: two minutes each,
+            # and the rest still run so one hang cannot hide the others.
+            timeout 120 "$bin" --exact "$t" --nocapture
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "=== $t FAILED (rc=$rc; 124 means the watchdog fired) ==="
+              fail=1
+            fi
+          done
+          exit $fail
 
       # The libpd feature vendors and compiles Pure Data, so it is opt-in;
       # exercised on macOS where it is known to build. pd-tremolo is an empty

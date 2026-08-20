@@ -87,10 +87,9 @@ No packaging: `cargo run -p my-plugin --bin my-plugin-standalone`, or
 
 ## What CI checks
 
-CI is switched off by default (manual runs only, to keep Actions cost at
-zero; re-enable the push/PR triggers in `.github/workflows/ci.yml`). When
-run, it checks rustfmt, clippy with warnings
-denied, the full test suite on macOS/Windows/Linux, `cargo doc` with
+CI runs on pushes to `main` and on pull requests (feature branches are
+manual-only, to keep Actions cost bounded). It checks rustfmt, clippy with
+warnings denied, the full test suite on macOS/Windows/Linux, `cargo doc` with
 warnings denied, clap-validator and Steinberg's VST3 `validator` over the
 example bundles, and the SolidJS editor's headless DOM check. The same
 commands work locally — see [contributing](../contributing.md).

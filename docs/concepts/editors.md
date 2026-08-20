@@ -36,7 +36,8 @@ There is one more message kind, for diagnostics: the page posts
 `"skuiz_diag"` and the plugin answers with
 `window.skuizOnDiag && window.skuizOnDiag({...})`, a plain object of the
 instance's drop counters (`param_events_dropped`, `midi_events_dropped`,
-`commands_dropped`, `bus_frames_dropped`, `mirror_retries` — see
+`commands_dropped`, `bus_frames_dropped`, `state_responses_dropped`,
+`mirror_retries` — see
 `skuiz_core::diag`). Wired in the CLAP, VST3 and standalone editors;
 AUv3 has no webview editor. Useful for a debug overlay, ignorable
 otherwise.

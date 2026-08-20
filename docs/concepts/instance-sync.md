@@ -61,6 +61,15 @@ beats the last one seen for that parameter, so duplicated, delayed or
 reordered frames can slow convergence but never prevent it; ties
 resolve deterministically on origin id.
 
+Version recording is atomic with delivery (`Lww::accept_with` /
+`Lww::stamp_with`): a version is marked only after the change has
+actually entered the audio engine, and the record lock is held across
+the push. Two consequences: a frame dropped because the command queue
+was full leaves no mark, so the identical version re-delivered later
+still wins (the instance heals instead of diverging permanently); and
+concurrent edits can never leave the engine holding a stale value under
+a fresh version.
+
 Two mechanisms close the gaps versions alone cannot:
 
 - **Join snapshot.** A new instance broadcasts

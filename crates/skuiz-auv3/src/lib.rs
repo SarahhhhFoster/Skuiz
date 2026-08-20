@@ -44,8 +44,9 @@
 //! earns its place, because the ordinary case — the user deleting the
 //! instance that happened to be serving — leaves the process alive.
 
-use skuiz_core::engine::Engine;
+use skuiz_core::engine::{AudioToken, Engine};
 use skuiz_core::Processor;
+use std::cell::RefCell;
 use std::ffi::{c_char, CStr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -89,6 +90,10 @@ pub struct AuInstance<P: Processor> {
     /// the engine is idle and main-thread entry points take the direct
     /// path. Neither side ever locks the processor.
     pub engine: Arc<Engine<P>>,
+    /// Proof the engine is in the AUDIO state, stashed for the duration of
+    /// a render call: claimed at the top of `skuiz_auv3_render`, handed back
+    /// at the bottom. Render-thread only.
+    pub audio_token: RefCell<Option<AudioToken>>,
     /// This instance's seat on the shared-state bus.
     pub bus: Mutex<Option<skuiz_ipc::Bus>>,
     /// Last-writer-wins versions for shared parameters (invariant 9); bus
@@ -108,6 +113,7 @@ impl<P: Processor + Default> AuInstance<P> {
     pub fn new() -> Self {
         Self {
             engine: Engine::new(MIDI_OUT_CAPACITY),
+            audio_token: RefCell::new(None),
             bus: Mutex::new(None),
             lww: Arc::new(skuiz_core::lww::Lww::new()),
         }
@@ -144,11 +150,13 @@ impl<P: Processor + Default> AuInstance<P> {
             };
             if let Some((id, value, version)) = proto::parse_set_param_versioned(msg) {
                 // Local parameters never sync (invariant 10); stale versions
-                // lose (invariant 9).
-                if !skuiz_core::syncs_over_bus::<P>(id) || !lww_cb.accept(id, version) {
+                // lose (invariant 9). The version is recorded only if the
+                // change entered the engine, so a frame dropped by a full
+                // command queue can still win when re-delivered.
+                if !skuiz_core::syncs_over_bus::<P>(id) {
                     return;
                 }
-                handle.set_param(id, value);
+                lww_cb.accept_with(id, version, || handle.set_param(id, value));
                 return;
             }
             if proto::parse_sync_request(msg).is_some() {
@@ -177,9 +185,8 @@ impl<P: Processor + Default> AuInstance<P> {
             }
             if let Some(entries) = proto::parse_sync_state(msg) {
                 for (id, value, seq, origin) in entries {
-                    if skuiz_core::syncs_over_bus::<P>(id) && lww_cb.accept(id, Some((seq, origin)))
-                    {
-                        handle.set_param(id, value);
+                    if skuiz_core::syncs_over_bus::<P>(id) {
+                        lww_cb.accept_with(id, Some((seq, origin)), || handle.set_param(id, value));
                     }
                 }
             }
@@ -327,9 +334,13 @@ macro_rules! export_auv3 {
                         // (fullState) on the direct path — hosts routinely
                         // query state while no blocks are flowing.
                         if !i.engine.is_processing() {
-                            i.engine.begin_audio();
+                            i.audio_token.replace(Some(i.engine.begin_audio()));
                         }
-                        let core = i.engine.audio_core();
+                        let core = {
+                            let token = i.audio_token.borrow();
+                            i.engine
+                                .audio_core(token.as_ref().expect("AUDIO implies a token"))
+                        };
                         i.engine.drain_commands(core);
 
                         let n_ch = (channel_count as usize).min(2);
@@ -352,7 +363,9 @@ macro_rules! export_auv3 {
                             core.midi_out.dropped() as u64,
                             ::std::sync::atomic::Ordering::Relaxed,
                         );
-                        i.engine.end_audio();
+                        if let Some(token) = i.audio_token.take() {
+                            i.engine.end_audio(token);
+                        }
                     },
                     (),
                 )
@@ -420,28 +433,31 @@ macro_rules! export_auv3 {
                         };
                         // Direct when the transport is stopped, queued for
                         // the next block when running; never locks the
-                        // processor.
-                        i.engine.set_param(id, value);
-                        // Share the move with every other instance on the
-                        // bus — but only parameters declared shared; local
-                        // ones stay in the instance (invariant 10). The
-                        // versioned frame lets receivers discard stale
-                        // echoes (invariant 9).
+                        // processor. For shared parameters the apply happens
+                        // inside `stamp_with`: only a change that entered
+                        // the engine claims a version and reaches the bus
+                        // (invariant 9).
                         if def.shared {
-                            if let Some(bus) = i
-                                .bus
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .as_ref()
-                            {
-                                let (seq, origin) = i.lww.stamp(id);
-                                bus.send(
-                                    $crate::skuiz_core::protocol::set_param_versioned(
-                                        id, value, seq, origin,
-                                    )
-                                    .as_bytes(),
-                                );
+                            // Share the move with every other instance on the
+                            // bus. The versioned frame lets receivers discard
+                            // stale echoes (invariant 9).
+                            let stamped = i.lww.stamp_with(id, || i.engine.set_param(id, value));
+                            if let Some((seq, origin)) = stamped {
+                                if let Some(bus) =
+                                    i.bus.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                                {
+                                    bus.send(
+                                        $crate::skuiz_core::protocol::set_param_versioned(
+                                            id, value, seq, origin,
+                                        )
+                                        .as_bytes(),
+                                    );
+                                }
                             }
+                        } else {
+                            // Local parameters stay in the instance
+                            // (invariant 10).
+                            i.engine.set_param(id, value);
                         }
                     },
                     (),
@@ -542,17 +558,26 @@ macro_rules! export_auv3 {
                     || {
                         let Some(i) = inst(ptr) else { return 0 };
                         // The shim pulls events from inside the render block,
-                        // after `skuiz_auv3_render` returned; `midi_out`
-                        // stays readable there (single-writer contract).
+                        // right after `skuiz_auv3_render` returned — at which
+                        // point that call already handed its token back, so
+                        // the engine is IDLE. Re-claim the audio state for
+                        // the read: `midi_out`'s single writer is this same
+                        // render thread (see `Engine::midi_out`), and
+                        // `begin_audio` can only spin out an in-flight main
+                        // access, which is always brief.
                         // This ABI carries 3-byte MIDI 1.0 only: UMP-only
                         // (MIDI 2.0) events are invisible here. Widen the C
                         // ABI when a plugin needs MIDI 2.0 out of AUv3.
-                        i.engine
-                            .midi_out()
+                        let token = i.engine.begin_audio();
+                        let count = i
+                            .engine
+                            .midi_out(&token)
                             .events()
                             .iter()
                             .filter(|(_, ev)| ev.midi1_bytes().is_some())
-                            .count() as u32
+                            .count() as u32;
+                        i.engine.end_audio(token);
+                        count
                     },
                     0,
                 )
@@ -571,10 +596,15 @@ macro_rules! export_auv3 {
                         if frame.is_null() || bytes3.is_null() {
                             return false;
                         }
-                        let midi = i.engine.midi_out();
+                        // Same re-claim as `skuiz_auv3_midi_count`: this runs
+                        // inside the render block, after render released the
+                        // audio state.
+                        let token = i.engine.begin_audio();
+                        let midi = i.engine.midi_out(&token);
                         // `index` counts only MIDI 1.0 events, matching
                         // `skuiz_auv3_midi_count`; UMP-only events are skipped.
                         let mut seen = 0u32;
+                        let mut found = false;
                         for &(at, ev) in midi.events() {
                             let Some(data) = ev.midi1_bytes() else {
                                 continue;
@@ -582,11 +612,13 @@ macro_rules! export_auv3 {
                             if seen == index {
                                 *frame = at;
                                 ::std::ptr::copy_nonoverlapping(data.as_ptr(), bytes3, 3);
-                                return true;
+                                found = true;
+                                break;
                             }
                             seen += 1;
                         }
-                        false
+                        i.engine.end_audio(token);
+                        found
                     },
                     false,
                 )

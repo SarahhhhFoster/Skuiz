@@ -575,7 +575,7 @@ pub trait Processor: Send + 'static {
         if data.is_empty() || !data.len().is_multiple_of(12) {
             return false;
         }
-        for chunk in data.chunks_exact(12) {
+        for chunk in data.as_chunks::<12>().0 {
             let id = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
             let value = f64::from_le_bytes(chunk[4..12].try_into().unwrap());
             if Self::params().iter().any(|p| p.id == id) {
