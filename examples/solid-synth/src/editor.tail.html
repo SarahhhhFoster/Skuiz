@@ -3,6 +3,7 @@
 <script>
 (() => {
   const { createSignal, createEffect, createMemo, render, html } = window.Solid;
+  const { Control, Arc, rangeFunctions, rangeCreators, RangeType } = window.SolidKnobs;
 
   // Must match the constants in lib.rs.
   const FREQ = 0, WAVE = 1, LEVEL = 2, CUTOFF = 3;
@@ -11,6 +12,18 @@
     ["A3", 220.00], ["B3", 246.94], ["C4", 261.63], ["D4", 293.66],
     ["E4", 329.63], ["F4", 349.23], ["G4", 392.00],
   ];
+
+  // solid-knobs ranges describe the sweep, the scale, and how values are
+  // displayed; Control turns them into drag/keyboard/double-click gestures.
+  const FREQ_RANGE = rangeCreators.createFrequencyRange(55, 1760);
+  const LEVEL_RANGE = {
+    type: RangeType.Continuous, start: 0, end: 1,
+    valueToString: (v) => v.toFixed(2),
+  };
+  const CUTOFF_RANGE = {
+    type: RangeType.Continuous, start: 0, end: 1,
+    valueToString: (v) => v.toFixed(2),
+  };
 
   // Last value known to agree with the plugin. Without this, a value
   // arriving from the host or another instance would be echoed straight
@@ -24,6 +37,43 @@
     // interactive, instead of throwing during mount and showing nothing.
     window.ipc?.postMessage?.("set_param " + id + " " + value);
   };
+
+  // An SVG knob from solid-knobs' headless pieces: Control supplies the
+  // gesture handling and accessibility (role=slider, arrow keys nudge,
+  // double-click resets), Arc draws the track and the value sweep.
+  //
+  // The editor is written with `html` templates, not JSX, so components are
+  // called as plain functions — the property getters are what keep
+  // `value`/`endAngle` reactive through Control's and Arc's splitProps.
+  const BASE_ANGLE = 135;
+  function Knob(props) {
+    const norm = () => rangeFunctions.toNormalised(props.range, props.value());
+    const track = Arc({
+      x: 50, y: 50, radius: 38,
+      startAngle: -BASE_ANGLE, endAngle: BASE_ANGLE,
+      stroke: "#34343d", "stroke-width": 9,
+    });
+    const sweep = Arc({
+      x: 50, y: 50, radius: 38,
+      startAngle: -BASE_ANGLE,
+      get endAngle() { return -BASE_ANGLE + 2 * BASE_ANGLE * norm(); },
+      stroke: "#7fb2ff", "stroke-width": 9,
+    });
+    return Control({
+      class: "knob",
+      label: props.label,
+      range: props.range,
+      defaultValue: props.defaultValue,
+      get value() { return props.value(); },
+      onChange: props.onChange,
+      children: html`
+        <svg viewBox="0 0 100 100">
+          ${track}${sweep}
+          <circle cx="50" cy="50" r="26" fill="#24242b" stroke="#34343d" />
+        </svg>
+      `,
+    });
+  }
 
   function App() {
     const [freq, setFreq] = createSignal(220);
@@ -62,19 +112,24 @@
       <h1>Solid Synth</h1>
       <div class="sub">SolidJS state driving Rust DSP</div>
 
-      <div class="row">
-        <div class="label">
-          <b>Frequency</b>
+      <div class="knobs">
+        <div class="knob-col">
+          ${Knob({ label: "Frequency", range: FREQ_RANGE, value: freq,
+                   defaultValue: 220, onChange: setFreq })}
+          <div class="label"><b>Frequency</b></div>
           <span class="val">${() => freq().toFixed(1)} Hz ${nearestNote}</span>
         </div>
-        <input type="range" min="55" max="1760" step="0.1"
-               value=${freq}
-               onInput=${(e) => setFreq(parseFloat(e.currentTarget.value))} />
-        <div class="keys">
-          ${() => NOTES.map(([name, hz]) => html`
-            <button data-on=${() => Math.abs(freq() - hz) < 0.5}
-                    onClick=${() => setFreq(hz)}>${name}</button>
-          `)}
+        <div class="knob-col">
+          ${Knob({ label: "Level", range: LEVEL_RANGE, value: level,
+                   defaultValue: 0.3, onChange: setLevel })}
+          <div class="label"><b>Level</b></div>
+          <span class="val">${() => level().toFixed(2)}</span>
+        </div>
+        <div class="knob-col">
+          ${Knob({ label: "Cutoff", range: CUTOFF_RANGE, value: cutoff,
+                   defaultValue: 1, onChange: setCutoff })}
+          <div class="label"><b>Cutoff</b></div>
+          <span class="val">${() => cutoff().toFixed(2)}</span>
         </div>
       </div>
 
@@ -89,23 +144,20 @@
       </div>
 
       <div class="row">
-        <div class="label"><b>Level</b><span class="val">${() => level().toFixed(2)}</span></div>
-        <input type="range" min="0" max="1" step="0.001"
-               value=${level}
-               onInput=${(e) => setLevel(parseFloat(e.currentTarget.value))} />
-      </div>
-
-      <div class="row">
-        <div class="label"><b>Cutoff</b><span class="val">${() => cutoff().toFixed(2)}</span></div>
-        <input type="range" min="0" max="1" step="0.001"
-               value=${cutoff}
-               onInput=${(e) => setCutoff(parseFloat(e.currentTarget.value))} />
+        <div class="keys">
+          ${() => NOTES.map(([name, hz]) => html`
+            <button data-on=${() => Math.abs(freq() - hz) < 0.5}
+                    onClick=${() => setFreq(hz)}>${name}</button>
+          `)}
+        </div>
       </div>
 
       <div class="note">
-        Every control is a Solid signal. <code>createEffect</code> sends each
-        change to the DSP, and the same channel carries values back from host
-        automation or another instance.
+        The knobs are <code>solid-knobs</code> — drag vertically, nudge with
+        the arrow keys, double-click to reset. Every control is a Solid
+        signal: <code>createEffect</code> sends each change to the DSP, and
+        the same channel carries values back from host automation or another
+        instance.
       </div>
     `;
   }
