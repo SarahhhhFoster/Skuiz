@@ -29,7 +29,7 @@
 #![allow(non_snake_case)]
 
 use skuiz_core::diag::DiagCounters;
-use skuiz_core::engine::Engine;
+use skuiz_core::engine::{AudioToken, Engine};
 use skuiz_core::{MidiOut, ParamDef, Processor};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -203,6 +203,10 @@ struct Shared<P: Processor> {
     /// docs/concepts/invariants.md); Arc'd for the view and the bus
     /// callback's Weak handle.
     engine: Arc<Engine<P>>,
+    /// Proof the engine is in the AUDIO state, stashed between
+    /// `setProcessing(true)` and `setProcessing(false)` (or created on the
+    /// fly by `process` for hosts that skip the call). Audio-thread only.
+    audio_token: std::cell::RefCell<Option<AudioToken>>,
     /// Timed parameter points collected from the host for the current
     /// block: `(sample_offset, param_id, plain_value)`. Audio-thread only;
     /// pre-allocated so `process` never allocates. The block is split at
@@ -232,7 +236,17 @@ impl<P: Processor> Shared<P> {
         let Some(def) = P::params().iter().find(|p| p.id == id) else {
             return;
         };
-        self.engine.set_param(id, value);
+        // For shared parameters the apply happens inside `stamp_with`: only
+        // a change that entered the engine claims a version and reaches the
+        // bus, so a dropped command never splits the instance from its
+        // peers (invariant 9). Only parameters declared shared leave the
+        // instance (invariant 10).
+        let stamped = if def.shared {
+            self.lww.stamp_with(id, || self.engine.set_param(id, value))
+        } else {
+            self.engine.set_param(id, value);
+            None
+        };
         // Clone the retained handler out and release the lock before the
         // COM calls: hosts may re-enter the controller synchronously from
         // performEdit, and holding our lock across that is a deadlock
@@ -252,13 +266,12 @@ impl<P: Processor> Shared<P> {
                 handler.endEdit(id);
             }
         }
-        // Only parameters declared shared leave the instance (invariant 10).
         // The versioned frame lets receivers discard stale echoes
-        // (invariant 9).
-        if def.shared {
+        // (invariant 9); `None` means the change never entered the engine,
+        // so nothing is broadcast.
+        if let Some((seq, origin)) = stamped {
             if let Ok(bus) = self.bus.lock() {
                 if let Some(bus) = bus.as_ref() {
-                    let (seq, origin) = self.lww.stamp(id);
                     bus.send(
                         skuiz_core::protocol::set_param_versioned(id, value, seq, origin)
                             .as_bytes(),
@@ -287,6 +300,7 @@ impl<P: Processor + Default> Vst3Plugin<P> {
         Self {
             shared: Arc::new(Shared {
                 engine: Engine::new(MIDI_OUT_CAPACITY),
+                audio_token: std::cell::RefCell::new(None),
                 param_events: UnsafeCell::new(Vec::with_capacity(PARAM_EVENT_CAPACITY)),
                 bus: Mutex::new(None),
                 lww: Arc::new(skuiz_core::lww::Lww::new()),
@@ -534,9 +548,12 @@ impl<P: Processor> Vst3Plugin<P> {
         // Hosts should call setProcessing(true) first; tolerate the ones
         // (and the tests) that don't, rather than render silence.
         if !engine.is_processing() {
-            engine.begin_audio();
+            self.shared.audio_token.replace(Some(engine.begin_audio()));
         }
-        let core = engine.audio_core();
+        let core = {
+            let token = self.shared.audio_token.borrow();
+            engine.audio_core(token.as_ref().expect("AUDIO implies a token"))
+        };
         let report = engine.drain_commands(core);
         if report.notify_main {
             self.shared.editor_dirty.store(true, Ordering::Release);
@@ -746,11 +763,13 @@ impl<P: Processor + Default> IPluginBaseTrait for Vst3Plugin<P> {
             };
             if let Some((id, value, version)) = proto::parse_set_param_versioned(msg) {
                 // Local parameters never sync (invariant 10); stale versions
-                // lose (invariant 9).
-                if !skuiz_core::syncs_over_bus::<P>(id) || !lww_cb.accept(id, version) {
+                // lose (invariant 9). The version is recorded only if the
+                // change entered the engine, so a frame dropped by a full
+                // command queue can still win when re-delivered.
+                if !skuiz_core::syncs_over_bus::<P>(id) {
                     return;
                 }
-                handle.set_param(id, value);
+                lww_cb.accept_with(id, version, || handle.set_param(id, value));
                 return;
             }
             if proto::parse_sync_request(msg).is_some() {
@@ -779,9 +798,8 @@ impl<P: Processor + Default> IPluginBaseTrait for Vst3Plugin<P> {
             }
             if let Some(entries) = proto::parse_sync_state(msg) {
                 for (id, value, seq, origin) in entries {
-                    if skuiz_core::syncs_over_bus::<P>(id) && lww_cb.accept(id, Some((seq, origin)))
-                    {
-                        handle.set_param(id, value);
+                    if skuiz_core::syncs_over_bus::<P>(id) {
+                        lww_cb.accept_with(id, Some((seq, origin)), || handle.set_param(id, value));
                     }
                 }
             }
@@ -946,9 +964,11 @@ impl<P: Processor + Default> IAudioProcessorTrait for Vst3Plugin<P> {
 
     unsafe fn setProcessing(&self, state: TBool) -> tresult {
         if state != 0 {
-            self.shared.engine.begin_audio();
-        } else {
-            self.shared.engine.end_audio();
+            self.shared
+                .audio_token
+                .replace(Some(self.shared.engine.begin_audio()));
+        } else if let Some(token) = self.shared.audio_token.take() {
+            self.shared.engine.end_audio(token);
         }
         kResultOk
     }
