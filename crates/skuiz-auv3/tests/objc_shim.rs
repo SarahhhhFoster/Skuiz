@@ -46,6 +46,7 @@ impl Processor for Fixture {
                 max: 2.0,
                 default: 1.0,
                 choices: &[],
+                shared: true,
             },
             ParamDef {
                 id: 1,
@@ -54,6 +55,7 @@ impl Processor for Fixture {
                 max: 0.0,
                 default: 0.0,
                 choices: &["Off", "On", "Auto"],
+                shared: true,
             },
         ]
     }

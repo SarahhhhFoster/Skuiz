@@ -30,6 +30,10 @@ impl Processor for Fixture {
         }
     }
     fn params() -> &'static [ParamDef] {
+        // Both `shared: false`: these tests run in parallel in one process
+        // and every instance joins the same plugin-id bus. Shared params
+        // would let one test's live instance sync into another's (invariant
+        // 9 working as designed — bus sync is covered by the ipc tests).
         &[
             ParamDef {
                 id: 0,
@@ -38,6 +42,7 @@ impl Processor for Fixture {
                 max: 2.0,
                 default: 1.0,
                 choices: &[],
+                shared: false,
             },
             ParamDef {
                 id: 1,
@@ -46,6 +51,7 @@ impl Processor for Fixture {
                 max: 0.0,
                 default: 0.0,
                 choices: &["Off", "On", "Auto"],
+                shared: false,
             },
         ]
     }

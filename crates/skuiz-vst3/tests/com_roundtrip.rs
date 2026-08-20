@@ -38,6 +38,12 @@ impl Processor for Fixture {
         }
     }
     fn params() -> &'static [ParamDef] {
+        // Both `shared: false`: these tests run in parallel in one process,
+        // and every instance joins the same plugin-id bus. With shared
+        // params, one test's live instance would answer another test's
+        // join-time sync_request and contaminate its state (invariant 9
+        // working as designed — instance sync is covered by the dedicated
+        // ipc tests instead).
         &[
             ParamDef {
                 id: 0,
@@ -46,6 +52,7 @@ impl Processor for Fixture {
                 max: 2.0,
                 default: 1.0,
                 choices: &[],
+                shared: false,
             },
             ParamDef {
                 id: 1,
@@ -54,6 +61,7 @@ impl Processor for Fixture {
                 max: 0.0,
                 default: 0.0,
                 choices: &["Off", "On", "Auto"],
+                shared: false,
             },
         ]
     }
@@ -702,5 +710,126 @@ fn editor_edits_reach_the_host_as_gestures() {
         );
         // The processor itself moved too, in plain units.
         assert_eq!(controller.getParamNormalized(0), 0.75);
+    }
+}
+
+/// Emits one of each MIDI 1.0 message kind the adapter translates, on its
+/// own plugin id so it never shares a bus with the other fixtures.
+struct CcFixture;
+
+impl Default for CcFixture {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl Processor for CcFixture {
+    fn info() -> PluginInfo {
+        PluginInfo {
+            id: "test.vst3cc",
+            name: "CcFixture",
+            vendor: "Skuiz",
+            version: "0",
+            description: "",
+        }
+    }
+    fn params() -> &'static [ParamDef] {
+        &[]
+    }
+    fn emits_midi() -> bool {
+        true
+    }
+    fn set_param(&mut self, _id: u32, _v: f64) {}
+    fn get_param(&self, _id: u32) -> f64 {
+        0.0
+    }
+    fn process(&mut self, _channels: &mut [&mut [f32]], midi: &mut MidiOut) {
+        midi.push(0, skuiz_core::MidiEvent::from_midi1([0xB2, 7, 64])); // CC 7, ch 2
+        midi.push(4, skuiz_core::MidiEvent::from_midi1([0xE0, 0x00, 0x40])); // bend centre
+        midi.push(8, skuiz_core::MidiEvent::from_midi1([0xA0, 60, 96])); // poly pressure
+        midi.push(12, skuiz_core::MidiEvent::from_midi1([0xD0, 100, 0])); // channel pressure
+    }
+}
+
+/// MIDI 1.0 beyond notes: CC, pitch bend and channel pressure leave as
+/// legacy MIDI CC out events; poly pressure as the native VST3 event.
+#[test]
+fn midi_cc_bend_and_pressure_reach_the_event_output() {
+    unsafe {
+        let component = ComWrapper::new(Vst3Plugin::<CcFixture>::default())
+            .to_com_ptr::<IComponent>()
+            .unwrap();
+        assert_eq!(component.initialize(std::ptr::null_mut()), kResultOk);
+        let processor = component
+            .cast::<IAudioProcessor>()
+            .expect("IAudioProcessor");
+
+        let mut setup = ProcessSetup {
+            processMode: ProcessModes_::kRealtime as int32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
+            maxSamplesPerBlock: 512,
+            sampleRate: 48_000.0,
+        };
+        assert_eq!(processor.setupProcessing(&mut setup), kResultOk);
+
+        let mut left = [0.0f32; 64];
+        let mut right = [0.0f32; 64];
+        let mut out_ptrs = [left.as_mut_ptr(), right.as_mut_ptr()];
+        let mut out_bus = AudioBusBuffers {
+            numChannels: 2,
+            silenceFlags: 0,
+            __field0: AudioBusBuffers__type0 {
+                channelBuffers32: out_ptrs.as_mut_ptr(),
+            },
+        };
+
+        let sink = ComWrapper::new(EventSink::default());
+        let sink_ptr = sink.to_com_ptr::<IEventList>().unwrap();
+
+        let mut data: ProcessData = std::mem::zeroed();
+        data.numSamples = 64;
+        data.numInputs = 0;
+        data.numOutputs = 1;
+        data.outputs = &mut out_bus;
+        data.symbolicSampleSize = SymbolicSampleSizes_::kSample32 as int32;
+        data.outputEvents = sink_ptr.as_ptr();
+
+        assert_eq!(processor.process(&mut data), kResultOk);
+
+        assert_eq!(sink_ptr.getEventCount(), 4, "all four messages emitted");
+        let mut ev: Event = std::mem::zeroed();
+
+        assert_eq!(sink_ptr.getEvent(0, &mut ev), kResultOk);
+        assert_eq!(ev.r#type, Event_::EventTypes_::kLegacyMIDICCOutEvent as u16);
+        assert_eq!(ev.__field0.midiCCOut.controlNumber, 7);
+        assert_eq!(ev.__field0.midiCCOut.channel, 2);
+        assert_eq!(ev.__field0.midiCCOut.value, 64);
+
+        assert_eq!(sink_ptr.getEvent(1, &mut ev), kResultOk);
+        assert_eq!(ev.r#type, Event_::EventTypes_::kLegacyMIDICCOutEvent as u16);
+        assert_eq!(ev.sampleOffset, 4);
+        assert_eq!(
+            ev.__field0.midiCCOut.controlNumber,
+            ControllerNumbers_::kPitchBend as u8
+        );
+        // VST3 convention: value = LSB, value2 = MSB; bend centre is 8192.
+        assert_eq!(ev.__field0.midiCCOut.value, 0x00);
+        assert_eq!(ev.__field0.midiCCOut.value2, 0x40);
+
+        assert_eq!(sink_ptr.getEvent(2, &mut ev), kResultOk);
+        assert_eq!(ev.r#type, Event_::EventTypes_::kPolyPressureEvent as u16);
+        assert_eq!(ev.sampleOffset, 8);
+        assert_eq!(ev.__field0.polyPressure.pitch, 60);
+        assert!((ev.__field0.polyPressure.pressure - 96.0 / 127.0).abs() < 1e-6);
+
+        assert_eq!(sink_ptr.getEvent(3, &mut ev), kResultOk);
+        assert_eq!(ev.r#type, Event_::EventTypes_::kLegacyMIDICCOutEvent as u16);
+        assert_eq!(
+            ev.__field0.midiCCOut.controlNumber,
+            ControllerNumbers_::kAfterTouch as u8
+        );
+        assert_eq!(ev.__field0.midiCCOut.value, 100);
+
+        assert_eq!(component.terminate(), kResultOk);
     }
 }

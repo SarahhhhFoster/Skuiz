@@ -10,11 +10,17 @@ use skuiz_core::{ParamDef, PluginInfo, Processor};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
-struct Gain(f64);
+struct Gain {
+    gain: f64,
+    local: f64,
+}
 
 impl Default for Gain {
     fn default() -> Self {
-        Self(1.0)
+        Self {
+            gain: 1.0,
+            local: 0.5,
+        }
     }
 }
 
@@ -30,22 +36,69 @@ impl Processor for Gain {
         }
     }
     fn params() -> &'static [ParamDef] {
-        &[ParamDef {
-            id: 0,
-            name: "Gain",
-            min: 0.0,
-            max: 1.0,
-            default: 1.0,
-            choices: &[],
-        }]
+        &[
+            ParamDef {
+                id: 0,
+                name: "Gain",
+                min: 0.0,
+                max: 1.0,
+                default: 1.0,
+                choices: &[],
+                shared: true,
+            },
+            ParamDef {
+                id: 1,
+                name: "Local",
+                min: 0.0,
+                max: 1.0,
+                default: 0.5,
+                choices: &[],
+                shared: false,
+            },
+        ]
     }
-    fn set_param(&mut self, _id: u32, v: f64) {
-        self.0 = v;
+    fn set_param(&mut self, id: u32, v: f64) {
+        match id {
+            0 => self.gain = v,
+            1 => self.local = v,
+            _ => {}
+        }
     }
-    fn get_param(&self, _id: u32) -> f64 {
-        self.0
+    fn get_param(&self, id: u32) -> f64 {
+        match id {
+            0 => self.gain,
+            1 => self.local,
+            _ => 0.0,
+        }
     }
     fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {}
+}
+
+/// Same processor on its own bus scope: the convergence test must not share
+/// a bus with the other two tests, whose repeated legacy frames would
+/// legitimately apply to its instances and flap the asserted value.
+#[derive(Default)]
+struct ConvGain(Gain);
+
+impl Processor for ConvGain {
+    fn info() -> PluginInfo {
+        PluginInfo {
+            id: "test.ipcconv",
+            ..Gain::info()
+        }
+    }
+    fn params() -> &'static [ParamDef] {
+        Gain::params()
+    }
+    fn set_param(&mut self, id: u32, v: f64) {
+        self.0.set_param(id, v);
+    }
+    fn get_param(&self, id: u32) -> f64 {
+        self.0.get_param(id)
+    }
+    fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut skuiz_core::MidiOut) {
+        self.0.process(channels, midi);
+    }
 }
 
 unsafe fn run_empty_process(plugin: *const clap_plugin) {
@@ -111,6 +164,115 @@ fn bus_frame_reaches_all_instances() {
 
         ((*a).destroy.unwrap())(a);
         ((*b).destroy.unwrap())(b);
+        drop(outsider);
+    }
+}
+
+/// A parameter declared `shared: false` must not sync: a bus frame naming
+/// it is ignored, not applied (invariant 10).
+#[test]
+fn local_params_ignore_bus_frames() {
+    unsafe {
+        let desc = Box::leak(Box::new(ClapDescriptor::new::<Gain>()));
+        let a = skuiz_clap::instantiate::<Gain>(&desc.raw, null());
+        assert!(((*a).init.unwrap())(a));
+
+        let outsider = skuiz_ipc::Bus::join("test.ipcgain", |_| {});
+        let ext = ((*a).get_extension.unwrap())(a, CLAP_EXT_PARAMS.as_ptr());
+        let params = &*(ext as *const clap_plugin_params);
+        let local_value = |plugin: *const clap_plugin| {
+            let mut v = f64::NAN;
+            assert!((params.get_value.unwrap())(plugin, 1, &mut v));
+            v
+        };
+
+        // Re-send with blocks pumped, exactly like the positive test: if
+        // the frame were applied, this loop would converge. It must not.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            outsider.send(b"set_param 1 0.9");
+            run_empty_process(a);
+        }
+        assert_eq!(
+            local_value(a),
+            0.5,
+            "local parameter changed from a bus frame"
+        );
+
+        ((*a).destroy.unwrap())(a);
+        drop(outsider);
+    }
+}
+
+/// A late-joining instance must converge to the shared state the bus already
+/// holds (invariant 9): it broadcasts `sync_request` on join and applies the
+/// winning `sync_state` answer — without the answerer's untouched defaults
+/// dragging anyone back.
+#[test]
+fn late_joiner_converges_to_shared_state() {
+    unsafe {
+        let desc = Box::leak(Box::new(ClapDescriptor::new::<ConvGain>()));
+        let a = skuiz_clap::instantiate::<ConvGain>(&desc.raw, null());
+        assert!(((*a).init.unwrap())(a));
+
+        // Establish state on A from a versioned frame, like a live edit on
+        // some instance would. In-process delivery is synchronous, but pump
+        // blocks so the engine drains however it was queued.
+        let outsider = skuiz_ipc::Bus::join("test.ipcconv", |_| {});
+        wait_until("instance A to take the versioned value", || {
+            outsider.send(skuiz_core::protocol::set_param_versioned(0, 0.7, 5, 42).as_bytes());
+            run_empty_process(a);
+            param_value(a) == 0.7
+        });
+
+        // B joins late, still at the default. Its join-time sync_request must
+        // pull A's value across with no further edits from anyone.
+        let b = skuiz_clap::instantiate::<ConvGain>(&desc.raw, null());
+        assert!(((*b).init.unwrap())(b));
+        wait_until("the late joiner to converge", || {
+            run_empty_process(a);
+            run_empty_process(b);
+            param_value(b) == 0.7
+        });
+        // B never saw an edit, so it omitted everything from its answer —
+        // its untouched default must not reach back into A.
+        run_empty_process(a);
+        assert_eq!(
+            param_value(a),
+            0.7,
+            "a joiner's untouched default displaced real state"
+        );
+
+        ((*a).destroy.unwrap())(a);
+        ((*b).destroy.unwrap())(b);
+        drop(outsider);
+    }
+}
+
+/// A stale versioned frame must not clobber newer state (invariant 9).
+#[test]
+fn stale_versioned_frames_lose() {
+    unsafe {
+        let desc = Box::leak(Box::new(ClapDescriptor::new::<ConvGain>()));
+        let a = skuiz_clap::instantiate::<ConvGain>(&desc.raw, null());
+        assert!(((*a).init.unwrap())(a));
+
+        let outsider = skuiz_ipc::Bus::join("test.ipcconv", |_| {});
+        wait_until("the newer version to land", || {
+            outsider.send(skuiz_core::protocol::set_param_versioned(0, 0.7, 5, 42).as_bytes());
+            run_empty_process(a);
+            param_value(a) == 0.7
+        });
+
+        // Older seq, different origin: if applied, this would show as 0.1.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            outsider.send(skuiz_core::protocol::set_param_versioned(0, 0.1, 3, 99).as_bytes());
+            run_empty_process(a);
+        }
+        assert_eq!(param_value(a), 0.7, "a stale versioned frame was applied");
+
+        ((*a).destroy.unwrap())(a);
         drop(outsider);
     }
 }
