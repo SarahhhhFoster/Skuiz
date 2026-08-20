@@ -1,4 +1,4 @@
-// Quick-and-dirty C DSP, per PLAN.md: a one-pole envelope follower with
+// Quick-and-dirty C DSP: a one-pole envelope follower with
 // Schmitt-trigger thresholding. Skuiz needs no glue layer for this — the
 // struct is plain data and the functions are plain C, so Rust calls them
 // through `extern "C"` directly (see lib.rs, build.rs).

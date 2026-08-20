@@ -1,6 +1,6 @@
 //! solid-synth: a SolidJS editor driving a Rust oscillator.
 //!
-//! The demo PLAN.md implies but the other examples do not show: a real
+//! The demo the other examples do not show: a real
 //! reactive framework in the webview, whose state is the synth's state.
 //! Solid signals hold frequency, waveform, level and cutoff; a
 //! `createEffect` pushes each change down to this DSP, and sound follows.
@@ -94,6 +94,7 @@ impl Processor for SolidSynth {
                 max: 1760.0,
                 default: 220.0,
                 choices: &[],
+                shared: true,
             },
             ParamDef {
                 id: P_WAVE,
@@ -102,6 +103,7 @@ impl Processor for SolidSynth {
                 max: 0.0,
                 default: 0.0,
                 choices: WAVEFORMS,
+                shared: true,
             },
             ParamDef {
                 id: P_LEVEL,
@@ -110,6 +112,7 @@ impl Processor for SolidSynth {
                 max: 1.0,
                 default: 0.3,
                 choices: &[],
+                shared: true,
             },
             ParamDef {
                 id: P_CUTOFF,
@@ -118,6 +121,7 @@ impl Processor for SolidSynth {
                 max: 1.0,
                 default: 1.0,
                 choices: &[],
+                shared: true,
             },
         ]
     }
