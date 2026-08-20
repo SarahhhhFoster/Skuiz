@@ -45,6 +45,11 @@ release.
 
 ## Conventions
 
+- **The invariants are the contract.** Code that violates one of the ten
+  invariants in [concepts/invariants.md](concepts/invariants.md) is buggy
+  even if it passes tests. The page tracks which invariants the tree
+  currently holds, partially holds, or violates — keep its statuses honest
+  as work lands.
 - **Licensing purity is a requirement.** Skuiz is MIT and links no GPL
   code. Do not vendor or copy from JUCE — the VST3 side uses the
   clean-room `vst3` bindings for exactly this reason. (The Steinberg

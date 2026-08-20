@@ -32,6 +32,15 @@ before your script runs is dropped, not an error.
 That is the entire protocol. Everything else — sliders, frameworks,
 visualizations — is ordinary web development.
 
+There is one more message kind, for diagnostics: the page posts
+`"skuiz_diag"` and the plugin answers with
+`window.skuizOnDiag && window.skuizOnDiag({...})`, a plain object of the
+instance's drop counters (`param_events_dropped`, `midi_events_dropped`,
+`commands_dropped`, `bus_frames_dropped`, `mirror_retries` — see
+`skuiz_core::diag`). Wired in the CLAP, VST3 and standalone editors;
+AUv3 has no webview editor. Useful for a debug overlay, ignorable
+otherwise.
+
 ## Two rules that keep editors sane
 
 **Push your state on mount.** The adapter seeds the page with current
@@ -64,10 +73,10 @@ jsdom and assert on the messages. See
 
 ## Platform support
 
-macOS is tested. Windows (`from_hwnd`) is written but unverified — it
-type-checks and ships in CI but has had no real-world exercise. Linux
-has no webview backend yet, so `editor_html()` is ignored there and the
-host shows its generic UI. See
+macOS is tested. Windows (`from_hwnd`) and Linux (`from_x11`, X11 via
+WebKitGTK — on Wayland, through the host's X11-embedding support) are
+written but unverified — they type-check and ship in CI but have had no
+real-world exercise. See
 [platform support](../reference/platform-support.md).
 
 ## Automation recording caveat

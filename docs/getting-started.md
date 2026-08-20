@@ -93,6 +93,7 @@ impl Processor for MyGain {
             max: 1.0,
             default: 1.0,
             choices: &[], // empty = continuous, not a dropdown
+            shared: true, // editor moves sync to other instances; false = local
         }]
     }
 

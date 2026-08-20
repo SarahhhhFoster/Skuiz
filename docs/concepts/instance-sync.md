@@ -41,6 +41,47 @@ do this for `set_param` messages; you only touch the Bus directly to
 send message types of your own. Use `skuiz_core::protocol`'s format for
 anything parameter-shaped so editors and the bus stay compatible.
 
+## Which parameters sync
+
+Only parameters declared `shared: true` in their `ParamDef`. The rule
+applies in both directions: an editor move on a shared parameter is
+broadcast, and a bus frame naming a local parameter is ignored by
+receivers rather than applied. Host automation and project state loads
+never cross the bus for any parameter — automation is per-instance and
+sample-accurate, sync is cross-instance and block-timed, and neither
+borrows the other's behavior.
+
+## Convergence: versions and snapshots
+
+Sync is *eventually convergent*, not just fire-and-forget. Every
+`set_param` frame an adapter broadcasts carries a version — a lamport
+sequence number plus the sender's origin id
+(`skuiz_core::lww`). A receiver applies a frame only when its version
+beats the last one seen for that parameter, so duplicated, delayed or
+reordered frames can slow convergence but never prevent it; ties
+resolve deterministically on origin id.
+
+Two mechanisms close the gaps versions alone cannot:
+
+- **Join snapshot.** A new instance broadcasts
+  `sync_request <origin>` right after joining. Every instance answers
+  with a `sync_state` frame listing the shared parameters it holds a
+  version for — ones actually edited over the bus — and
+  last-writer-wins makes duplicate answers safe. Parameters never
+  edited over the bus are *omitted* from the answer: their value may be
+  host automation, which is per-instance and must not propagate to
+  joiners, so a joiner's untouched defaults can never drag the fleet
+  back.
+- **Link-up healing.** Frames sent while the cross-process link is down
+  (an election window) are dropped — but when the link (re)connects,
+  the bus delivers a synthetic `LINK_UP_FRAME` to local instances and
+  each answers with a fresh `sync_request`, pulling the fleet back into
+  agreement.
+
+Legacy 3-token `set_param` frames (hand-rolled senders, old peers)
+still apply — but they carry no version and leave no mark, so they can
+never permanently displace versioned state: the next sync round heals.
+
 ## Election and promotion
 
 Exactly one instance machine-wide reports `is_server()`. It should own
