@@ -183,7 +183,11 @@ fn choice_params_drive_output_and_show_labels() {
         let mut chans: [&mut [f32]; 1] = [&mut block];
         proc_.process(&mut chans, &mut midi);
         assert_eq!(midi.events().len(), 1);
-        assert_eq!(midi.events()[0].1, [0x92, 63, 100], "channel 3, D#3");
+        assert_eq!(
+            midi.events()[0].1.midi1_bytes(),
+            Some([0x92, 63, 100]),
+            "channel 3, D#3"
+        );
 
         ((*plugin).destroy.unwrap())(plugin);
     }

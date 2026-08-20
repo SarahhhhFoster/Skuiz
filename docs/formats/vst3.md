@@ -1,16 +1,23 @@
 # VST3
 
-VST3 works — with the editor — but is opt-in, because shipping a VST3
-binary carries an obligation CLAP does not.
+VST3 works — with the editor — and is an ordinary default workspace
+member since the licensing question went away (see below).
 
 ## Licensing
 
 `skuiz-vst3` builds on the clean-room MIT/Apache `vst3` bindings crate:
-no Steinberg SDK code is vendored or linked, and Skuiz itself stays
-MIT. But **shipping a VST3 binary** is licensed by Steinberg under
-either GPLv3 or their separate free-of-charge proprietary agreement.
-That obligation is why `skuiz-vst3` is deliberately excluded from the
-workspace's default members — building it is a choice you make:
+no Steinberg SDK code is vendored or linked, and Skuiz itself stays MIT.
+And since Steinberg relicensed the VST3 SDK under MIT in v3.8.0
+(2025-10-20) — retiring the GPLv3-or-proprietary dual licence —
+**shipping a VST3 binary carries no Steinberg licensing obligation**:
+no fees, no paperwork, commercial and closed-source shipping allowed.
+The only remaining condition is trademark: using the "VST" name or logo
+is optional, but if you do, Steinberg's VST usage guidelines (included
+in the SDK) are mandatory.
+
+The crate used to be excluded from the workspace's default members over
+that obligation; with it gone, `skuiz-vst3` builds and tests like every
+other crate:
 
 ```sh
 cargo build -p skuiz-vst3
@@ -46,18 +53,20 @@ entry-point symbols, same compiled library inside both bundles.
 
 ## Limitations
 
-- **Note on/off only from `MidiOut`.** CC and pitch-bend bytes are
-  dropped at the event conversion (a documented ponytail — the event
-  type is narrower than VST3's).
+- **MIDI 1.0-reducible events only from `MidiOut`.** Note on/off (and any
+  event that reduces to 3 MIDI 1.0 bytes) is converted; UMP-only MIDI 2.0
+  events are skipped — VST3 has no UMP event type (a documented ponytail).
 - **No MIDI input** — same trait-level gap as CLAP.
 - MIDI event frame offsets are clamped into the block; DSP that
   timestamps past the block end loses that timing.
 
 ## Validating
 
-There is no VST3 equivalent of clap-validator in-tree. The COM contract
-is covered by `cargo test -p skuiz-vst3` (a test drives the factory,
-processing, state, and edit gestures the way a host would); beyond
-that, test in a real host. See
-[platform support](../reference/platform-support.md) for the honesty
-matrix.
+CI runs Steinberg's official `validator` — built from the MIT SDK — over
+the example bundle (`.github/workflows/ci.yml`, job `vst3-validation`;
+the workflows are manual-only by default). The COM contract is also
+covered by
+`cargo test -p skuiz-vst3` (a test drives the factory, processing, state,
+and edit gestures the way a host would); beyond that, test in a real
+host. See [platform support](../reference/platform-support.md) for the
+honesty matrix.

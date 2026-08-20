@@ -139,7 +139,8 @@ The crate exists because embedding Pd in a plugin has two sharp edges, and
   block size — 100 frames, or a different size every block.
   `PdEngine::process` adapts between the two with an internal ring buffer,
   at the cost of a constant `PdEngine::latency_frames()` samples of delay
-  (one 64-frame tick). Report that to the host.
+  (one 64-frame tick). Return it from `Processor::latency` — the CLAP and
+  VST3 adapters report it to the host, so the DAW can delay-compensate.
 
 The API, all of it:
 
@@ -162,8 +163,10 @@ The split matters: `new` and `open_patch` allocate and touch process-wide Pd
 state, so they belong in `activate` (or instance setup); `process` is
 lock-free and allocation-free. Drop frees the instance and stops its DSP.
 
-Status: the engine and its tests exist and pass, but **no example plugin
-uses it yet** — if you build one, it becomes the example.
+`examples/pd-tremolo` is the working example: a stereo tremolo whose patch
+is embedded with `include_str!`, written to a temp file and loaded in
+`activate`, and driven from plugin parameters through `[receive]` objects —
+see its `tests/clap.rs` for driving it through the raw CLAP vtable.
 
 ## Where to go next
 
@@ -171,5 +174,5 @@ uses it yet** — if you build one, it becomes the example.
   correctness page.
 - [Parameters](../concepts/parameters.md) — ranges, choice lists, saved
   state.
-- `examples/trigger-note`, `examples/solid-synth` — the code this page
-  summarizes.
+- `examples/trigger-note`, `examples/solid-synth`, `examples/pd-tremolo` —
+  the code this page summarizes.

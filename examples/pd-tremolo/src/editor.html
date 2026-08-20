@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 14px; background: #1e1e22; color: #ddd; }
+  .row { display: grid; grid-template-columns: 5.5em 1fr 3em; align-items: center;
+         gap: 8px; margin-bottom: 10px; }
+  input[type=range] { width: 100%; }
+  .val { text-align: right; font-variant-numeric: tabular-nums; color: #9a9aa4; }
+</style>
+</head>
+<body>
+  <div class="row">
+    <label for="rate">Rate</label>
+    <input id="rate" type="range" min="0.1" max="10" step="0.01" value="5">
+    <span class="val" id="rate-val">5.00</span>
+  </div>
+  <div class="row">
+    <label for="depth">Depth</label>
+    <input id="depth" type="range" min="0" max="1" step="0.01" value="1">
+    <span class="val" id="depth-val">1.00</span>
+  </div>
+
+  <script>
+    // Parameter ids must match the constants in lib.rs.
+    const RATE = 0, DEPTH = 1;
+
+    const send = (id, value) => window.ipc.postMessage('set_param ' + id + ' ' + value);
+
+    const controls = {
+      [RATE]: document.getElementById('rate'),
+      [DEPTH]: document.getElementById('depth'),
+    };
+    const readouts = {
+      [RATE]: [document.getElementById('rate-val'), v => Number(v).toFixed(2)],
+      [DEPTH]: [document.getElementById('depth-val'), v => Number(v).toFixed(2)],
+    };
+
+    const showValue = (id, value) => {
+      const readout = readouts[id];
+      if (readout) readout[0].textContent = readout[1](value);
+    };
+
+    for (const [id, el] of Object.entries(controls)) {
+      el.addEventListener('input', () => {
+        showValue(id, el.value);
+        send(id, el.value);
+      });
+    }
+
+    // plugin -> UI; must not echo back or editor and host would ping-pong.
+    window.skuizOnParam = (id, value) => {
+      const el = controls[id];
+      if (!el) return;
+      el.value = value;
+      showValue(id, value);
+    };
+  </script>
+</body>
+</html>

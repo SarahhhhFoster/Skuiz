@@ -23,7 +23,7 @@ runtime-verified — treat a Windows CI failure as a real finding.
 | Format | Status | Obligation on you |
 | --- | --- | --- |
 | CLAP | Working, validator-clean | None (MIT) |
-| VST3 | Working, with editor | Steinberg licence to **ship** a binary ([details](../formats/vst3.md#licensing)) |
+| VST3 | Working, with editor; Steinberg-validator-checked in CI | None — SDK is MIT since v3.8 ([details](../formats/vst3.md#licensing)) |
 | AUv3 | C ABI + Obj-C shim done and tested; Xcode target not assembled | Apple developer account |
 | Standalone | Working (output + test tone) | None |
 
@@ -38,9 +38,10 @@ shim needs the App Group directory set **before instantiation**; see
 ## Deferred (add when needed)
 
 - Lock-free parameter sync (currently one Mutex around the processor)
-- MPE / MIDI 2.0 UMP output (needs a wider event type than 3 bytes)
+- MPE per-note expression (UMP events and MIDI 2.0 output are in;
+  MPE note-expression events are still out)
 - MIDI *input* (only output ports exist today)
-- GPU spectral resynthesis example; an example plugin embedding libpd
+- GPU spectral resynthesis example
 - AUv3 Xcode project, provisioning and signing
 - VST3 CC / pitch-bend output (note on/off are converted)
 - Standalone input capture and MIDI output

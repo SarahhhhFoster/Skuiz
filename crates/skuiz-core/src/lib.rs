@@ -79,13 +79,72 @@ impl ParamDef {
     }
 }
 
-/// MIDI 1.0 bytes emitted during one processing block, with the frame
-/// offset each event lands on. Adapters drain this into the host's event
-/// output. Fixed capacity: [`MidiOut::push`] never allocates, and silently
-/// drops events once full — a full buffer means the DSP is emitting
-/// thousands of events per block, which is a bug in the DSP, not here.
+/// One generated MIDI event: up to four 32-bit UMP words, so a MIDI 1.0
+/// channel-voice message (one word, message type 0x2) and any MIDI 2.0
+/// message fit the same slot. Build these with the `skuiz-midi`
+/// constructors rather than by hand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MidiEvent {
+    words: [u32; 4],
+    len: u8,
+}
+
+impl MidiEvent {
+    /// Wrap 3 MIDI 1.0 bytes as one UMP word (message type 0x2, group 0).
+    /// Adapters still hand these to the host as native MIDI 1.0 events —
+    /// the UMP form is the transport inside Skuiz, not necessarily on the
+    /// wire.
+    pub fn from_midi1(bytes: [u8; 3]) -> Self {
+        Self {
+            words: [
+                0x2000_0000 | (bytes[0] as u32) << 16 | (bytes[1] as u32) << 8 | bytes[2] as u32,
+                0,
+                0,
+                0,
+            ],
+            len: 1,
+        }
+    }
+
+    /// Wrap raw UMP words. Anything past four words is dropped: no channel
+    /// message is longer, and longer stream messages (sysex) need a
+    /// different path anyway.
+    pub fn from_ump(words: &[u32]) -> Self {
+        let len = words.len().min(4) as u8;
+        let mut out = [0; 4];
+        out[..len as usize].copy_from_slice(&words[..len as usize]);
+        Self { words: out, len }
+    }
+
+    /// The valid UMP words.
+    pub fn words(&self) -> &[u32] {
+        &self.words[..self.len as usize]
+    }
+
+    /// The 3 MIDI 1.0 bytes, if this event is a MIDI 1.0 channel-voice
+    /// message; `None` for anything wider (MIDI 2.0).
+    pub fn midi1_bytes(&self) -> Option<[u8; 3]> {
+        if self.len == 1 && self.words[0] >> 28 == 0x2 {
+            let w = self.words[0];
+            Some([
+                ((w >> 16) & 0xFF) as u8,
+                ((w >> 8) & 0xFF) as u8,
+                (w & 0xFF) as u8,
+            ])
+        } else {
+            None
+        }
+    }
+}
+
+/// MIDI emitted during one processing block, with the frame offset each
+/// event lands on. Events are UMP words (see [`MidiEvent`]): MIDI 1.0 and
+/// MIDI 2.0 both fit. Adapters drain this into the host's event output.
+/// Fixed capacity: [`MidiOut::push`] never allocates, and silently drops
+/// events once full — a full buffer means the DSP is emitting thousands of
+/// events per block, which is a bug in the DSP, not here.
 pub struct MidiOut {
-    events: Vec<(u32, [u8; 3])>,
+    events: Vec<(u32, MidiEvent)>,
 }
 
 impl MidiOut {
@@ -96,16 +155,16 @@ impl MidiOut {
         }
     }
 
-    /// Queue `bytes` at `frame` within the current block. Realtime-safe.
-    pub fn push(&mut self, frame: u32, bytes: [u8; 3]) {
+    /// Queue `event` at `frame` within the current block. Realtime-safe.
+    pub fn push(&mut self, frame: u32, event: MidiEvent) {
         if self.events.len() < self.events.capacity() {
-            self.events.push((frame, bytes));
+            self.events.push((frame, event));
         }
     }
 
-    /// Every queued event as `(frame_offset, midi_bytes)`, in push order.
+    /// Every queued event as `(frame_offset, event)`, in push order.
     /// Adapters drain this after [`Processor::process`] returns.
-    pub fn events(&self) -> &[(u32, [u8; 3])] {
+    pub fn events(&self) -> &[(u32, MidiEvent)] {
         &self.events
     }
 
@@ -240,6 +299,19 @@ pub trait Processor: Send + 'static {
     /// FFI boundary and aborts the host. Everything expensive belongs in
     /// [`Processor::activate`].
     fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut MidiOut);
+
+    /// Delay this plugin adds between its input and output, in frames.
+    ///
+    /// Default 0. Adapters report it to the host through the format's
+    /// latency mechanism, so the DAW can delay-compensate other tracks.
+    /// The value must be constant across the plugin's lifetime: adapters
+    /// answer the host's query but never push change notifications, so a
+    /// latency that only materialises in [`Processor::activate`] must still
+    /// be reported from the start. Called on the **main thread**; keep it
+    /// cheap.
+    fn latency(&self) -> u32 {
+        0
+    }
 
     /// Whether this plugin generates MIDI. Adapters only advertise a note
     /// output port when this is true, so an audio-only plugin doesn't show
@@ -385,13 +457,31 @@ mod tests {
     fn midi_out_is_bounded_and_never_reallocates() {
         let mut midi = MidiOut::with_capacity(2);
         let ptr = midi.events().as_ptr();
-        midi.push(0, [0x90, 60, 100]);
-        midi.push(1, [0x80, 60, 0]);
-        midi.push(2, [0x90, 62, 100]); // over capacity: dropped, not realloc'd
+        midi.push(0, MidiEvent::from_midi1([0x90, 60, 100]));
+        midi.push(1, MidiEvent::from_midi1([0x80, 60, 0]));
+        midi.push(2, MidiEvent::from_midi1([0x90, 62, 100])); // over capacity: dropped, not realloc'd
         assert_eq!(midi.events().len(), 2);
         assert_eq!(midi.events().as_ptr(), ptr, "push must never reallocate");
-        assert_eq!(midi.events()[0], (0, [0x90, 60, 100]));
+        assert_eq!(
+            midi.events()[0],
+            (0, MidiEvent::from_midi1([0x90, 60, 100]))
+        );
         midi.clear();
         assert!(midi.events().is_empty());
+    }
+
+    #[test]
+    fn midi_event_round_trips_midi1_and_ump() {
+        let ev = MidiEvent::from_midi1([0x92, 63, 100]);
+        assert_eq!(ev.words(), &[0x2092_3F64]);
+        assert_eq!(ev.midi1_bytes(), Some([0x92, 63, 100]));
+
+        // A two-word MIDI 2.0 message is not reducible to 3 bytes.
+        let wide = MidiEvent::from_ump(&[0x4092_3C00, 0xF800_0000]);
+        assert_eq!(wide.words(), &[0x4092_3C00, 0xF800_0000]);
+        assert_eq!(wide.midi1_bytes(), None);
+
+        // Over-long input is truncated to four words, never panics.
+        assert_eq!(MidiEvent::from_ump(&[0; 6]).words().len(), 4);
     }
 }

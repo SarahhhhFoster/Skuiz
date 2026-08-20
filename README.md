@@ -33,19 +33,21 @@ exchange between two processes.
 | Format | Status | Obligation on you |
 | --- | --- | --- |
 | CLAP | Working, validator-clean | None (MIT) |
-| VST3 | Working, with editor | Steinberg licence to **ship** a binary |
+| VST3 | Working, with editor | None — the SDK is MIT since v3.8 (Oct 2025) |
 | AUv3 | Shim done and tested; needs an Xcode target | Apple developer account |
 | Standalone | Working (output + test tone) | None |
 
 `skuiz-vst3` builds on the clean-room MIT/Apache `vst3` bindings, so no
-Steinberg SDK code is vendored or linked and Skuiz itself stays MIT. But
-*shipping* a VST3 binary is licensed by Steinberg under either GPLv3 or
-their separate free-of-charge proprietary agreement, so the crate is
-excluded from the workspace's default members — building it is a deliberate
-choice, not something `cargo build` does for you.
+Steinberg SDK code is vendored or linked and Skuiz itself stays MIT. And
+since Steinberg relicensed the VST3 SDK under MIT in v3.8 (October 2025) —
+retiring the GPLv3-or-proprietary dual licence — *shipping* a VST3 binary
+no longer carries a Steinberg licensing obligation either. The only
+remaining string is trademark: branding a plugin with the "VST" name or
+logo is optional, but doing so means following Steinberg's usage
+guidelines.
 
 ```sh
-cargo build -p skuiz-vst3          # explicit
+cargo build                            # skuiz-vst3 is a default member
 ./examples/shared-gain/bundle-vst3.sh
 ```
 
@@ -57,15 +59,18 @@ cargo build -p skuiz-vst3          # explicit
 - `crates/skuiz-ipc` — two-tier instance bus: direct in-process delivery
   plus one cross-process socket link per process, with zero-config election
   and automatic promotion
-- `crates/skuiz-midi` — MIDI 1.0 messages and output configuration
+- `crates/skuiz-midi` — MIDI 1.0 and MIDI 2.0 (UMP) messages, output
+  configuration
 - `crates/skuiz-dsp` — embedded Pure Data via libpd (feature `libpd`)
-- `crates/skuiz-vst3` — VST3 adapter (opt-in; see Licensing below)
+- `crates/skuiz-vst3` — VST3 adapter (default member; see Licensing above)
 - `crates/skuiz-auv3` — AUv3 C ABI, `AUAudioUnit` shim, packaging scaffold
 - `crates/skuiz-standalone` — run any processor as a desktop app
 - `examples/shared-gain` — gain with an IPC-shared parameter and a webview
   editor; move the slider in one instance, all instances follow
 - `examples/trigger-note` — C envelope follower that fires MIDI notes, with
   dropdown configuration
+- `examples/pd-tremolo` — stereo tremolo whose DSP is an embedded Pure Data
+  patch (libpd, opt-in feature)
 - `examples/solid-synth` — SolidJS editor driving a Rust oscillator; the
   quickest way to hear the stack work
 
@@ -140,7 +145,12 @@ fixed 64-frame tick to arbitrary host block sizes.
 
 ```sh
 cargo test -p skuiz-dsp --features libpd   # vendors and builds Pure Data
+cargo test -p pd-tremolo --features libpd  # the example plugin that embeds it
 ```
+
+`examples/pd-tremolo` shows the whole pattern: a stereo tremolo whose patch
+is embedded with `include_str!`, loaded from a temp file in `activate`, and
+driven from plugin parameters through `[receive]` objects.
 
 ## Building
 
@@ -149,6 +159,13 @@ cargo build --workspace
 cargo test --workspace
 ./examples/shared-gain/bundle.sh   # macOS: builds target/shared-gain.clap
 clap-validator validate target/shared-gain.clap
+```
+
+To start your own plugin, scaffold from an example and install it:
+
+```sh
+./tools/new-plugin.sh my-gain    # copies examples/shared-gain, rewired standalone
+cd my-gain && ./install.sh       # build + install to your user CLAP dir
 ```
 
 ## Standalone
@@ -180,18 +197,28 @@ via server promotion.
 
 ## Development
 
-CI (`.github/workflows/ci.yml`) enforces on every push to `main` and every
-pull request:
+CI (`.github/workflows/ci.yml`) is switched off to keep Actions cost at
+zero — the workflows stay in the tree and can be run manually from the
+Actions tab, or re-enabled by restoring the push/PR triggers. When run, CI
+enforces:
 
 - `cargo fmt --all -- --check` — the tree is rustfmt-clean
 - `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings
 - `cargo test --workspace` on **macOS, Windows and Linux** — the Windows job
   is the only place the named-pipe transport actually executes, so treat a
   Windows failure as a real finding
-- the libpd integration test (`skuiz-dsp --features libpd`, macOS)
+- the libpd integration tests (`skuiz-dsp` and `pd-tremolo --features libpd`,
+  macOS)
 - `cargo doc` with warnings denied — documentation links must resolve
-- clap-validator over every example plugin (macOS)
+- clap-validator over every example plugin (macOS), plus an end-to-end run
+  of the scaffold tooling (`tools/new-plugin.sh` → install → validate)
+- Steinberg's official VST3 `validator`, built from the MIT SDK, over the
+  example `.vst3` bundle (macOS)
 - the SolidJS editor's headless DOM check (Linux)
+
+The release workflow (`.github/workflows/release.yml`, also manual-only)
+builds the example bundles with `BUILD_TYPE=release` and attaches them to
+a GitHub release.
 
 Run the same locally before pushing:
 
@@ -202,10 +229,9 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 ## Deferred (add when needed)
 
 - Lock-free parameter sync (currently a Mutex around the processor)
-- GPU spectral resynthesis example; a plugin example that embeds libpd
-  (the engine and its tests exist, no example plugin uses it yet)
-- MPE / MIDI 2.0 UMP output — both need an event wider than the 3 bytes
-  `MidiOut` carries, so they land together with a wider event type
+- GPU spectral resynthesis example
+- MPE per-note expression — the UMP event type (`MidiEvent`) and MIDI 2.0
+  output are in; MPE note-expression events are still out
 - MIDI *input* (only output ports are declared today)
 - AUv3 Xcode project, provisioning and signing (the C ABI and the
   `AUAudioUnit` shim are done and tested; see crates/skuiz-auv3/scaffold)

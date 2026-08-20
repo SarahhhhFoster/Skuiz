@@ -35,13 +35,13 @@ Read these in order; each assumes the one before it.
 
 ## Formats
 
-Each format has its own packaging, its own capabilities, and in one case its
-own licensing obligation.
+Each format has its own packaging and its own capabilities; all are
+obligation-free since the VST3 SDK went MIT in October 2025.
 
 - **[CLAP](formats/clap.md)** — the reference target; fully working, no
   strings attached.
-- **[VST3](formats/vst3.md)** — working, opt-in. **Read the licensing
-  section before shipping a binary.**
+- **[VST3](formats/vst3.md)** — working, a default workspace member, and
+  CI-checked against Steinberg's official validator.
 - **[AUv3](formats/auv3.md)** — Rust side and Objective-C shim done and
   tested; needs an Xcode target you assemble.
 - **[Standalone](formats/standalone.md)** — a desktop app with window,
