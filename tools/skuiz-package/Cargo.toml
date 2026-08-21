@@ -1,0 +1,11 @@
+[package]
+name = "skuiz-package"
+description = "Build and package a Skuiz plugin as .dmg, .AppImage, or .exe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# std only: the tool shells out to cargo/hdiutil/appimagetool/iscc and
+# generates its metadata files as text. Keep it that way.
