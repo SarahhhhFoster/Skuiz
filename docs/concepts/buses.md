@@ -73,6 +73,10 @@ fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &m
   static declarations. No allocation, no locking, no string lookup on the
   audio thread — the [invariants](invariants.md) apply here as everywhere.
 
+`examples/ducking-compressor` is a complete sidechain effect built on this:
+a rudimentary ducking compressor whose mono sidechain drives an envelope
+follower.
+
 ## What each host sees
 
 The adapters translate the same declaration into their native model; the

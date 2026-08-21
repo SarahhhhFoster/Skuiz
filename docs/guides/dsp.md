@@ -181,3 +181,5 @@ see its `tests/clap.rs` for driving it through the raw CLAP vtable.
   state.
 - `examples/trigger-note`, `examples/solid-synth`, `examples/pd-tremolo` —
   the code this page summarizes.
+- `examples/ducking-compressor` — a rudimentary sidechain ducking
+  compressor: envelope follower driven by an optional sidechain bus.

@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 16px; background: #1e1e22; color: #ddd; }
+  label { display: block; margin-bottom: 8px; }
+  input[type=range] { width: 100%; }
+  .val { float: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <label>Threshold <span class="val" id="val0"></span></label>
+  <input id="p0" type="range" min="0" max="1" step="0.01" value="0.3">
+  <label>Depth <span class="val" id="val1"></span></label>
+  <input id="p1" type="range" min="0" max="1" step="0.01" value="0.8">
+  <label>Attack (ms) <span class="val" id="val2"></span></label>
+  <input id="p2" type="range" min="0.1" max="200" step="0.1" value="5">
+  <label>Release (ms) <span class="val" id="val3"></span></label>
+  <input id="p3" type="range" min="1" max="1000" step="1" value="150">
+  <script>
+    const sliders = [0, 1, 2, 3].map(id => document.getElementById('p' + id));
+    const vals = [0, 1, 2, 3].map(id => document.getElementById('val' + id));
+    sliders.forEach((slider, id) => {
+      vals[id].textContent = Number(slider.value).toFixed(2);
+      slider.addEventListener('input', () => {
+        vals[id].textContent = Number(slider.value).toFixed(2);
+        window.ipc.postMessage('set_param ' + id + ' ' + slider.value);
+      });
+    });
+    // plugin -> UI: adapter calls this with current values
+    window.skuizOnParam = (id, value) => {
+      if (sliders[id]) {
+        sliders[id].value = value;
+        vals[id].textContent = Number(value).toFixed(2);
+      }
+    };
+  </script>
+</body>
+</html>
