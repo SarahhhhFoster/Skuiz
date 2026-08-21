@@ -857,10 +857,16 @@ impl<P: Processor> Vt<P> {
                 ChannelLayout::Discrete(n) => (n as u32, null()),
             };
             let main = index == 0;
-            // The main pair can be processed in place: the input names the
-            // matching output's id (and vice versa is not part of CLAP).
-            let in_place_pair = if is_input && main {
-                Self::bus_specs(BusDirection::Output)
+            // The main pair can be processed in place: each side names the
+            // other's id. The pairing must be symmetric — validators (and
+            // hosts) cross-check both directions.
+            let in_place_pair = if main {
+                let other_dir = if is_input {
+                    BusDirection::Output
+                } else {
+                    BusDirection::Input
+                };
+                Self::bus_specs(other_dir)
                     .next()
                     .filter(|o| o.layout.channels() == spec.layout.channels())
                     .map_or(CLAP_INVALID_ID, |o| o.id.0)

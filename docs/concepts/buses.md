@@ -26,10 +26,12 @@ impl Processor for SidechainComp {
 ```
 
 Each `AudioBusSpec` carries a stable [`BusId`] (a const FNV-1a hash of the
-name — pin it with `.with_id(n)` if you ever rename a bus), a display name,
-a direction, a `ChannelLayout` (`Mono`, `Stereo`, or `Discrete(n)` up to 8
-channels; named surround layouts are deliberately deferred), and whether it
-is `optional`.
+name, namespaced by direction so an input "Main" and an output "Main" get
+different ids — host formats like CLAP require port ids to be unique across
+the whole plugin; pin it with `.with_id(n)` if you ever rename a bus), a
+display name, a direction, a `ChannelLayout` (`Mono`, `Stereo`, or
+`Discrete(n)` up to 8 channels; named surround layouts are deliberately
+deferred), and whether it is `optional`.
 
 Two ready-made topologies cover the common cases:
 
@@ -38,8 +40,8 @@ Two ready-made topologies cover the common cases:
 - `skuiz_core::bus::INSTRUMENT_BUSES` — no inputs, stereo main out.
 
 The rules (`validate_buses`, debug-asserted at engine construction): ids
-are unique per direction, the first bus of a direction is the *main* bus
-and cannot be optional, at most 4 buses per direction.
+are unique across the whole plugin, the first bus of a direction is the
+*main* bus and cannot be optional, at most 4 buses per direction.
 
 ## Reading buses in `process`
 
@@ -48,7 +50,7 @@ fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &m
     let Some(main_in) = inputs.main() else { return };      // None: instrument
     let Some(main_out) = outputs.main() else { return };
     let side = inputs
-        .get(BusId::from_name("Sidechain"))
+        .get(BusId::input("Sidechain"))
         .and_then(|b| b.channel(0));   // None when inactive
 
     for (ic, oc) in main_in.channels().iter().zip(main_out.channels()) {

@@ -24,24 +24,39 @@ pub const MAX_BUSES_PER_DIRECTION: usize = 4;
 ///
 /// Like [`crate::ParamDef::id`], a bus id must never change once the plugin
 /// ships: hosts key bus state (activation, saved routings) on it. The
-/// default id is a const FNV-1a hash of the bus name, so declarative names
-/// resolve to static ids at compile time; override with
+/// default id is a const FNV-1a hash of the bus name *namespaced by
+/// direction* — an input "Main" and an output "Main" get different ids, so
+/// ids are unique across the whole plugin as host formats like CLAP require
+/// (in-place pairing names a port in the opposite direction by id).
+/// Declarative names resolve to static ids at compile time via
+/// [`BusId::input`]/[`BusId::output`]; override with
 /// [`AudioBusSpec::with_id`] to keep an id stable across a rename.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BusId(pub u32);
 
 impl BusId {
-    /// FNV-1a over the name bytes — the same hash family the VST3 adapter
-    /// uses for class ids, but `const`, so it runs at compile time.
-    pub const fn from_name(name: &str) -> Self {
-        let bytes = name.as_bytes();
-        let mut hash = 0x811c_9dc5u32;
+    const fn fnv1a(bytes: &[u8], mut hash: u32) -> u32 {
         let mut i = 0;
         while i < bytes.len() {
             hash = (hash ^ bytes[i] as u32).wrapping_mul(0x0100_0193);
             i += 1;
         }
-        BusId(hash)
+        hash
+    }
+
+    /// Id of the input bus named `name` — what [`AudioBusSpec::input`]
+    /// derives. The same hash family the VST3 adapter uses for class ids,
+    /// but `const`, so it runs at compile time.
+    pub const fn input(name: &str) -> Self {
+        let hash = Self::fnv1a(b"in:", 0x811c_9dc5);
+        BusId(Self::fnv1a(name.as_bytes(), hash))
+    }
+
+    /// Id of the output bus named `name` — what [`AudioBusSpec::output`]
+    /// derives.
+    pub const fn output(name: &str) -> Self {
+        let hash = Self::fnv1a(b"out:", 0x811c_9dc5);
+        BusId(Self::fnv1a(name.as_bytes(), hash))
     }
 }
 
@@ -100,10 +115,11 @@ pub struct AudioBusSpec {
 }
 
 impl AudioBusSpec {
-    /// A declared input bus, active by default, id hashed from `name`.
+    /// A declared input bus, active by default, id derived from `name` via
+    /// [`BusId::input`].
     pub const fn input(name: &'static str, layout: ChannelLayout) -> Self {
         Self {
-            id: BusId::from_name(name),
+            id: BusId::input(name),
             name,
             direction: BusDirection::Input,
             layout,
@@ -111,10 +127,11 @@ impl AudioBusSpec {
         }
     }
 
-    /// A declared output bus, active by default, id hashed from `name`.
+    /// A declared output bus, active by default, id derived from `name` via
+    /// [`BusId::output`].
     pub const fn output(name: &'static str, layout: ChannelLayout) -> Self {
         Self {
-            id: BusId::from_name(name),
+            id: BusId::output(name),
             name,
             direction: BusDirection::Output,
             layout,
@@ -140,7 +157,9 @@ impl AudioBusSpec {
 /// Why a topology declaration is invalid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BusError {
-    /// Two buses in the same direction share an id.
+    /// Two buses share an id (ids must be unique across the whole plugin —
+    /// hosts key bus state on them, and CLAP in-place pairing references a
+    /// port in the opposite direction by id).
     DuplicateId,
     /// The first bus of a direction — the main bus — is marked optional.
     MainIsOptional,
@@ -154,20 +173,17 @@ pub enum BusError {
 /// invalid topology as empty in release builds (fail safe, deterministic);
 /// adapters only ever see validated scratch.
 pub fn validate_buses(specs: &[AudioBusSpec]) -> Result<(), BusError> {
+    for (i, spec) in specs.iter().enumerate() {
+        if specs.iter().skip(i + 1).any(|s| s.id == spec.id) {
+            return Err(BusError::DuplicateId);
+        }
+    }
     for dir in [BusDirection::Input, BusDirection::Output] {
         let mut count = 0usize;
         for (i, spec) in specs.iter().filter(|s| s.direction == dir).enumerate() {
             count += 1;
             if i == 0 && spec.optional {
                 return Err(BusError::MainIsOptional);
-            }
-            if specs
-                .iter()
-                .filter(|s| s.direction == dir)
-                .skip(i + 1)
-                .any(|s| s.id == spec.id)
-            {
-                return Err(BusError::DuplicateId);
             }
             let n = spec.layout.channels();
             if n == 0 || n as usize > MAX_BUS_CHANNELS {
@@ -612,8 +628,11 @@ mod tests {
 
     #[test]
     fn ids_are_stable_and_name_derived() {
-        assert_eq!(BusId::from_name("Main"), BusId::from_name("Main"));
-        assert_ne!(BusId::from_name("Main"), BusId::from_name("Sidechain"));
+        assert_eq!(BusId::input("Main"), BusId::input("Main"));
+        assert_ne!(BusId::input("Main"), BusId::input("Sidechain"));
+        // Direction namespaces the hash: same name, different ids, so ids
+        // are unique across the whole plugin.
+        assert_ne!(BusId::input("Main"), BusId::output("Main"));
         // with_id pins an explicit value.
         let spec = AudioBusSpec::input("Main", ChannelLayout::Stereo).with_id(42);
         assert_eq!(spec.id, BusId(42));
@@ -654,12 +673,19 @@ mod tests {
             AudioBusSpec::input("Main", ChannelLayout::Mono),
         ];
         assert_eq!(validate_buses(DUP), Err(BusError::DuplicateId));
-        // Same id across directions is fine.
+        // with_id can collide across directions; rejected too.
+        const XDIR_DUP: &[AudioBusSpec] = &[
+            AudioBusSpec::input("Main", ChannelLayout::Stereo).with_id(7),
+            AudioBusSpec::output("Main", ChannelLayout::Stereo).with_id(7),
+        ];
+        assert_eq!(validate_buses(XDIR_DUP), Err(BusError::DuplicateId));
+        // Same name across directions is fine: ids are direction-namespaced.
         const MAIN_MAIN: &[AudioBusSpec] = &[
             AudioBusSpec::input("Main", ChannelLayout::Stereo),
             AudioBusSpec::output("Main", ChannelLayout::Stereo),
         ];
         assert!(validate_buses(MAIN_MAIN).is_ok());
+        assert_ne!(MAIN_MAIN[0].id, MAIN_MAIN[1].id);
         // Main bus cannot be optional.
         const OPT_MAIN: &[AudioBusSpec] =
             &[AudioBusSpec::input("Main", ChannelLayout::Stereo).optional()];
@@ -710,9 +736,7 @@ mod tests {
         assert!(main.active());
         assert_eq!(main.layout(), ChannelLayout::Stereo);
         assert_eq!(main.channel(0).unwrap(), &[1.0f32; 8]);
-        let side = inputs
-            .get(BusId::from_name("Sidechain"))
-            .expect("sidechain");
+        let side = inputs.get(BusId::input("Sidechain")).expect("sidechain");
         assert!(side.active());
         assert_eq!(side.channel(0).unwrap()[0], 0.5);
 
@@ -735,9 +759,7 @@ mod tests {
             scratch.set_channel(BusDirection::Output, 0, 0, left_out.as_mut_ptr(), 4);
         }
         let (inputs, _) = scratch.views();
-        let side = inputs
-            .get(BusId::from_name("Sidechain"))
-            .expect("sidechain");
+        let side = inputs.get(BusId::input("Sidechain")).expect("sidechain");
         assert!(!side.active());
         assert!(side.channels().is_empty());
         assert_eq!(side.channel(0), None);

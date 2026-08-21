@@ -55,7 +55,7 @@ impl Processor for SidechainFx {
     }
     fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
         let side = inputs
-            .get(BusId::from_name("Sidechain"))
+            .get(BusId::input("Sidechain"))
             .and_then(|b| b.channel(0))
             .map(|c| c[0]);
         let main_in = inputs.main().and_then(|b| b.channel(0)).map(|c| c[0]);

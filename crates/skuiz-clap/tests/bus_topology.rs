@@ -15,6 +15,7 @@ use skuiz_core::bus::{validate_buses, BusId};
 use skuiz_core::{
     AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, ParamDef, PluginInfo, Processor,
 };
+use std::ffi::CStr;
 use std::ptr::{null, null_mut};
 
 /// Main stereo in/out plus an optional mono sidechain. The DSP writes a
@@ -62,7 +63,7 @@ impl Processor for SidechainFx {
         _midi: &mut skuiz_core::MidiOut,
     ) {
         let side = inputs
-            .get(BusId::from_name("Sidechain"))
+            .get(BusId::input("Sidechain"))
             .and_then(|b| b.channel(0))
             .map(|c| c[0]);
         let main_in = inputs.main().and_then(|b| b.channel(0)).map(|c| c[0]);
@@ -120,22 +121,28 @@ fn declared_buses_are_exposed() {
         assert_eq!((ports.count.unwrap())(plugin, false), 1, "one output port");
 
         let main_in = port_info(plugin, 0, true).expect("main input");
-        assert_eq!(main_in.id, BusId::from_name("Main").0);
+        assert_eq!(main_in.id, BusId::input("Main").0);
         assert_ne!(main_in.flags & CLAP_AUDIO_PORT_IS_MAIN, 0);
         assert_eq!(main_in.channel_count, 2);
-        assert_eq!(main_in.port_type, CLAP_PORT_STEREO.as_ptr());
+        // Compare port-type contents, not pointers: string literals are not
+        // deduplicated across codegen units on every platform (MSVC).
+        assert_eq!(CStr::from_ptr(main_in.port_type), CLAP_PORT_STEREO);
         assert_eq!(name_of(&main_in), "Main");
-        // In-place pair names the matching main output.
-        assert_eq!(main_in.in_place_pair, BusId::from_name("Main").0);
+        // In-place pair names the matching main output — a *different* id
+        // from the input's, since ids are namespaced by direction.
+        assert_eq!(main_in.in_place_pair, BusId::output("Main").0);
 
         let side = port_info(plugin, 1, true).expect("sidechain input");
-        assert_eq!(side.id, BusId::from_name("Sidechain").0);
+        assert_eq!(side.id, BusId::input("Sidechain").0);
         assert_eq!(side.flags & CLAP_AUDIO_PORT_IS_MAIN, 0);
         assert_eq!(side.channel_count, 1);
-        assert_eq!(side.port_type, CLAP_PORT_MONO.as_ptr());
+        assert_eq!(CStr::from_ptr(side.port_type), CLAP_PORT_MONO);
         assert_eq!(name_of(&side), "Sidechain");
 
         let main_out = port_info(plugin, 0, false).expect("main output");
+        assert_eq!(main_out.id, BusId::output("Main").0);
+        // The pairing is symmetric: the output names the input back.
+        assert_eq!(main_out.in_place_pair, BusId::input("Main").0);
         assert_ne!(main_out.flags & CLAP_AUDIO_PORT_IS_MAIN, 0);
         assert_eq!(main_out.channel_count, 2);
 
