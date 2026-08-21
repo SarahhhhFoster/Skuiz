@@ -13,7 +13,9 @@ breaks it; the fix is scheduled P0/P1 work).
 
 No other thread may call into the processor while a block is rendering.
 Ownership is structural — the processor lives in audio-side state that
-only `process`/`params_flush` can reach — not mutual exclusion.
+only the audio-side entry points can reach (`process`, the CLAP
+`params_flush`, between-block state-op servicing, and the `MidiOut`
+accessor) — not mutual exclusion.
 
 - **Enforced by:** `Engine`'s three-state access machine
   (`crates/skuiz-core/src/engine.rs`): the processor lives behind an
@@ -23,9 +25,11 @@ only `process`/`params_flush` can reach — not mutual exclusion.
   `end_audio`. Safe code therefore cannot reach the audio core without
   provably holding the AUDIO state; the main thread gets access only
   while the transport is stopped (`with_main`).
-- **Status: held.** All four adapters route through the engine and stash
-  the token in instance state between start/stop; no adapter code
-  touches the processor outside the state machine.
+- **Status: held.** All four adapters route through the engine and no
+  adapter code touches the processor outside the state machine. CLAP and
+  VST3 stash the token in instance state between start/stop; AUv3 and
+  the standalone have no start/stop pair, so they claim the token at the
+  top of each render callback and hand it back at the bottom.
 
 ## 2. No mutex may be acquired by the audio thread
 
@@ -98,8 +102,9 @@ mirror the audio thread publishes.
   seqlock generation counter for consistent snapshots.
 - **Status: held.** Every host read (`params_get_value`,
   `getParamNormalized`, `AUParameter` getters) and every editor seeding
-  goes through the mirror; `snapshot_params` and its processor lock are
-  gone.
+  goes through the mirror; the processor lock is gone, and
+  `EngineHandle::snapshot_params` — which answers `sync_request` in all
+  four adapters — reads the mirror rather than the processor.
 
 ## 7. MIDI output is audio-thread-owned during processing and transferred without blocking
 

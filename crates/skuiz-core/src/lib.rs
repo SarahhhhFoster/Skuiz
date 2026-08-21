@@ -483,8 +483,11 @@ pub trait Processor: Send + 'static {
     /// see [`MidiOut::push`].
     ///
     /// **Audio thread, realtime.** No allocation, no locking, no file or
-    /// network I/O, no logging, and no panicking — a panic here crosses an
-    /// FFI boundary and aborts the host. Everything expensive belongs in
+    /// network I/O, no logging, and no panicking — the adapters catch
+    /// panics at the FFI boundary with `catch_unwind`, but that is a
+    /// safety net that keeps the host alive, not a license: a panicked
+    /// block renders silence and leaves the processor in an unknown
+    /// state. Everything expensive belongs in
     /// [`Processor::activate`].
     fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut MidiOut);
 

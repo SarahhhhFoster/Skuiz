@@ -48,12 +48,15 @@ otherwise.
 values right after attaching, but that eval can race your script
 loading, and the guarded call drops it silently. The reliable
 direction is the page pushing: on mount, post every parameter value
-your UI is showing. If the host has a different value, the answer
-comes back through `skuizOnParam`.
+your UI is showing. On CLAP with the transport running, the applied
+value comes back through `skuizOnParam` once the engine has taken it;
+on VST3 and the standalone there is no echo, so treat your own push as
+authoritative.
 
-**Never echo host values back out.** When `skuizOnParam` delivers a
-value (host automation, a preset load, another instance), update the
-widget — but do not let that update re-post `set_param`. Two editors
+**Never echo incoming values back out.** When `skuizOnParam` delivers a
+value (a preset load, another instance, or the CLAP echo of your own
+push), update the widget — but do not let that update re-post
+`set_param`. Two editors
 each echoing the other is an infinite loop. Track which values are
 "agreed" and suppress the echo; `examples/solid-synth`'s editor does
 this with an `agreed` map, and `verify-editor.mjs` asserts it
@@ -62,9 +65,9 @@ headlessly.
 ## Using a framework
 
 The page is a plain document — use any framework or none.
-`examples/solid-synth` uses SolidJS, vendored as a prebuilt ~31 KB
-bundle and `concat!`ed into the HTML, so building the plugin needs
-cargo and no JavaScript toolchain. Its signals hold the parameters and
+`examples/solid-synth` uses SolidJS plus solid-knobs, vendored as
+prebuilt bundles (~63 KB total) and `concat!`ed into the HTML, so
+building the plugin needs cargo and no JavaScript toolchain. Its signals hold the parameters and
 a `createEffect` per signal posts changes — that pattern is worth
 reading before writing your own reactive editor.
 
@@ -76,8 +79,9 @@ jsdom and assert on the messages. See
 
 macOS is tested. Windows (`from_hwnd`) and Linux (`from_x11`, X11 via
 WebKitGTK — on Wayland, through the host's X11-embedding support) are
-written but unverified — they type-check and ship in CI but have had no
-real-world exercise. See
+written but unverified — they type-check in CI but have had no
+real-world exercise, and the release workflow ships macOS and Linux
+bundles only, nothing for Windows yet. See
 [platform support](../reference/platform-support.md).
 
 ## Automation recording caveat

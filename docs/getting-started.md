@@ -41,8 +41,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-skuiz-core = { git = "https://github.com/sarahhhh/skuiz" }
-skuiz-clap = { git = "https://github.com/sarahhhh/skuiz" }
+skuiz-core = { git = "https://github.com/SarahhhhFoster/Skuiz" }
+skuiz-clap = { git = "https://github.com/SarahhhhFoster/Skuiz" }
 ```
 
 `crate-type = ["cdylib"]` is what makes the build produce a loadable library
@@ -268,4 +268,4 @@ guide](formats/auv3.md); for a desktop app see
   page; read it before shipping.
 - [Parameters](concepts/parameters.md) — dropdowns, saved state, ranges.
 - [Writing DSP](guides/dsp.md) — C over FFI, or an embedded Pure Data patch.
-- `examples/` in this repository — three complete plugins, all CI-tested.
+- `examples/` in this repository — four complete plugins, all CI-tested.

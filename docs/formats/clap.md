@@ -20,9 +20,13 @@ advertised with the `instrument` feature; everything else is an
 - **Audio**: one main stereo input, one main stereo output.
 - **Parameters**: your full list, with choice parameters flagged
   `IS_ENUM | IS_STEPPED` and label-aware text conversion.
-- **Note ports**: one MIDI 1.0 *output* port, only when `emits_midi()`.
+- **Note ports**: one *output* port speaking MIDI 1.0 and MIDI 2.0
+  (UMP), only when `emits_midi()`.
 - **State**: `save_state`/`load_state` streamed through the host's
   `clap_ostream`/`clap_istream`, with a host rescan after a load.
+- **Reset**: the host's `reset` callback runs your `Processor::reset`
+  via `Engine::reset` — directly when stopped, at the next block top
+  when running; parameter values are untouched.
 - **GUI**: the webview editor, on macOS (tested), Windows and Linux
   (written, unverified — Linux embeds on X11 via WebKitGTK), when
   `editor_html()` is `Some`. See [editors](../concepts/editors.md).
@@ -57,8 +61,6 @@ it over every example; make it a habit before debugging a host.
   bus carry no timestamp and apply at block top.
 - **No MIDI input** — note ports are output-only; the `Processor`
   trait has no MIDI-input surface yet (deferred).
-- **`reset` is a no-op** — the trait has no reset hook, so DSP state
-  survives transport jumps.
 - **GUI moves don't record automation gestures** — editor changes reach
   the host as a value rescan, which syncs values without a recorded
   gesture (VST3 does record; see its page).

@@ -17,7 +17,7 @@ library name, `src/bin/*-standalone.rs`, bundle scripts), and rewrites
 `Cargo.toml` from workspace inheritance to **path dependencies on this
 checkout**, so the project builds on its own. Move it to another machine
 and those path deps break — switch them to
-`skuiz-core = { git = "https://github.com/sarahhhh/skuiz" }` etc.
+`skuiz-core = { git = "https://github.com/SarahhhhFoster/Skuiz" }` etc.
 
 The generated `install.sh` packages the plugin and copies it where hosts
 scan for the current user (`~/Library/Audio/Plug-Ins/CLAP` on macOS,
