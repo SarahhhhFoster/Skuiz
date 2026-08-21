@@ -17,14 +17,22 @@ pub fn run(tool: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Find an executable on PATH (no extension games — this runs on the host
-/// OS only, and the tools we look up are Unix-style names).
+/// Find an executable on PATH. On Windows, `name` is also tried with an
+/// `.exe` suffix (minimal PATHEXT: all the tools we look up are `.exe`).
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let with_exe = format!("{name}.exe");
+    let names: &[&str] = if cfg!(windows) && !name.ends_with(".exe") {
+        &[name, &with_exe]
+    } else {
+        &[name]
+    };
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+        for n in names {
+            let candidate = dir.join(n);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -82,8 +90,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn which_finds_sh() {
+    fn which_finds_a_host_executable() {
+        #[cfg(unix)]
         assert!(which("sh").is_some());
+        #[cfg(windows)]
+        assert!(which("cmd").is_some(), "cmd.exe should resolve on Windows");
         assert!(which("definitely-not-a-real-tool-xyz").is_none());
     }
 
