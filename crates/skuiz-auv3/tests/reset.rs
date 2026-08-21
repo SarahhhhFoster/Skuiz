@@ -2,7 +2,8 @@
 //! counter the processor advances per block is observable in the rendered
 //! audio, so the test can see the reset land without touching internals.
 
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_auv3::SkuizAudioBusBuffers;
+use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
 use std::ffi::c_void;
 
 struct Counter {
@@ -49,16 +50,17 @@ impl Processor for Counter {
     fn reset(&mut self) {
         self.blocks = 0;
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
         self.blocks += 1;
         // Frame 0 of channel 0 reports how many blocks have run since the
         // last reset; the rest is ordinary gain processing.
-        for ch in channels.iter_mut() {
+        let Some(out) = outputs.main() else { return };
+        for ch in out.channels() {
             for s in ch.iter_mut() {
                 *s *= self.gain as f32;
             }
         }
-        if let Some(first) = channels.first_mut().and_then(|c| c.first_mut()) {
+        if let Some(first) = out.channel_mut(0).and_then(|c| c.first_mut()) {
             *first = self.blocks as f32;
         }
     }
@@ -72,8 +74,8 @@ extern "C" {
     fn skuiz_auv3_activate(inst: *mut c_void, sample_rate: f64, max_frames: u32);
     fn skuiz_auv3_render(
         inst: *mut c_void,
-        channels: *const *mut f32,
-        channel_count: u32,
+        inputs: *const SkuizAudioBusBuffers,
+        outputs: *const SkuizAudioBusBuffers,
         frames: u32,
     );
     fn skuiz_auv3_reset(inst: *mut c_void);
@@ -92,8 +94,11 @@ fn reset_clears_dsp_state_but_not_parameters() {
         let mut left = [1.0f32; 32];
         let render = |left: &mut [f32; 32]| {
             left.fill(1.0); // fresh input each block, or the gain compounds
-            let ptrs: [*mut f32; 1] = [left.as_mut_ptr()];
-            skuiz_auv3_render(inst, ptrs.as_ptr(), 1, 32);
+            let mut outputs = [SkuizAudioBusBuffers::empty(); 4];
+            outputs[0].channels[0] = left.as_mut_ptr();
+            outputs[0].channel_count = 1;
+            outputs[0].active = 1;
+            skuiz_auv3_render(inst, std::ptr::null(), outputs.as_ptr(), 32);
         };
 
         render(&mut left);

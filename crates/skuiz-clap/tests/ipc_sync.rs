@@ -71,7 +71,13 @@ impl Processor for Gain {
             _ => 0.0,
         }
     }
-    fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {}
+    fn process(
+        &mut self,
+        _inputs: &skuiz_core::AudioInputs,
+        _outputs: &mut skuiz_core::AudioOutputs,
+        _midi: &mut skuiz_core::MidiOut,
+    ) {
+    }
 }
 
 /// Same processor on its own bus scope: the convergence test must not share
@@ -96,8 +102,13 @@ impl Processor for ConvGain {
     fn get_param(&self, id: u32) -> f64 {
         self.0.get_param(id)
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut skuiz_core::MidiOut) {
-        self.0.process(channels, midi);
+    fn process(
+        &mut self,
+        inputs: &skuiz_core::AudioInputs,
+        outputs: &mut skuiz_core::AudioOutputs,
+        midi: &mut skuiz_core::MidiOut,
+    ) {
+        self.0.process(inputs, outputs, midi);
     }
 }
 
@@ -298,8 +309,13 @@ impl Processor for LoadGain {
     fn get_param(&self, id: u32) -> f64 {
         self.0.get_param(id)
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut skuiz_core::MidiOut) {
-        self.0.process(channels, midi);
+    fn process(
+        &mut self,
+        inputs: &skuiz_core::AudioInputs,
+        outputs: &mut skuiz_core::AudioOutputs,
+        midi: &mut skuiz_core::MidiOut,
+    ) {
+        self.0.process(inputs, outputs, midi);
     }
 }
 

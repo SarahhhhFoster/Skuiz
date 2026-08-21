@@ -3,7 +3,8 @@
 //! thread split holds under hostile concurrency: no deadlock, no panic, and
 //! reads always answer with a real value.
 
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_auv3::SkuizAudioBusBuffers;
+use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -44,11 +45,13 @@ impl Processor for Gain {
     fn get_param(&self, _id: u32) -> f64 {
         self.0
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
         let g = self.0 as f32;
-        for ch in channels.iter_mut() {
-            for s in ch.iter_mut() {
-                *s *= g;
+        if let Some(out) = outputs.main() {
+            for ch in out.channels() {
+                for s in ch.iter_mut() {
+                    *s *= g;
+                }
             }
         }
     }
@@ -63,8 +66,8 @@ extern "C" {
     fn skuiz_auv3_deactivate(inst: *mut c_void);
     fn skuiz_auv3_render(
         inst: *mut c_void,
-        channels: *const *mut f32,
-        channel_count: u32,
+        inputs: *const SkuizAudioBusBuffers,
+        outputs: *const SkuizAudioBusBuffers,
         frames: u32,
     );
     fn skuiz_auv3_get_param(inst: *mut c_void, id: u32) -> f64;
@@ -79,6 +82,17 @@ extern "C" {
 #[derive(Clone, Copy)]
 struct SendPtr(*mut c_void);
 unsafe impl Send for SendPtr {}
+
+/// Build the outputs array the render entry point takes: main stereo bus
+/// active, everything else zeroed. The main input aliases it in Rust.
+fn main_out(left: &mut [f32], right: &mut [f32]) -> [SkuizAudioBusBuffers; 4] {
+    let mut outputs = [SkuizAudioBusBuffers::empty(); 4];
+    outputs[0].channels[0] = left.as_mut_ptr();
+    outputs[0].channels[1] = right.as_mut_ptr();
+    outputs[0].channel_count = 2;
+    outputs[0].active = 1;
+    outputs
+}
 
 #[test]
 fn hammers_params_and_state_while_rendering() {
@@ -95,8 +109,8 @@ fn hammers_params_and_state_while_rendering() {
                 let mut left = [0.5f32; 64];
                 let mut right = [0.5f32; 64];
                 for _ in 0..4000 {
-                    let ptrs: [*mut f32; 2] = [left.as_mut_ptr(), right.as_mut_ptr()];
-                    skuiz_auv3_render(inst.0, ptrs.as_ptr(), 2, 64);
+                    let outputs = main_out(&mut left, &mut right);
+                    skuiz_auv3_render(inst.0, std::ptr::null(), outputs.as_ptr(), 64);
                 }
             });
 
@@ -148,9 +162,9 @@ fn hammers_params_and_state_while_rendering() {
         // Drain anything still queued, then every read must be a real value.
         let mut left = [0.0f32; 64];
         let mut right = [0.0f32; 64];
-        let ptrs: [*mut f32; 2] = [left.as_mut_ptr(), right.as_mut_ptr()];
         for _ in 0..4 {
-            skuiz_auv3_render(inst.0, ptrs.as_ptr(), 2, 64);
+            let outputs = main_out(&mut left, &mut right);
+            skuiz_auv3_render(inst.0, std::ptr::null(), outputs.as_ptr(), 64);
         }
         let final_value = skuiz_auv3_get_param(inst.0, 0);
         assert!(

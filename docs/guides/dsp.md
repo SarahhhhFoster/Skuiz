@@ -47,8 +47,9 @@ code says so: the bright ones alias at high frequencies, and PolyBLEP is the
 named fix if the plugin ever needs to sound clean rather than demonstrate a
 signal path. Document yours the same way.
 
-Also note `process` may receive an empty `channels` slice — a MIDI-only
-plugin still runs — so guard with `channels.first()` rather than indexing.
+Also note a bus the host left inactive yields no channels — a plugin
+whose output isn't connected still runs — so guard with
+`outputs.main()`/`inputs.main()` rather than indexing.
 
 ## C over FFI
 
@@ -157,8 +158,10 @@ pd.open_patch(Path::new("my-patch.pd"))?;
 // Drive [receive] objects from your parameters.
 pd.send_float("cutoff", 0.7);
 
-// In Processor::process: any block size, realtime-safe.
-pd.process(channels);
+// In Processor::process: any block size, realtime-safe. Takes the flat
+// in-place channel array — hand it `outputs.main()`'s channels, which the
+// adapter already copied the input into.
+pd.process(main.channels());
 ```
 
 The split matters: `new` and `open_patch` allocate and touch process-wide Pd

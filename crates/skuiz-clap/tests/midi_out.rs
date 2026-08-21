@@ -39,7 +39,12 @@ impl Processor for TwoWorlds {
     fn get_param(&self, _id: u32) -> f64 {
         0.0
     }
-    fn process(&mut self, _channels: &mut [&mut [f32]], midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &skuiz_core::AudioInputs,
+        _outputs: &mut skuiz_core::AudioOutputs,
+        midi: &mut MidiOut,
+    ) {
         midi.push(3, skuiz_midi::note_on(0, 60, 100));
         midi.push(5, skuiz_midi::note_on2(1, 60, 0xF800));
     }

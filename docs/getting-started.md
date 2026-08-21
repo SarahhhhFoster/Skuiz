@@ -55,7 +55,7 @@ Everything a plugin does lives in one trait implementation. Put this in
 `src/lib.rs`:
 
 ```rust
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
 
 /// Parameter ids are yours to choose, but must stay stable forever:
 /// saved projects refer to them.
@@ -112,9 +112,12 @@ impl Processor for MyGain {
         }
     }
 
-    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
         let g = self.gain as f32;
-        for ch in channels.iter_mut() {
+        // The adapter already copied the input into the output buffers,
+        // so scaling the main output in place is the whole effect.
+        let Some(main) = outputs.main() else { return };
+        for ch in main.channels() {
             for sample in ch.iter_mut() {
                 *sample *= g;
             }
@@ -128,8 +131,10 @@ skuiz_clap::export_clap!(MyGain);
 
 That is a complete, working plugin. Three things are worth noticing:
 
-- **`process` works in place.** Each slice arrives holding input and must
-  leave holding output.
+- **`process` works on buses, not raw channels.** You get `AudioInputs` /
+  `AudioOutputs` views over the declared topology (default: stereo main
+  in/out — see [buses](concepts/buses.md)). The main input may alias the
+  main output, so read a frame before writing it.
 - **`process` is realtime.** No allocation, no locking, no I/O, no
   panicking. See [threading](concepts/threading.md) — it is the one page
   that will save you a support ticket.

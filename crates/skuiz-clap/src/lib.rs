@@ -13,7 +13,7 @@ use clap_sys::events::{
 };
 use clap_sys::ext::audio_ports::{
     clap_audio_port_info, clap_plugin_audio_ports, CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS,
-    CLAP_PORT_STEREO,
+    CLAP_PORT_MONO, CLAP_PORT_STEREO,
 };
 #[cfg(target_os = "macos")]
 use clap_sys::ext::gui::CLAP_WINDOW_API_COCOA;
@@ -39,8 +39,9 @@ use clap_sys::process::{clap_process, clap_process_status, CLAP_PROCESS_CONTINUE
 use clap_sys::stream::{clap_istream, clap_ostream};
 use clap_sys::string_sizes::{CLAP_NAME_SIZE, CLAP_PATH_SIZE};
 use clap_sys::version::CLAP_VERSION;
+use skuiz_core::bus::{AudioBusSpec, BusDirection, ChannelLayout};
 use skuiz_core::diag::DiagCounters;
-use skuiz_core::engine::{AudioToken, Engine};
+use skuiz_core::engine::{AudioCore, AudioToken, Engine};
 use skuiz_core::{MidiOut, Processor};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -373,13 +374,6 @@ pub unsafe fn instantiate<P: Processor + Default>(
 #[allow(dead_code)]
 struct Vt<P>(PhantomData<P>);
 
-/// The block's output channels as raw pointers, grouped so
-/// `Vt::process_segment` stays readable (and under the arg-count lint).
-struct BlockOut {
-    outs: [*mut f32; 2],
-    n_ch: usize,
-}
-
 impl<P: Processor> Vt<P> {
     // --- plugin lifecycle -------------------------------------------------
 
@@ -606,81 +600,35 @@ impl<P: Processor> Vt<P> {
                 engine.audio_core(token.as_ref().expect("AUDIO implies a token"))
             };
             let report = engine.drain_commands(core);
-            let proc_ = &mut core.processor;
 
             // The block's timed automation events, sorted by frame offset.
             let events = &mut *inst.param_events.get();
             events.clear();
             collect_param_events::<P>(p.in_events, p.frames_count, events, engine.diag());
-            // Assemble the output channel pointers. A plugin with no audio
-            // output (or a host that gave us none) still gets processed
-            // with zero channels, so DSP that only emits MIDI keeps running.
-            let frames = p.frames_count as usize;
-            let mut block = BlockOut {
-                outs: [null_mut(), null_mut()],
-                n_ch: 0,
-            };
-            if p.audio_outputs_count > 0 && !p.audio_outputs.is_null() {
-                let out = &*p.audio_outputs;
-                if !out.data32.is_null() {
-                    block.n_ch = (out.channel_count as usize).min(block.outs.len());
 
-                    // Copy input into output unless the host processes in
-                    // place, then let the processor work in place on the
-                    // outputs.
-                    let mut copied = 0;
-                    if p.audio_inputs_count > 0 && !p.audio_inputs.is_null() {
-                        let inp = &*p.audio_inputs;
-                        if !inp.data32.is_null() {
-                            copied = block.n_ch.min(inp.channel_count as usize);
-                            for c in 0..copied {
-                                let src = *inp.data32.add(c);
-                                let dst = *out.data32.add(c);
-                                if !src.is_null() && !dst.is_null() && src != dst {
-                                    std::ptr::copy_nonoverlapping(src, dst, frames);
-                                }
-                            }
-                        }
-                    }
-
-                    // Zero the channels no input was copied into (host gave
-                    // fewer inputs than outputs, or none): left alone they'd
-                    // feed stale data from an earlier block to the DSP.
-                    for c in copied..block.n_ch {
-                        let dst = *out.data32.add(c);
-                        if !dst.is_null() {
-                            std::ptr::write_bytes(dst, 0, frames);
-                        }
-                    }
-
-                    for (c, slot) in block.outs.iter_mut().enumerate().take(block.n_ch) {
-                        let ptr = *out.data32.add(c);
-                        if ptr.is_null() {
-                            block.n_ch = c;
-                            break;
-                        }
-                        *slot = ptr;
-                    }
-                }
-            }
+            // Copy the main input into the main output once (unless the
+            // host already processes in place) and zero what no input
+            // covered; segments then re-slice those buffers, and any
+            // sidechain input is read directly from the host's buffers.
+            Self::copy_main_into_output(p);
 
             // Split the block at event times: render up to the next event,
-            // apply it, continue. Segments re-slice the same output buffers.
-            let midi = &mut core.midi_out;
+            // apply it, continue. Segments re-slice the same host buffers.
+            let frames = p.frames_count as usize;
             let mut pos = 0usize;
             for &(time, id, value) in events.iter() {
                 let t = (time as usize).min(frames);
                 if t > pos {
-                    Self::process_segment(proc_, &block, pos, t, midi, p, engine);
+                    Self::process_segment(engine, core, p, pos, t);
                     pos = t;
                 }
-                proc_.set_param(id, value);
+                core.processor.set_param(id, value);
                 // Readback publish: the mirror must hold the value the
                 // processor actually kept (it may round or clamp).
-                engine.mirror().publish(id, proc_.get_param(id));
+                engine.mirror().publish(id, core.processor.get_param(id));
             }
             if pos < frames {
-                Self::process_segment(proc_, &block, pos, frames, midi, p, engine);
+                Self::process_segment(engine, core, p, pos, frames);
             }
             if report.notify_main {
                 // Bounce to the main thread for host rescan + editor refresh.
@@ -694,24 +642,136 @@ impl<P: Processor> Vt<P> {
         })
     }
 
-    /// Render one segment of a block: `outs[start..end]` per channel, in
-    /// place. MIDI queued by the DSP carries segment-relative frame numbers,
-    /// so it is emitted with `start` added back.
+    /// Copy the main input into the main output (unless the host processes
+    /// in place) and zero any main-output channels no input landed in.
+    /// Runs once per block; segments then re-slice those buffers. Without
+    /// this, an absent input would feed stale data from an earlier block
+    /// to the DSP.
+    unsafe fn copy_main_into_output(p: &clap_process) {
+        let Some(out_spec) = Self::bus_specs(BusDirection::Output).next() else {
+            return;
+        };
+        if p.audio_outputs_count == 0 || p.audio_outputs.is_null() {
+            return;
+        }
+        let out = &*p.audio_outputs;
+        if out.data32.is_null() {
+            return;
+        }
+        let frames = p.frames_count as usize;
+        let n_out = (out.channel_count as usize).min(out_spec.layout.channels() as usize);
+        let mut copied = 0;
+        if Self::bus_specs(BusDirection::Input).next().is_some()
+            && p.audio_inputs_count > 0
+            && !p.audio_inputs.is_null()
+        {
+            let inp = &*p.audio_inputs;
+            if !inp.data32.is_null() {
+                copied = n_out.min(inp.channel_count as usize);
+                for c in 0..copied {
+                    let src = *inp.data32.add(c);
+                    let dst = *out.data32.add(c);
+                    if !src.is_null() && !dst.is_null() && src != dst {
+                        std::ptr::copy_nonoverlapping(src, dst, frames);
+                    }
+                }
+            }
+        }
+        for c in copied..n_out {
+            let dst = *out.data32.add(c);
+            if !dst.is_null() {
+                std::ptr::write_bytes(dst, 0, frames);
+            }
+        }
+    }
+
+    /// Render one segment of a block: repoint the engine's bus scratch at
+    /// `buffer[start..end]` per channel and run the processor. The main
+    /// input aliases the main output (copy-in landed there); sidechain
+    /// inputs read the host's buffers directly and are active only when
+    /// connected. MIDI queued by the DSP carries segment-relative frame
+    /// numbers, so it is emitted with `start` added back.
+    // Channel loops index raw host pointers (`port.data32.add(c)`), so an
+    // index loop is the honest shape here.
+    #[allow(clippy::needless_range_loop)]
     unsafe fn process_segment(
-        proc_: &mut P,
-        block: &BlockOut,
+        engine: &Engine<P>,
+        core: &mut AudioCore<P>,
+        p: &clap_process,
         start: usize,
         end: usize,
-        midi: &mut MidiOut,
-        p: &clap_process,
-        engine: &Engine<P>,
     ) {
-        let mut chans: [&mut [f32]; 2] = [&mut [], &mut []];
-        for (c, chan) in chans.iter_mut().enumerate().take(block.n_ch) {
-            *chan = std::slice::from_raw_parts_mut(block.outs[c].add(start), end - start);
+        let len = end - start;
+        let scratch = &mut core.bus_scratch;
+        scratch.clear();
+
+        // Outputs: each declared bus maps to the host port of the same
+        // index. A plugin with no connected output still gets processed
+        // with the bus inactive, so MIDI-only DSP keeps running.
+        let mut main_out: [*mut f32; skuiz_core::bus::MAX_BUS_CHANNELS] =
+            [null_mut(); skuiz_core::bus::MAX_BUS_CHANNELS];
+        let mut main_out_n = 0usize;
+        for (i, spec) in Self::bus_specs(BusDirection::Output).enumerate() {
+            if i >= p.audio_outputs_count as usize || p.audio_outputs.is_null() {
+                continue;
+            }
+            let port = &*p.audio_outputs.add(i);
+            if port.data32.is_null() {
+                continue;
+            }
+            scratch.set_active(BusDirection::Output, i, true);
+            let n = (port.channel_count as usize).min(spec.layout.channels() as usize);
+            for c in 0..n {
+                let ptr = *port.data32.add(c);
+                if ptr.is_null() {
+                    break;
+                }
+                scratch.set_channel(BusDirection::Output, i, c, ptr.add(start), len);
+                if i == 0 {
+                    // Segment-offset pointer, reused verbatim for the
+                    // main input alias below.
+                    main_out[c] = ptr.add(start);
+                    main_out_n = c + 1;
+                }
+            }
         }
+
+        // Inputs: the main bus aliases the main output; any further input
+        // (a sidechain) reads the host's buffer directly, active only when
+        // the host connected it.
+        for (i, spec) in Self::bus_specs(BusDirection::Input).enumerate() {
+            if i == 0 {
+                if main_out_n == 0 {
+                    continue;
+                }
+                scratch.set_active(BusDirection::Input, 0, true);
+                for (c, ptr) in main_out.iter().enumerate().take(main_out_n) {
+                    scratch.set_channel(BusDirection::Input, 0, c, *ptr, len);
+                }
+                continue;
+            }
+            if i >= p.audio_inputs_count as usize || p.audio_inputs.is_null() {
+                continue;
+            }
+            let port = &*p.audio_inputs.add(i);
+            if port.data32.is_null() {
+                continue;
+            }
+            scratch.set_active(BusDirection::Input, i, true);
+            let n = (port.channel_count as usize).min(spec.layout.channels() as usize);
+            for c in 0..n {
+                let ptr = *port.data32.add(c);
+                if ptr.is_null() {
+                    break;
+                }
+                scratch.set_channel(BusDirection::Input, i, c, ptr.add(start), len);
+            }
+        }
+
+        let (inputs, mut outputs) = scratch.views();
+        let midi = &mut core.midi_out;
         midi.clear();
-        proc_.process(&mut chans[..block.n_ch], midi);
+        core.processor.process(&inputs, &mut outputs, midi);
         // MIDI pushed past capacity is a counted drop (invariant 8).
         if midi.dropped() > 0 {
             engine
@@ -749,37 +809,74 @@ impl<P: Processor> Vt<P> {
         })
     }
 
-    // --- audio-ports extension (fixed: one main stereo in, one out) -------
+    // --- audio-ports extension (translates the declared bus topology) -----
 
     const AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports {
         count: Some(Self::ap_count),
         get: Some(Self::ap_get),
     };
 
-    unsafe extern "C" fn ap_count(_plugin: *const clap_plugin, _is_input: bool) -> u32 {
-        ffi_guard(0, || 1)
+    /// The declared buses in one direction, in declaration order.
+    fn bus_specs(dir: BusDirection) -> impl Iterator<Item = &'static AudioBusSpec> {
+        P::audio_buses().iter().filter(move |s| s.direction == dir)
+    }
+
+    unsafe extern "C" fn ap_count(_plugin: *const clap_plugin, is_input: bool) -> u32 {
+        ffi_guard(0, || {
+            let dir = if is_input {
+                BusDirection::Input
+            } else {
+                BusDirection::Output
+            };
+            Self::bus_specs(dir).count() as u32
+        })
     }
 
     unsafe extern "C" fn ap_get(
         _plugin: *const clap_plugin,
         index: u32,
-        _is_input: bool,
+        is_input: bool,
         info: *mut clap_audio_port_info,
     ) -> bool {
         ffi_guard(false, || {
-            if index != 0 || info.is_null() {
+            if info.is_null() {
                 return false;
             }
+            let dir = if is_input {
+                BusDirection::Input
+            } else {
+                BusDirection::Output
+            };
+            let Some(spec) = Self::bus_specs(dir).nth(index as usize) else {
+                return false;
+            };
+            let (channel_count, port_type) = match spec.layout {
+                ChannelLayout::Mono => (1, CLAP_PORT_MONO.as_ptr()),
+                ChannelLayout::Stereo => (2, CLAP_PORT_STEREO.as_ptr()),
+                // No named port type: the host reads channel_count only.
+                ChannelLayout::Discrete(n) => (n as u32, null()),
+            };
+            let main = index == 0;
+            // The main pair can be processed in place: the input names the
+            // matching output's id (and vice versa is not part of CLAP).
+            let in_place_pair = if is_input && main {
+                Self::bus_specs(BusDirection::Output)
+                    .next()
+                    .filter(|o| o.layout.channels() == spec.layout.channels())
+                    .map_or(CLAP_INVALID_ID, |o| o.id.0)
+            } else {
+                CLAP_INVALID_ID
+            };
             let out = &mut *info;
             *out = clap_audio_port_info {
-                id: 0,
+                id: spec.id.0,
                 name: [0; CLAP_NAME_SIZE],
-                flags: CLAP_AUDIO_PORT_IS_MAIN,
-                channel_count: 2,
-                port_type: CLAP_PORT_STEREO.as_ptr(),
-                in_place_pair: CLAP_INVALID_ID,
+                flags: if main { CLAP_AUDIO_PORT_IS_MAIN } else { 0 },
+                channel_count,
+                port_type,
+                in_place_pair,
             };
-            write_cstr(&mut out.name, "main");
+            write_cstr(&mut out.name, spec.name);
             true
         })
     }

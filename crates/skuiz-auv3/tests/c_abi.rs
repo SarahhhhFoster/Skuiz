@@ -1,8 +1,8 @@
 //! Calls the generated C ABI the way the Objective-C shim will, so the
 //! boundary is exercised even though the Xcode target does not exist here.
 
-use skuiz_auv3::SkuizParamInfo;
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_auv3::{SkuizAudioBusBuffers, SkuizParamInfo};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
 use std::ffi::{c_void, CStr, CString};
 
 struct Fixture {
@@ -72,11 +72,13 @@ impl Processor for Fixture {
             _ => 0.0,
         }
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut) {
         let g = self.gain as f32;
-        for ch in channels.iter_mut() {
-            for s in ch.iter_mut() {
-                *s *= g;
+        if let Some(out) = outputs.main() {
+            for ch in out.channels() {
+                for s in ch.iter_mut() {
+                    *s *= g;
+                }
             }
         }
         midi.push(7, skuiz_core::MidiEvent::from_midi1([0x90, 64, 100]));
@@ -92,8 +94,8 @@ extern "C" {
     fn skuiz_auv3_deactivate(inst: *mut c_void);
     fn skuiz_auv3_render(
         inst: *mut c_void,
-        channels: *const *mut f32,
-        channel_count: u32,
+        inputs: *const SkuizAudioBusBuffers,
+        outputs: *const SkuizAudioBusBuffers,
         frames: u32,
     );
     fn skuiz_auv3_param_count() -> u32;
@@ -138,8 +140,14 @@ fn renders_audio_and_reports_midi() {
 
         let mut left = [1.0f32; 64];
         let mut right = [1.0f32; 64];
-        let ptrs: [*mut f32; 2] = [left.as_mut_ptr(), right.as_mut_ptr()];
-        skuiz_auv3_render(inst, ptrs.as_ptr(), 2, 64);
+        // Default effect topology: main in aliases main out, so the buffers
+        // below carry the input and receive the output, as the shim arranges.
+        let mut outputs = [SkuizAudioBusBuffers::empty(); 4];
+        outputs[0].channels[0] = left.as_mut_ptr();
+        outputs[0].channels[1] = right.as_mut_ptr();
+        outputs[0].channel_count = 2;
+        outputs[0].active = 1;
+        skuiz_auv3_render(inst, std::ptr::null(), outputs.as_ptr(), 64);
 
         assert!(
             left.iter().all(|s| (s - 0.5).abs() < 1e-6),

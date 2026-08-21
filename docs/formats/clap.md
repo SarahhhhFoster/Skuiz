@@ -17,7 +17,10 @@ advertised with the `instrument` feature; everything else is an
 
 ## What the adapter declares
 
-- **Audio**: one main stereo input, one main stereo output.
+- **Audio**: your declared bus topology (see
+  [buses](../concepts/buses.md)) — one CLAP audio port per bus, mono/stereo
+  port types, `IS_MAIN` on the main bus, the main pair linked by
+  `in_place_pair`. Default: stereo main in/out.
 - **Parameters**: your full list, with choice parameters flagged
   `IS_ENUM | IS_STEPPED` and label-aware text conversion.
 - **Note ports**: one *output* port speaking MIDI 1.0 and MIDI 2.0

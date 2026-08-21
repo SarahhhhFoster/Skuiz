@@ -8,7 +8,20 @@
 
 #![cfg(target_os = "macos")]
 
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{
+    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiOut, ParamDef, PluginInfo,
+    Processor,
+};
+
+/// Main stereo in/out plus an optional mono sidechain, which is what the
+/// Objective-C self test asserts against: the unit must expose two input
+/// busses, and frame 0 of the output carries a `100 + sidechain` marker
+/// exactly when the host connected the sidechain.
+const BUSES: &[AudioBusSpec] = &[
+    AudioBusSpec::input("Main", ChannelLayout::Stereo),
+    AudioBusSpec::input("Sidechain", ChannelLayout::Mono).optional(),
+    AudioBusSpec::output("Main", ChannelLayout::Stereo),
+];
 
 /// Parameter 0 is a plain gain multiplier, which is what the Objective-C
 /// self test asserts against: set it to 0.25 and a buffer of ones must come
@@ -62,6 +75,9 @@ impl Processor for Fixture {
     fn emits_midi() -> bool {
         true
     }
+    fn audio_buses() -> &'static [AudioBusSpec] {
+        BUSES
+    }
     fn set_param(&mut self, id: u32, v: f64) {
         match id {
             0 => self.gain = v,
@@ -76,11 +92,19 @@ impl Processor for Fixture {
             _ => 0.0,
         }
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut MidiOut) {
+    fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut) {
+        let side = inputs.at(1).and_then(|b| b.channel(0)).map(|c| c[0]);
         let g = self.gain as f32;
-        for ch in channels.iter_mut() {
-            for s in ch.iter_mut() {
-                *s *= g;
+        if let Some(out) = outputs.main() {
+            for ch in out.channels() {
+                for s in ch.iter_mut() {
+                    *s *= g;
+                }
+            }
+            // Sidechain marker: frame 0 reports what the DSP saw this block.
+            if let (Some(sc), Some(first)) = (side, out.channel_mut(0).and_then(|c| c.first_mut()))
+            {
+                *first = 100.0 + sc;
             }
         }
         midi.push(0, skuiz_core::MidiEvent::from_midi1([0x90, 60, 100]));
@@ -111,6 +135,10 @@ fn describe(code: i32) -> &'static str {
         11 => "state did not survive a fullState save/load cycle",
         12 => "render returned an error with a MIDI output block installed",
         13 => "generated MIDI did not reach the host's MIDI output block",
+        18 => "declared topology did not surface as two input busses and one output bus",
+        19 => "bus names or channel layouts do not match the declaration",
+        20 => "render returned an error with a sidechain connected or re-disconnected",
+        21 => "the sidechain did not appear active to the DSP exactly when connected",
         _ => "unknown failure",
     }
 }

@@ -28,8 +28,12 @@
 
 #![allow(non_snake_case)]
 
+use skuiz_core::bus::{
+    AudioBusSpec, BusDirection as CoreBusDirection, ChannelLayout, MAX_BUSES_PER_DIRECTION,
+    MAX_BUS_CHANNELS,
+};
 use skuiz_core::diag::DiagCounters;
-use skuiz_core::engine::{AudioToken, Engine};
+use skuiz_core::engine::{AudioCore, AudioToken, Engine};
 use skuiz_core::{MidiOut, ParamDef, Processor};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -217,6 +221,12 @@ struct Shared<P: Processor> {
     /// Last-writer-wins versions for shared parameters (invariant 9); bus
     /// and UI threads only.
     lww: Arc<skuiz_core::lww::Lww>,
+    /// Host-driven activation state for the declared audio buses, by
+    /// declaration index. `activateBus` is a main-thread call; `process`
+    /// reads these on the audio thread. Only optional buses honor them —
+    /// a non-optional bus is always active.
+    input_bus_active: [AtomicBool; MAX_BUSES_PER_DIRECTION],
+    output_bus_active: [AtomicBool; MAX_BUSES_PER_DIRECTION],
     /// The host's handler, retained while it is set. Editor-driven changes
     /// go through this, or the host never learns the GUI moved a parameter.
     handler: Mutex<Option<ComPtr<IComponentHandler>>>,
@@ -305,6 +315,8 @@ impl<P: Processor + Default> Vst3Plugin<P> {
                 param_events: UnsafeCell::new(Vec::with_capacity(PARAM_EVENT_CAPACITY)),
                 bus: Mutex::new(None),
                 lww: Arc::new(skuiz_core::lww::Lww::new()),
+                input_bus_active: std::array::from_fn(|_| AtomicBool::new(false)),
+                output_bus_active: std::array::from_fn(|_| AtomicBool::new(false)),
                 handler: Mutex::new(None),
                 editor_dirty: AtomicBool::new(false),
             }),
@@ -328,6 +340,36 @@ impl<P: Processor> Vst3Plugin<P> {
 
     fn param_by_id(id: u32) -> Option<&'static ParamDef> {
         P::params().iter().find(|p| p.id == id)
+    }
+
+    /// The declared audio buses in one direction, in declaration order.
+    fn bus_specs(dir: CoreBusDirection) -> impl Iterator<Item = &'static AudioBusSpec> {
+        P::audio_buses().iter().filter(move |s| s.direction == dir)
+    }
+
+    /// The VST3 speaker arrangement matching a declared layout.
+    fn arrangement_of(layout: ChannelLayout) -> SpeakerArrangement {
+        match layout {
+            ChannelLayout::Mono => SpeakerArr::kMono,
+            ChannelLayout::Stereo => SpeakerArr::kStereo,
+            // No named arrangement: the first n speaker bits, which is how
+            // the SDK builds every n-channel arrangement.
+            ChannelLayout::Discrete(n) => (1 << n) - 1,
+        }
+    }
+
+    /// Whether the host has this bus active. `activateBus` is a main-thread
+    /// call; the audio thread reads the recorded state here. A non-optional
+    /// bus is always active, whatever the host asked for.
+    fn bus_is_active(&self, dir: CoreBusDirection, index: usize, spec: &AudioBusSpec) -> bool {
+        if !spec.optional {
+            return true;
+        }
+        let slots = match dir {
+            CoreBusDirection::Input => &self.shared.input_bus_active,
+            CoreBusDirection::Output => &self.shared.output_bus_active,
+        };
+        slots.get(index).is_some_and(|s| s.load(Ordering::Acquire))
     }
 
     /// Collect the block's timed parameter points into `out`
@@ -565,104 +607,180 @@ impl<P: Processor> Vst3Plugin<P> {
         if report.notify_main {
             self.shared.editor_dirty.store(true, Ordering::Release);
         }
-        let proc_ = &mut core.processor;
-
         // The block's timed automation points, sorted by sample offset.
         let events = &mut *self.shared.param_events.get();
         events.clear();
         self.collect_param_changes(data.inputParameterChanges, frames, events);
 
-        // Output channel pointers. A host that connects no outputs still
-        // gets the processor run with zero channels, so DSP that only emits
-        // MIDI keeps running.
-        let mut outs: [*mut f32; 2] = [std::ptr::null_mut(); 2];
-        let mut n_ch = 0;
-        if data.numOutputs >= 1 && !data.outputs.is_null() {
-            let out_bus = &*data.outputs;
-            let out_ptrs = out_bus.__field0.channelBuffers32;
-            if !out_ptrs.is_null() {
-                n_ch = (out_bus.numChannels.max(0) as usize).min(outs.len());
-                let out_bufs = std::slice::from_raw_parts(out_ptrs, n_ch);
-
-                // Copy input to output unless the host processes in place.
-                let mut copied = 0;
-                if data.numInputs >= 1 && !data.inputs.is_null() {
-                    let in_bus = &*data.inputs;
-                    let in_ptrs = in_bus.__field0.channelBuffers32;
-                    if !in_ptrs.is_null() {
-                        let n_in = (in_bus.numChannels.max(0) as usize).min(n_ch);
-                        let ins = std::slice::from_raw_parts(in_ptrs, n_in);
-                        for c in 0..n_in {
-                            if !ins[c].is_null() && !out_bufs[c].is_null() && ins[c] != out_bufs[c]
-                            {
-                                std::ptr::copy_nonoverlapping(ins[c], out_bufs[c], frames);
-                            }
-                        }
-                        copied = n_in;
-                    }
-                }
-
-                // Channels no input was copied into — every channel when the
-                // host connects none — must be silenced, not left holding
-                // whatever the buffer already contained.
-                for out in out_bufs.iter().take(n_ch).skip(copied) {
-                    if !out.is_null() {
-                        std::ptr::write_bytes(*out, 0, frames);
-                    }
-                }
-
-                for (c, slot) in outs.iter_mut().enumerate().take(n_ch) {
-                    if out_bufs[c].is_null() {
-                        n_ch = c;
-                        break;
-                    }
-                    *slot = out_bufs[c];
-                }
-            }
-        }
+        // Copy the main input into the main output once (unless the host
+        // processes in place) and zero what no input covered; segments
+        // then re-slice those buffers, and any sidechain input is read
+        // directly from the host's buffers.
+        self.copy_main_into_output(data, frames);
 
         // Split the block at point times: render up to the next point,
-        // apply it, continue. Segments re-slice the same output buffers.
-        let midi = &mut core.midi_out;
+        // apply it, continue. Segments re-slice the same host buffers.
         let mut pos = 0usize;
         for &(time, id, value) in events.iter() {
             let t = (time as usize).min(frames);
             if t > pos {
-                self.process_segment(proc_, &outs, n_ch, pos, t, midi, data);
+                self.process_segment(core, data, pos, t);
                 pos = t;
             }
-            proc_.set_param(id, value);
+            core.processor.set_param(id, value);
             // Publish the readback, not the request: processors may round
             // or clamp, and the mirror must hold the value actually in
             // force.
-            engine.mirror().publish(id, proc_.get_param(id));
+            engine.mirror().publish(id, core.processor.get_param(id));
         }
         if pos < frames {
-            self.process_segment(proc_, &outs, n_ch, pos, frames, midi, data);
+            self.process_segment(core, data, pos, frames);
         }
         kResultOk
     }
 
-    /// Render one segment of a block: `outs[segment]` per channel, in
-    /// place. MIDI queued by the DSP carries segment-relative frame numbers,
-    /// so it is emitted with `segment.start` added back.
-    #[allow(clippy::too_many_arguments)] // one concept per argument; a struct would be ceremony
+    /// Copy the main input into the main output (unless the host processes
+    /// in place) and zero any main-output channels no input landed in.
+    /// Runs once per block; segments then re-slice those buffers. Without
+    /// this, an absent input would feed stale data from an earlier block
+    /// to the DSP.
+    // Channel loops index raw host pointers (`ptrs.add(c)`), so an index
+    // loop is the honest shape here.
+    #[allow(clippy::needless_range_loop)]
+    unsafe fn copy_main_into_output(&self, data: &ProcessData, frames: usize) {
+        let Some(out_spec) = Self::bus_specs(CoreBusDirection::Output).next() else {
+            return;
+        };
+        if data.numOutputs < 1 || data.outputs.is_null() {
+            return;
+        }
+        let out_bus = &*data.outputs;
+        let out_ptrs = out_bus.__field0.channelBuffers32;
+        if out_ptrs.is_null() {
+            return;
+        }
+        let n_out = (out_bus.numChannels.max(0) as usize).min(out_spec.layout.channels() as usize);
+        let mut copied = 0;
+        if Self::bus_specs(CoreBusDirection::Input).next().is_some()
+            && data.numInputs >= 1
+            && !data.inputs.is_null()
+        {
+            let in_bus = &*data.inputs;
+            let in_ptrs = in_bus.__field0.channelBuffers32;
+            if !in_ptrs.is_null() {
+                copied = n_out.min(in_bus.numChannels.max(0) as usize);
+                for c in 0..copied {
+                    let src = *in_ptrs.add(c);
+                    let dst = *out_ptrs.add(c);
+                    if !src.is_null() && !dst.is_null() && src != dst {
+                        std::ptr::copy_nonoverlapping(src, dst, frames);
+                    }
+                }
+            }
+        }
+        // Channels no input was copied into — every channel when the host
+        // connects none — must be silenced, not left holding whatever the
+        // buffer already contained.
+        for c in copied..n_out {
+            let dst = *out_ptrs.add(c);
+            if !dst.is_null() {
+                std::ptr::write_bytes(dst, 0, frames);
+            }
+        }
+    }
+
+    /// Render one segment of a block: repoint the engine's bus scratch at
+    /// `buffer[start..end]` per channel and run the processor. The main
+    /// input aliases the main output (copy-in landed there); sidechain
+    /// inputs read the host's buffers directly and are active only when
+    /// the host activated and connected them. MIDI queued by the DSP
+    /// carries segment-relative frame numbers, so it is emitted with
+    /// `start` added back.
+    // Channel loops index raw host pointers (`ptrs.add(c)`), so an index
+    // loop is the honest shape here.
+    #[allow(clippy::needless_range_loop)]
     unsafe fn process_segment(
         &self,
-        proc_: &mut P,
-        outs: &[*mut f32; 2],
-        n_ch: usize,
+        core: &mut AudioCore<P>,
+        data: &ProcessData,
         start: usize,
         end: usize,
-        midi: &mut MidiOut,
-        data: &ProcessData,
     ) {
-        let mut chans: [&mut [f32]; 2] = [&mut [], &mut []];
-        for (c, chan) in chans.iter_mut().enumerate().take(n_ch) {
-            *chan = std::slice::from_raw_parts_mut(outs[c].add(start), end - start);
+        let len = end - start;
+        let scratch = &mut core.bus_scratch;
+        scratch.clear();
+
+        // Outputs: each declared bus maps to the host bus of the same
+        // index. A host that connects no outputs still gets the processor
+        // run with the bus inactive, so MIDI-only DSP keeps running.
+        let mut main_out: [*mut f32; MAX_BUS_CHANNELS] = [std::ptr::null_mut(); MAX_BUS_CHANNELS];
+        let mut main_out_n = 0usize;
+        for (i, spec) in Self::bus_specs(CoreBusDirection::Output).enumerate() {
+            if i >= data.numOutputs.max(0) as usize || data.outputs.is_null() {
+                continue;
+            }
+            let bus = &*data.outputs.add(i);
+            let ptrs = bus.__field0.channelBuffers32;
+            if ptrs.is_null() || !self.bus_is_active(CoreBusDirection::Output, i, spec) {
+                continue;
+            }
+            scratch.set_active(CoreBusDirection::Output, i, true);
+            let n = (bus.numChannels.max(0) as usize).min(spec.layout.channels() as usize);
+            for c in 0..n {
+                let ptr = *ptrs.add(c);
+                if ptr.is_null() {
+                    break;
+                }
+                scratch.set_channel(CoreBusDirection::Output, i, c, ptr.add(start), len);
+                if i == 0 {
+                    // Segment-offset pointer, reused verbatim for the main
+                    // input alias below.
+                    main_out[c] = ptr.add(start);
+                    main_out_n = c + 1;
+                }
+            }
         }
+
+        // Inputs: the main bus aliases the main output; any further input
+        // (a sidechain) reads the host's buffer directly, active only when
+        // the host activated and connected it.
+        for (i, spec) in Self::bus_specs(CoreBusDirection::Input).enumerate() {
+            if i == 0 {
+                if main_out_n == 0 {
+                    continue;
+                }
+                scratch.set_active(CoreBusDirection::Input, 0, true);
+                for (c, ptr) in main_out.iter().enumerate().take(main_out_n) {
+                    scratch.set_channel(CoreBusDirection::Input, 0, c, *ptr, len);
+                }
+                continue;
+            }
+            if !self.bus_is_active(CoreBusDirection::Input, i, spec) {
+                continue;
+            }
+            if i >= data.numInputs.max(0) as usize || data.inputs.is_null() {
+                continue;
+            }
+            let bus = &*data.inputs.add(i);
+            let ptrs = bus.__field0.channelBuffers32;
+            if ptrs.is_null() {
+                continue;
+            }
+            scratch.set_active(CoreBusDirection::Input, i, true);
+            let n = (bus.numChannels.max(0) as usize).min(spec.layout.channels() as usize);
+            for c in 0..n {
+                let ptr = *ptrs.add(c);
+                if ptr.is_null() {
+                    break;
+                }
+                scratch.set_channel(CoreBusDirection::Input, i, c, ptr.add(start), len);
+            }
+        }
+
+        let (inputs, mut outputs) = scratch.views();
+        let midi = &mut core.midi_out;
         midi.clear();
-        proc_.process(&mut chans[..n_ch], midi);
+        core.processor.process(&inputs, &mut outputs, midi);
         // MIDI pushed past capacity is a counted drop (invariant 8).
         if midi.dropped() > 0 {
             self.shared
@@ -839,7 +957,14 @@ impl<P: Processor + Default> IComponentTrait for Vst3Plugin<P> {
 
     unsafe fn getBusCount(&self, media_type: MediaType, dir: BusDirection) -> i32 {
         match media_type as MediaTypes {
-            MediaTypes_::kAudio => 1,
+            MediaTypes_::kAudio => {
+                let dir = if dir as BusDirections == BusDirections_::kInput {
+                    CoreBusDirection::Input
+                } else {
+                    CoreBusDirection::Output
+                };
+                Self::bus_specs(dir).count() as i32
+            }
             MediaTypes_::kEvent
                 // Only advertise an event bus for plugins that generate MIDI.
                 if P::emits_midi() && dir as BusDirections == BusDirections_::kOutput => {
@@ -856,28 +981,46 @@ impl<P: Processor + Default> IComponentTrait for Vst3Plugin<P> {
         index: i32,
         bus: *mut BusInfo,
     ) -> tresult {
-        if index != 0 || bus.is_null() {
+        if index < 0 || bus.is_null() {
             return kInvalidArgument;
         }
         let is_input = dir as BusDirections == BusDirections_::kInput;
         let bus = &mut *bus;
         match media_type as MediaTypes {
             MediaTypes_::kAudio => {
+                let spec_dir = if is_input {
+                    CoreBusDirection::Input
+                } else {
+                    CoreBusDirection::Output
+                };
+                let Some(spec) = Self::bus_specs(spec_dir).nth(index as usize) else {
+                    return kInvalidArgument;
+                };
                 bus.mediaType = MediaTypes_::kAudio as MediaType;
                 bus.direction = dir;
-                bus.channelCount = 2;
-                copy_wstring(if is_input { "Input" } else { "Output" }, &mut bus.name);
-                bus.busType = BusTypes_::kMain as BusType;
+                bus.channelCount = spec.layout.channels() as i32;
+                copy_wstring(spec.name, &mut bus.name);
+                // The first bus of a direction is the main bus; any further
+                // input is an aux (a sidechain).
+                bus.busType = if index == 0 {
+                    BusTypes_::kMain as BusType
+                } else {
+                    BusTypes_::kAux as BusType
+                };
                 // The cast is platform-load-bearing: these enum constants
                 // are i32 on Windows and u32 on macOS, so clippy sees a
                 // same-type cast on one platform that the other requires.
                 #[allow(clippy::unnecessary_cast)]
                 {
-                    bus.flags = BusInfo_::BusFlags_::kDefaultActive as u32;
+                    bus.flags = if spec.optional {
+                        0
+                    } else {
+                        BusInfo_::BusFlags_::kDefaultActive as u32
+                    };
                 }
                 kResultOk
             }
-            MediaTypes_::kEvent if P::emits_midi() && !is_input => {
+            MediaTypes_::kEvent if index == 0 && P::emits_midi() && !is_input => {
                 bus.mediaType = MediaTypes_::kEvent as MediaType;
                 bus.direction = dir;
                 bus.channelCount = 16;
@@ -902,11 +1045,26 @@ impl<P: Processor + Default> IComponentTrait for Vst3Plugin<P> {
 
     unsafe fn activateBus(
         &self,
-        _media_type: MediaType,
-        _dir: BusDirection,
-        _index: i32,
-        _state: TBool,
+        media_type: MediaType,
+        dir: BusDirection,
+        index: i32,
+        state: TBool,
     ) -> tresult {
+        // Event buses carry no activation state worth recording.
+        if media_type as MediaTypes != MediaTypes_::kAudio || index < 0 {
+            return kResultOk;
+        }
+        let (spec_dir, slots) = if dir as BusDirections == BusDirections_::kInput {
+            (CoreBusDirection::Input, &self.shared.input_bus_active)
+        } else {
+            (CoreBusDirection::Output, &self.shared.output_bus_active)
+        };
+        if Self::bus_specs(spec_dir).nth(index as usize).is_none() {
+            return kInvalidArgument;
+        }
+        // Main thread here, audio thread in `process` — the atomic is the
+        // whole handshake. A non-optional bus ignores the recorded state.
+        slots[index as usize].store(state != 0, Ordering::Release);
         kResultOk
     }
 
@@ -931,25 +1089,50 @@ impl<P: Processor + Default> IAudioProcessorTrait for Vst3Plugin<P> {
         outputs: *mut SpeakerArrangement,
         num_outs: i32,
     ) -> tresult {
-        if num_ins != 1 || num_outs != 1 || inputs.is_null() || outputs.is_null() {
+        let n_in = Self::bus_specs(CoreBusDirection::Input).count() as i32;
+        let n_out = Self::bus_specs(CoreBusDirection::Output).count() as i32;
+        // The topology is fixed at build time: the host must offer exactly
+        // the declared bus counts, and each arrangement must match the
+        // declared layout (kEmpty only for an optional bus it deactivated).
+        if num_ins != n_in
+            || num_outs != n_out
+            || (num_ins > 0 && inputs.is_null())
+            || (num_outs > 0 && outputs.is_null())
+        {
             return kResultFalse;
         }
-        if *inputs != SpeakerArr::kStereo || *outputs != SpeakerArr::kStereo {
-            return kResultFalse;
+        let matches = |arrs: *mut SpeakerArrangement, dir: CoreBusDirection| {
+            Self::bus_specs(dir).enumerate().all(|(i, spec)| {
+                let arr = *arrs.add(i);
+                (arr == SpeakerArr::kEmpty && spec.optional)
+                    || arr == Self::arrangement_of(spec.layout)
+            })
+        };
+        if matches(inputs, CoreBusDirection::Input) && matches(outputs, CoreBusDirection::Output) {
+            kResultTrue
+        } else {
+            kResultFalse
         }
-        kResultTrue
     }
 
     unsafe fn getBusArrangement(
         &self,
-        _dir: BusDirection,
+        dir: BusDirection,
         index: i32,
         arr: *mut SpeakerArrangement,
     ) -> tresult {
-        if index != 0 || arr.is_null() {
+        if index < 0 || arr.is_null() {
             return kInvalidArgument;
         }
-        *arr = SpeakerArr::kStereo;
+        let spec_dir = if dir as BusDirections == BusDirections_::kInput {
+            CoreBusDirection::Input
+        } else {
+            CoreBusDirection::Output
+        };
+        let Some(spec) = Self::bus_specs(spec_dir).nth(index as usize) else {
+            return kInvalidArgument;
+        };
+        *arr = Self::arrangement_of(spec.layout);
         kResultOk
     }
 

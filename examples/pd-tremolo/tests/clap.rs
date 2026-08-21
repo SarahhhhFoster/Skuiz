@@ -117,7 +117,21 @@ fn parameter_reaches_patch_receivers() {
     let run = |proc_: &mut PdTremolo, midi: &mut skuiz_core::MidiOut| {
         let mut l = [0.7f32; 512];
         let mut r = [0.7f32; 512];
-        proc_.process(&mut [&mut l, &mut r], midi);
+        // Wire the main pair the way the adapters do after copy-in: the
+        // input view aliases the output buffers.
+        let mut scratch = skuiz_core::bus::TopologyScratch::new(PdTremolo::audio_buses());
+        scratch.clear();
+        scratch.set_active(skuiz_core::BusDirection::Input, 0, true);
+        scratch.set_active(skuiz_core::BusDirection::Output, 0, true);
+        unsafe {
+            for (c, ch) in [&mut l, &mut r].into_iter().enumerate() {
+                let ptr = ch.as_mut_ptr();
+                scratch.set_channel(skuiz_core::BusDirection::Output, 0, c, ptr, 512);
+                scratch.set_channel(skuiz_core::BusDirection::Input, 0, c, ptr, 512);
+            }
+        }
+        let (inputs, mut outputs) = scratch.views();
+        proc_.process(&inputs, &mut outputs, midi);
         (l, r)
     };
 

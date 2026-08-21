@@ -3,7 +3,7 @@
 
 #![allow(non_snake_case)]
 
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
 use skuiz_vst3::vst3::Steinberg::Vst::*;
 use skuiz_vst3::vst3::Steinberg::*;
 use skuiz_vst3::vst3::{Class, ComPtr, ComWrapper, Interface};
@@ -88,11 +88,15 @@ impl Processor for Fixture {
             _ => 0.0,
         }
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut) {
         let g = self.gain as f32;
-        for ch in channels.iter_mut() {
-            for s in ch.iter_mut() {
-                *s *= g;
+        // The main input aliases the main output, so processing the output
+        // bus in place applies the gain to the copied input.
+        if let Some(out) = outputs.main() {
+            for ch in out.channels() {
+                for s in ch.iter_mut() {
+                    *s *= g;
+                }
             }
         }
         midi.push(0, skuiz_core::MidiEvent::from_midi1([0x90, 64, 100]));
@@ -745,7 +749,7 @@ impl Processor for CcFixture {
     fn get_param(&self, _id: u32) -> f64 {
         0.0
     }
-    fn process(&mut self, _channels: &mut [&mut [f32]], midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, _outputs: &mut AudioOutputs, midi: &mut MidiOut) {
         midi.push(0, skuiz_core::MidiEvent::from_midi1([0xB2, 7, 64])); // CC 7, ch 2
         midi.push(4, skuiz_core::MidiEvent::from_midi1([0xE0, 0x00, 0x40])); // bend centre
         midi.push(8, skuiz_core::MidiEvent::from_midi1([0xA0, 60, 96])); // poly pressure
