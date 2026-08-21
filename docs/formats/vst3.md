@@ -74,7 +74,8 @@ entry-point symbols, same compiled library inside both bundles.
 
 CI runs Steinberg's official `validator` — built from the MIT SDK — over
 the example bundle (`.github/workflows/ci.yml`, job `vst3-validation`;
-the workflows are manual-only by default). The COM contract is also
+CI runs on pushes to `main` and on pull requests, and can be dispatched
+manually — only the release workflow is manual-only). The COM contract is also
 covered by
 `cargo test -p skuiz-vst3` (a test drives the factory, processing, state,
 and edit gestures the way a host would); beyond that, test in a real

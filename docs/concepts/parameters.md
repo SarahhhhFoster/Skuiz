@@ -37,7 +37,8 @@ parameter, so it automates, saves with the project, and syncs over IPC
 like anything else. `skuiz_midi::channel_param(id)` is a ready-made
 example: a 16-way dropdown whose labels are `"1".."16"`, read back
 with `skuiz_midi::channel_of(value)`. `examples/trigger-note` uses it
-for its channel and note selectors.
+for its channel selector (its note selector is a hand-rolled choice
+parameter).
 
 ## Rules that keep saved projects working
 
@@ -52,12 +53,14 @@ for its channel and note selectors.
 
 Host automation is **sample-accurate**: the adapters split each block
 at parameter-event times and render the segments in order, so a change
-stamped at frame 41 takes effect at frame 41. (The per-parameter event
-buffer is pre-allocated and bounded — a host sending more than 256
-points in one block loses the excess, which is pathological anyway.)
+stamped at frame 41 takes effect at frame 41. (The per-block event
+buffer is pre-allocated and bounded — 256 events per block, shared
+across all parameters; a host sending more than that in one block loses
+the excess, which is pathological anyway.)
 
 Values from the other two paths — the editor and other instances over
-IPC — carry no timestamp and apply at block top. If a control is meant
+IPC — carry no timestamp and apply at block top while the transport
+runs (they apply directly when the engine is stopped). If a control is meant
 to move fast, smooth it in the DSP — see the per-sample one-pole
 smoothing in `examples/solid-synth`, and note `examples/shared-gain`
 skips this for brevity and says so.
@@ -66,16 +69,19 @@ skips this for brevity and says so.
 
 Three paths call your `set_param`, and they are the whole story:
 
-- **Host → DSP**: automation events, applied at the top of each block.
+- **Host → DSP**: automation events, applied sample-accurately — the
+  adapter splits the block at event times, as described above.
 - **Editor → DSP**: the page posts `set_param <id> <value>`; the
   adapter applies it, tells the host to rescan, and — for parameters
   declared `shared` — broadcasts it to other instances.
 - **IPC → DSP**: values from other instances park in a queue and are
-  applied at block top — see [instance sync](instance-sync.md). Frames
+  applied at block top (or directly, when the engine is stopped) — see
+  [instance sync](instance-sync.md). Frames
   naming a `shared: false` parameter are ignored, not applied.
 
-The reverse path — host automation reaching your editor — is the
-adapter calling `window.skuizOnParam(id, value)` in the page. See
+The reverse path — remote and state-load changes reaching your editor —
+is the adapter calling `window.skuizOnParam(id, value)` in the page.
+Host automation never reaches the editor. See
 [editors](editors.md).
 
 ## Saved state

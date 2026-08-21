@@ -44,8 +44,8 @@ the audio thread.
 - **No audio input** (above).
 - **Generated MIDI is dropped** — the standalone drains `MidiOut` and
   discards it; MIDI output from the shell is deferred.
-- **Editor platform support** is the webview's: macOS tested, Windows
-  written/unverified, none on Linux (the app runs, without a GUI).
+- **Editor platform support** is the webview's: macOS tested; Windows
+  and Linux written but unverified (Linux embeds on X11 via WebKitGTK).
 
 ## Under the hood
 

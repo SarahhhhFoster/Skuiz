@@ -35,8 +35,9 @@ sandboxed hosts (an App Group container on Apple platforms) there is
 `Bus::join_in(dir, scope, callback)`, which points the socket at a
 directory the sandbox allows.
 
-The callback runs on a bus thread and must never touch plugin memory —
-park the value and let the audio thread apply it. The adapters already
+The callback runs on a bus thread — or synchronously on the sending
+thread when the peer lives in the same process — and must never touch
+plugin memory — park the value and let the audio thread apply it. The adapters already
 do this for `set_param` messages; you only touch the Bus directly to
 send message types of your own. Use `skuiz_core::protocol`'s format for
 anything parameter-shaped so editors and the bus stay compatible.
@@ -75,12 +76,16 @@ Two mechanisms close the gaps versions alone cannot:
 - **Join snapshot.** A new instance broadcasts
   `sync_request <origin>` right after joining. Every instance answers
   with a `sync_state` frame listing the shared parameters it holds a
-  version for — ones actually edited over the bus — and
+  *fresh* bus version for — ones actually edited over the bus and not
+  since overwritten by a project state load — and
   last-writer-wins makes duplicate answers safe. Parameters never
   edited over the bus are *omitted* from the answer: their value may be
   host automation, which is per-instance and must not propagate to
   joiners, so a joiner's untouched defaults can never drag the fleet
-  back.
+  back. A project `load_state` stales every record
+  (`Lww::on_state_load`): the loaded values are per-instance project
+  state, not bus consensus, so they are omitted from snapshot answers
+  too rather than propagating under a stale version.
 - **Link-up healing.** Frames sent while the cross-process link is down
   (an election window) are dropped — but when the link (re)connects,
   the bus delivers a synthetic `LINK_UP_FRAME` to local instances and

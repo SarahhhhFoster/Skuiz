@@ -10,19 +10,20 @@ MIT licensed. No GPL code is linked.
 
 | | macOS | Windows | Linux |
 | --- | --- | --- | --- |
-| Audio + parameters + state | tested | type-checked | type-checked |
-| Instance bus | tested (Unix socket) | type-checked (named pipe); CI only | type-checked |
-| Webview editor | tested | written, unverified | not implemented |
-| Standalone shell | tested | type-checked | type-checked |
+| Audio + parameters + state | tested | CI-tested | CI-tested |
+| Instance bus | tested (Unix socket) | CI-tested (named pipe) | CI-tested (Unix socket) |
+| Webview editor | tested | written, unverified | written, unverified (X11) |
+| Standalone shell | tested | CI-tested | CI-tested |
 
-**Windows and Linux are not verified at runtime.** Development happens on
-macOS; the Windows paths are type-checked with
-`cargo check --target x86_64-pc-windows-msvc`, and the named pipe transport
-in `crates/skuiz-ipc/src/transport/windows.rs` runs only in CI's Windows
-test job — it has never been exercised on real hardware, so treat it as a
-starting point that needs a real test pass. Linux
-compiles (its bus is the same Unix socket transport macOS uses) but the
-editor has no X11 backend yet.
+**Windows and Linux are verified only in CI, not on real hardware.**
+Development happens on macOS; CI runs the full test suite on Windows and
+Linux runners on every push to `main` and every pull request. The Windows
+job is the only place the named pipe transport in
+`crates/skuiz-ipc/src/transport/windows.rs` actually executes — it has
+never been exercised on real hardware, so treat it as a starting point
+that needs a real test pass. Linux uses the same Unix socket transport
+macOS uses; its editor embeds on X11 via WebKitGTK, written but
+unverified.
 
 If you run this on Windows, `cargo test -p skuiz-ipc` is the place to start:
 it covers election, promotion, broadcast, and a genuine cross-process
@@ -138,8 +139,8 @@ extension, VST3's `IPlugView`, and the standalone window all attach the same
 wry webview to a host-provided native view, so there is one editor and one
 HTML file rather than one per format. VST3 additionally wraps editor changes
 in `beginEdit`/`performEdit`/`endEdit`, which is what makes hosts record
-automation from the GUI. macOS (NSView) is tested; Windows (HWND) is
-written but unverified; Linux has no webview backend yet.
+automation from the GUI. macOS (NSView) is tested; Windows (HWND) and
+Linux (X11 via WebKitGTK) are written but unverified.
 
 ## DSP
 
@@ -211,9 +212,10 @@ workflow stays manual-only. CI enforces:
 
 - `cargo fmt --all -- --check` — the tree is rustfmt-clean
 - `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings
-- `cargo test --workspace` on **macOS, Windows and Linux** — the Windows job
-  is the only place the named-pipe transport actually executes, so treat a
-  Windows failure as a real finding
+- `cargo test --workspace` on **macOS and Linux**, and the same suite run
+  per-crate on **Windows** (so a hang names its crate in the log) — the
+  Windows job is the only place the named-pipe transport actually
+  executes, so treat a Windows failure as a real finding
 - the libpd integration tests (`skuiz-dsp` and `pd-tremolo --features libpd`,
   macOS)
 - `cargo doc` with warnings denied — documentation links must resolve

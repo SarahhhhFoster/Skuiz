@@ -56,7 +56,7 @@ There is deliberately no wrapper crate for C DSP. The whole integration,
 from `examples/trigger-note`:
 
 **The C side is plain data and plain functions.** `src/envelope.h` declares
-a `typedef struct` of POD fields plus three functions; `src/envelope.c`
+a `typedef struct` of POD fields plus two functions; `src/envelope.c`
 implements a one-pole envelope follower with Schmitt-trigger thresholding.
 
 **Rust mirrors the struct with `#[repr(C)]` and declares the functions in an
@@ -110,11 +110,13 @@ parameters — a `ParamDef` with a non-empty `choices` list, such as the note
 picker — render as dropdowns and automate like anything else (see
 [parameters](../concepts/parameters.md)). Emitting MIDI is three pieces:
 `fn emits_midi() -> bool { true }`, messages built with `skuiz_midi`
-helpers (`note_on`, `note_off`, `channel_param`), and `midi.push(frame,
+helpers (`note_on`, `note_off`), and `midi.push(frame,
 bytes)` inside `process`, where `frame` is the offset within the block.
-`MidiOut` is bounded and never allocates; a full buffer silently drops
-events, which means the DSP is emitting thousands per block — a bug, fix it
-there. The example's `tests/midi_out.rs` drives the raw CLAP vtable and
+`MidiOut` is bounded (512 events) and never allocates; when the buffer is
+full, `push` refuses the event and the adapter counts it in the
+`midi_events_dropped` diagnostic (see
+[invariants](../concepts/invariants.md)) — which means the DSP is emitting
+far too many events per block, a bug to fix there. The example's `tests/midi_out.rs` drives the raw CLAP vtable and
 asserts the exact bytes on the wire (`[0x90, 60, 100]` and back off), which
 is the way to test this without a host.
 

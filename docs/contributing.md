@@ -7,7 +7,7 @@
 - `crates/skuiz-{clap,vst3,auv3,standalone}` — the adapters; the only
   code that knows what a host is.
 - `crates/skuiz-{ui,ipc,midi,dsp}` — services the adapters wire in.
-- `examples/` — three complete plugins; every change should keep them
+- `examples/` — four complete plugins; every change should keep them
   working and CI-green.
 
 `skuiz-vst3` is an ordinary default member: it was excluded while
@@ -26,9 +26,9 @@ manual-only, to keep Actions cost bounded). It enforces:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace` on macOS, Windows, and Linux — the Windows
-  job is the only place the named-pipe transport executes, so treat a
-  failure there as real
+- `cargo test --workspace` on macOS and Linux, and the same suite run
+  per-crate on Windows — the Windows job is the only place the
+  named-pipe transport executes, so treat a failure there as real
 - the libpd integration test on macOS
 - `cargo doc --workspace --no-deps` with warnings denied — doc links
   must resolve

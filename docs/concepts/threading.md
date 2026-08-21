@@ -16,7 +16,7 @@ mechanics.
 | `save_state` / `load_state` | Main thread when stopped; routed onto the audio thread between blocks while running |
 | `reset` | Audio thread between blocks while running; main thread when stopped |
 | `latency` | Audio thread (polled once per block) and main thread — must be realtime-safe |
-| Bus callback (`Bus::join`) | A bus thread — must never touch plugin memory |
+| Bus callback (`Bus::join`) | A bus thread (or the sending thread, for in-process delivery) — must never touch plugin memory |
 
 ## The realtime rules
 
@@ -52,8 +52,8 @@ thread**:
 
 - **Audio thread.** Claims the audio state when processing starts (the
   adapters do this in `start_processing`/`setProcessing`, or around each
-  render call on AUv3, which has no such pair) and runs `process`
-  directly. The claim is structural: `begin_audio` returns an
+  render call on AUv3 and the standalone, which have no such pair) and
+  runs `process` directly. The claim is structural: `begin_audio` returns an
   `AudioToken`, and every audio-side entry point (`audio_core`,
   `midi_out`) requires a borrow of it — safe code cannot reach the
   processor without one. While blocks flow, nothing else can touch the
@@ -81,7 +81,9 @@ parameter changes per second); the counter is how you find out.
 ## How IPC values reach the DSP
 
 A message from another instance never touches your processor directly.
-The bus callback — running on a bus thread — parses the frame and pushes
+The bus callback — running on a bus thread, or synchronously on the
+sending thread when the peer lives in the same process — parses the
+frame and pushes
 `set_param` onto the command queue through an `EngineHandle`. At the top
 of the next block, the audio thread drains the queue and calls
 `set_param` for each. This is why IPC-delivered changes apply at block

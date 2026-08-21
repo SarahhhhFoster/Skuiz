@@ -34,25 +34,29 @@ parameters cannot appear or disappear at runtime. See
 [parameters](parameters.md).
 
 **`set_param(id, value)` / `get_param(id)`** apply and read parameter
-changes. `set_param` runs on the audio thread (automation, IPC) *and*
-the main thread (editor, state load), so keep it to arithmetic and
-assignment, and clamp — hosts are not obliged to respect your declared
-range.
+changes. While blocks flow, `set_param` always runs on the audio thread —
+automation, IPC, and editor changes all reach it there — and on the main
+thread when the engine is stopped (state load, direct edits), so keep it
+to arithmetic and assignment, and clamp — hosts are not obliged to
+respect your declared range.
 
 **`process(channels, midi)`** renders one block in place: each channel
 slice arrives holding input and must leave holding output. All slices
 are the same length, which varies between calls. `channels` may be
 empty — a MIDI-only plugin still gets called. Push generated MIDI into
-`midi` (which arrives cleared); it has a fixed capacity, never
-allocates, and silently drops events once full — a full buffer means
-thousands of events per block, which is a bug in the DSP. This method
+`midi` (which arrives cleared); it has a fixed capacity of 512 events,
+never allocates, and refuses events once full — the refusal is counted in
+the `midi_events_dropped` diagnostic, never silent, and a full buffer
+means the DSP is emitting far too many events per block, which is a bug
+in the DSP. This method
 is realtime: read [threading](threading.md) before shipping.
 
 **`reset()`** (default no-op) clears DSP state — delay lines, filter
 memory, LFO phase — without touching parameter values. Called between
 blocks on the audio thread while running, on the main thread when
-stopped. AUv3 hosts call it on resets; CLAP and VST3 have no reset
-concept, so there it only fires if you call `Engine::reset` yourself.
+stopped. AUv3 hosts and the CLAP adapter call it on host resets; VST3
+has no reset concept, so there it only fires if you call
+`Engine::reset` yourself.
 
 **`latency()`** (default 0) reports the plugin's delay in frames. It may
 change at runtime: the engine re-reads it once per block and, on change,
