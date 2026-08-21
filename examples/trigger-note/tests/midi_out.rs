@@ -180,8 +180,19 @@ fn choice_params_drive_output_and_show_labels() {
         proc_.activate(48_000.0, 512);
         let mut midi = skuiz_core::MidiOut::with_capacity(8);
         let mut block = [0.8f32; 512];
-        let mut chans: [&mut [f32]; 1] = [&mut block];
-        proc_.process(&mut chans, &mut midi);
+        let mut scratch = skuiz_core::bus::TopologyScratch::new(TriggerNote::audio_buses());
+        scratch.clear();
+        scratch.set_active(skuiz_core::BusDirection::Input, 0, true);
+        // `block` outlives the views, which end after `process`.
+        scratch.set_channel(
+            skuiz_core::BusDirection::Input,
+            0,
+            0,
+            block.as_mut_ptr(),
+            512,
+        );
+        let (inputs, mut outputs) = scratch.views();
+        proc_.process(&inputs, &mut outputs, &mut midi);
         assert_eq!(midi.events().len(), 1);
         assert_eq!(
             midi.events()[0].1.midi1_bytes(),

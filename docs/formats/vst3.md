@@ -43,6 +43,11 @@ entry-point symbols, same compiled library inside both bundles.
 - **Single component.** One object implements `IComponent`,
   `IAudioProcessor`, and `IEditController`, so processor and controller
   can never disagree about parameter state.
+- **Buses come from your declaration.** Each declared audio bus becomes
+  a VST3 bus: `kMain` for the main pair, `kAux` for sidechain inputs,
+  `kDefaultActive` only on non-optional buses, and speaker arrangements
+  validated against the declared layouts in `setBusArrangements`. See
+  [buses](../concepts/buses.md).
 - **GUI edits record automation.** Editor changes are wrapped in
   `beginEdit`/`performEdit`/`endEdit`, which is what makes hosts record
   automation from the GUI — the CLAP adapter does not do this.

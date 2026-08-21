@@ -31,10 +31,12 @@ genuinely useful development loop: no host, no plugin scanning, just
 The shell is **output-only** today. `Input::TestTone` feeds your
 processor a 440 Hz tone at −12 dBFS so an effect is audible with no
 routing; `Input::Silence` is for generators (solid-synth uses it).
-Capturing system input needs a second device and drift-tolerant
+Only the declared main buses are wired: a sidechain input stays
+inactive, and an instrument topology (no inputs) simply gets no input
+fed. Capturing system input needs a second device and drift-tolerant
 buffering — deferred, see the README.
 
-Extra device channels beyond your processor's outputs get the last
+Extra device channels beyond your main output bus get the last
 produced channel duplicated onto them; block sizes are normalized into
 fixed-size passes so no device buffer size can force an allocation on
 the audio thread.

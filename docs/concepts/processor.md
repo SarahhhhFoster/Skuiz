@@ -33,6 +33,13 @@ display order. The list is static — hosts snapshot it at load time, so
 parameters cannot appear or disappear at runtime. See
 [parameters](parameters.md).
 
+**`audio_buses()`** returns the audio bus topology as a
+`&'static [AudioBusSpec]` — inputs, outputs, channel layouts, and which
+buses are optional. Static, like `params()`: hosts snapshot it at load and
+can (de)activate optional buses but never change the topology. Default is
+an effect (stereo main in/out); instruments return
+`skuiz_core::bus::INSTRUMENT_BUSES`. See [buses](buses.md).
+
 **`set_param(id, value)` / `get_param(id)`** apply and read parameter
 changes. While blocks flow, `set_param` always runs on the audio thread —
 automation, IPC, and editor changes all reach it there — and on the main
@@ -40,10 +47,13 @@ thread when the engine is stopped (state load, direct edits), so keep it
 to arithmetic and assignment, and clamp — hosts are not obliged to
 respect your declared range.
 
-**`process(channels, midi)`** renders one block in place: each channel
-slice arrives holding input and must leave holding output. All slices
-are the same length, which varies between calls. `channels` may be
-empty — a MIDI-only plugin still gets called. Push generated MIDI into
+**`process(inputs, outputs, midi)`** renders one block: read from the
+input bus channels, write to the output bus channels. All channel slices
+are the same length, which varies between calls. A bus the host left
+inactive yields no channels — `outputs.main()` returns `None` when nothing
+is connected, so a MIDI-only plugin still gets called. The main input may
+alias the main output (hosts process in place), so read a frame before
+writing it. Push generated MIDI into
 `midi` (which arrives cleared); it has a fixed capacity of 512 events,
 never allocates, and refuses events once full — the refusal is counted in
 the `midi_events_dropped` diagnostic, never silent, and a full buffer

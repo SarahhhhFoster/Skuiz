@@ -78,7 +78,13 @@ impl Processor for Gain {
         }
         true
     }
-    fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {}
+    fn process(
+        &mut self,
+        _inputs: &skuiz_core::AudioInputs,
+        _outputs: &mut skuiz_core::AudioOutputs,
+        _midi: &mut skuiz_core::MidiOut,
+    ) {
+    }
 }
 
 unsafe fn ext<T>(plugin: *const clap_plugin, id: &std::ffi::CStr) -> &'static T {

@@ -57,7 +57,11 @@ thread**:
   `AudioToken`, and every audio-side entry point (`audio_core`,
   `midi_out`) requires a borrow of it — safe code cannot reach the
   processor without one. While blocks flow, nothing else can touch the
-  processor.
+  processor. `process` receives its `AudioInputs`/`AudioOutputs` as
+  stack-built views over preallocated engine scratch that the adapter
+  repoints at the host's buffers at block top — no allocation, no
+  locking, no string lookup in the audio path (see
+  [buses](buses.md)).
 - **Main thread.** `activate`, `deactivate`, and state save/load take
   the main state — but only while the transport is stopped. While
   running, state save/load becomes a bounded round-trip on a *separate*

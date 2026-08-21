@@ -30,9 +30,11 @@ Read these in order; each assumes the one before it.
    status per invariant.
 5. **[Parameters](concepts/parameters.md)** — automation, saved state, and
    why configuration menus are just parameters with labels.
-6. **[Editors](concepts/editors.md)** — the webview model, the JavaScript
+6. **[Audio bus topology](concepts/buses.md)** — declaring inputs, outputs
+   and optional sidechains once, and what each host does with them.
+7. **[Editors](concepts/editors.md)** — the webview model, the JavaScript
    bridge, and using a framework like SolidJS.
-7. **[Instance sync](concepts/instance-sync.md)** — the part with no JUCE
+8. **[Instance sync](concepts/instance-sync.md)** — the part with no JUCE
    equivalent: how instances find each other, elect an owner, and share
    state across processes.
 

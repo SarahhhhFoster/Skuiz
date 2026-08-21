@@ -27,9 +27,16 @@
 //! clocks with a drift-tolerant ring buffer, which is real work that nothing
 //! here needs yet: a tone makes an effect audible and its parameters
 //! demonstrable. See [`Input`] to choose silence instead.
+//!
+//! The shell wires up only the declared *main* buses: the tone (or silence)
+//! feeds the main input, aliased in place onto the main output, and the main
+//! output maps onto the device channels. A declared optional sidechain is
+//! always inactive — there is nothing to feed it — and an instrument
+//! topology (no input buses) simply gets no input.
 
 #![warn(missing_docs)]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use skuiz_core::bus::{BusDirection, TopologyScratch};
 use skuiz_core::engine::{AudioToken, Engine};
 use skuiz_core::{MidiOut, Processor};
 use std::sync::Arc;
@@ -116,6 +123,8 @@ impl Tone {
 }
 
 /// Deinterleaved scratch buffers, allocated once and reused every callback.
+/// Channel count comes from the declared main bus layouts — the main input
+/// and output alias this memory, so it is sized to the wider of the two.
 struct Scratch {
     channels: Vec<Vec<f32>>,
 }
@@ -130,6 +139,15 @@ impl Scratch {
     }
 }
 
+/// Channel count of the declared main bus in `dir` — 0 when the topology
+/// has no bus in that direction (an instrument's inputs).
+fn main_bus_channels<P: Processor>(dir: BusDirection) -> usize {
+    P::audio_buses()
+        .iter()
+        .find(|s| s.direction == dir)
+        .map_or(0, |s| s.layout.channels() as usize)
+}
+
 /// Fill `scratch` with this pass's input and run the processor over it.
 ///
 /// Split out from the stream callback so it can be tested without an audio
@@ -138,19 +156,21 @@ impl Scratch {
 /// from the engine's audio side (invariant 1), so this function never
 /// locks anything.
 ///
-/// `channel_count` is the *device* channel count, used to deinterleave
-/// `out`; `scratch` holds the *processor* channel count, clamped to stereo.
-/// The two differ on devices with more than two outputs — the stream
-/// callback duplicates the last produced channel over the extras.
+/// `device_channels` is the *device* channel count, used to deinterleave
+/// `out`; `scratch` holds the *processor* channel count, derived from the
+/// declared main bus layouts. The two differ on devices wider than the main
+/// output — the stream callback duplicates the last produced channel over
+/// the extras.
 fn render_pass<P: Processor>(
     processor: &mut P,
     midi: &mut MidiOut,
+    bus_scratch: &mut TopologyScratch,
     scratch: &mut Scratch,
     out: &mut [f32],
-    channel_count: usize,
+    device_channels: usize,
     tone: &mut Tone,
 ) {
-    let frames = out.len() / channel_count.max(1);
+    let frames = out.len() / device_channels.max(1);
     for frame in 0..frames {
         let sample = tone.next();
         for ch in scratch.channels.iter_mut() {
@@ -158,21 +178,50 @@ fn render_pass<P: Processor>(
         }
     }
 
-    {
-        // Borrow each channel's live region as a separate mutable slice, on
-        // the stack: a Vec here would allocate on the audio thread, which is
-        // the one thing this function promises not to do.
-        let mut views: [&mut [f32]; 2] = [&mut [], &mut []];
-        let used = scratch.channels.len().min(views.len());
-        for (view, chan) in views.iter_mut().zip(scratch.channels.iter_mut()) {
-            *view = &mut chan[..frames];
+    // Wire the declared main buses onto the scratch. `set_channel` takes raw
+    // pointers so the main input can alias the main output's memory, giving
+    // the processor the same in-place buffers as before topologies were
+    // declarative; the views below are the only access while they live.
+    bus_scratch.clear();
+    let out_channels = main_bus_channels::<P>(BusDirection::Output);
+    if out_channels > 0 {
+        bus_scratch.set_active(BusDirection::Output, 0, true);
+        for (c, chan) in scratch.channels.iter_mut().take(out_channels).enumerate() {
+            // SAFETY: the scratch buffers are owned here and live past the
+            // process call; the views built from them die before the next
+            // pass reuses them.
+            unsafe {
+                bus_scratch.set_channel(BusDirection::Output, 0, c, chan.as_mut_ptr(), frames);
+            }
         }
-        processor.process(&mut views[..used], midi);
+    }
+    if main_bus_channels::<P>(BusDirection::Input) > 0 {
+        bus_scratch.set_active(BusDirection::Input, 0, true);
+        for (c, chan) in scratch
+            .channels
+            .iter_mut()
+            .take(main_bus_channels::<P>(BusDirection::Input))
+            .enumerate()
+        {
+            // SAFETY: same buffers as the main output above — the alias is
+            // the in-place contract, and no other access overlaps the pass.
+            unsafe {
+                bus_scratch.set_channel(BusDirection::Input, 0, c, chan.as_mut_ptr(), frames);
+            }
+        }
+    }
+    // Any further declared input (a sidechain) stays inactive: a standalone
+    // has nothing to feed it.
+
+    {
+        let (inputs, mut outputs) = bus_scratch.views();
+        processor.process(&inputs, &mut outputs, midi);
     }
 
+    let mapped = out_channels.min(device_channels);
     for frame in 0..frames {
-        for (ch, buf) in scratch.channels.iter().enumerate() {
-            out[frame * channel_count + ch] = buf[frame];
+        for (ch, buf) in scratch.channels.iter().enumerate().take(mapped) {
+            out[frame * device_channels + ch] = buf[frame];
         }
     }
 }
@@ -293,9 +342,11 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
         .map_err(|e| Error::Config(e.to_string()))?;
     let sample_rate = supported.sample_rate() as f64;
     let device_channels = supported.channels() as usize;
-    // The Processor contract covers up to stereo; extra device channels are
-    // fed from the last one we produce.
-    let channel_count = device_channels.clamp(1, 2);
+    // The declared main output layout decides how many processor channels
+    // the device gets; extra device channels are fed from the last one we
+    // produce.
+    let processor_channels = main_bus_channels::<P>(BusDirection::Output).max(1);
+    let channel_count = device_channels.clamp(1, processor_channels);
 
     let _ = engine.with_main(|core| {
         core.processor.activate(sample_rate, SCRATCH_FRAMES as u32);
@@ -303,7 +354,11 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
 
     let stream = {
         let engine = Arc::clone(&engine);
-        let mut scratch = Scratch::new(channel_count);
+        // The main input aliases the main output, so the scratch must hold
+        // the wider of the two declared layouts.
+        let scratch_channels = main_bus_channels::<P>(BusDirection::Input)
+            .max(main_bus_channels::<P>(BusDirection::Output));
+        let mut scratch = Scratch::new(scratch_channels);
         let mut tone = Tone::new(input, sample_rate as f32);
         // Proof the engine is in the AUDIO state, held for the duration of
         // each callback: claimed at the top, handed back at the bottom.
@@ -334,6 +389,7 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                         render_pass(
                             &mut core.processor,
                             &mut core.midi_out,
+                            &mut core.bus_scratch,
                             &mut scratch,
                             chunk,
                             device_channels,
@@ -481,7 +537,8 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skuiz_core::{ParamDef, PluginInfo};
+    use skuiz_core::bus::{AudioBusSpec, ChannelLayout};
+    use skuiz_core::{AudioInputs, AudioOutputs, ParamDef, PluginInfo};
 
     struct Gain(f64);
 
@@ -518,11 +575,71 @@ mod tests {
         fn get_param(&self, _id: u32) -> f64 {
             self.0
         }
-        fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut MidiOut) {
+        fn process(
+            &mut self,
+            _inputs: &AudioInputs,
+            outputs: &mut AudioOutputs,
+            _midi: &mut MidiOut,
+        ) {
             let g = self.0 as f32;
-            for ch in channels.iter_mut() {
+            let Some(main) = outputs.main() else {
+                return;
+            };
+            for ch in main.channels() {
                 for s in ch.iter_mut() {
                     *s *= g;
+                }
+            }
+        }
+    }
+
+    /// An effect with an optional sidechain input: records what the shell
+    /// actually fed it, so the test can see the standalone's wiring.
+    #[derive(Default)]
+    struct SidechainFx {
+        sidechain_active: Option<bool>,
+        main_channels: usize,
+    }
+
+    impl Processor for SidechainFx {
+        fn info() -> PluginInfo {
+            PluginInfo {
+                id: "test.sc",
+                name: "sc",
+                vendor: "t",
+                version: "0",
+                description: "",
+            }
+        }
+        fn params() -> &'static [ParamDef] {
+            &[]
+        }
+        fn set_param(&mut self, _id: u32, _v: f64) {}
+        fn get_param(&self, _id: u32) -> f64 {
+            0.0
+        }
+        fn audio_buses() -> &'static [AudioBusSpec] {
+            const BUSES: &[AudioBusSpec] = &[
+                AudioBusSpec::input("Main", ChannelLayout::Stereo),
+                AudioBusSpec::input("Sidechain", ChannelLayout::Mono).optional(),
+                AudioBusSpec::output("Main", ChannelLayout::Stereo),
+            ];
+            BUSES
+        }
+        fn process(
+            &mut self,
+            inputs: &AudioInputs,
+            outputs: &mut AudioOutputs,
+            _midi: &mut MidiOut,
+        ) {
+            self.sidechain_active = inputs.at(1).map(|bus| bus.active());
+            let Some(main) = outputs.main() else {
+                return;
+            };
+            self.main_channels = main.channels().len();
+            for ch in main.channels() {
+                for s in ch.iter_mut() {
+                    *s *= 2.0;
                 }
             }
         }
@@ -548,6 +665,7 @@ mod tests {
     fn render_pass_interleaves_and_applies_the_processor() {
         let mut processor = Gain(1.0);
         let mut midi = MidiOut::with_capacity(8);
+        let mut bus_scratch = TopologyScratch::new(Gain::audio_buses());
         let mut scratch = Scratch::new(2);
         let mut out = vec![0.0f32; 64 * 2];
         let mut tone = Tone::new(Input::TestTone, 48_000.0);
@@ -555,6 +673,7 @@ mod tests {
         render_pass(
             &mut processor,
             &mut midi,
+            &mut bus_scratch,
             &mut scratch,
             &mut out,
             2,
@@ -580,6 +699,7 @@ mod tests {
         render_pass(
             &mut processor,
             &mut midi,
+            &mut bus_scratch,
             &mut scratch,
             &mut out,
             2,
@@ -596,13 +716,17 @@ mod tests {
     fn silence_input_produces_silence() {
         let mut processor = Gain(1.0);
         let mut midi = MidiOut::with_capacity(8);
-        let mut scratch = Scratch::new(1);
+        let mut bus_scratch = TopologyScratch::new(Gain::audio_buses());
+        // The scratch follows the declared stereo topology even when the
+        // device is mono; only the first channel maps to the device.
+        let mut scratch = Scratch::new(2);
         let mut out = vec![1.0f32; 32];
         let mut tone = Tone::new(Input::Silence, 48_000.0);
 
         render_pass(
             &mut processor,
             &mut midi,
+            &mut bus_scratch,
             &mut scratch,
             &mut out,
             1,
@@ -620,17 +744,61 @@ mod tests {
     fn oversized_buffers_are_processed_in_passes() {
         let mut processor = Gain(1.0);
         let mut midi = MidiOut::with_capacity(8);
-        let mut scratch = Scratch::new(1);
+        let mut bus_scratch = TopologyScratch::new(Gain::audio_buses());
+        let mut scratch = Scratch::new(2);
         let mut tone = Tone::new(Input::TestTone, 48_000.0);
 
         let total = SCRATCH_FRAMES * 2 + 37;
         let mut out = vec![f32::NAN; total];
         for chunk in out.chunks_mut(SCRATCH_FRAMES) {
-            render_pass(&mut processor, &mut midi, &mut scratch, chunk, 1, &mut tone);
+            render_pass(
+                &mut processor,
+                &mut midi,
+                &mut bus_scratch,
+                &mut scratch,
+                chunk,
+                1,
+                &mut tone,
+            );
         }
         assert!(
             out.iter().all(|s| s.is_finite()),
             "some frames were never written"
+        );
+    }
+
+    /// A declared sidechain has no source in a standalone: the processor
+    /// must see it inactive while the main pair is processed as usual.
+    #[test]
+    fn declared_sidechain_is_always_inactive() {
+        let mut processor = SidechainFx::default();
+        let mut midi = MidiOut::with_capacity(8);
+        let mut bus_scratch = TopologyScratch::new(SidechainFx::audio_buses());
+        let mut scratch = Scratch::new(2);
+        let mut out = vec![0.0f32; 32 * 2];
+        let mut tone = Tone::new(Input::TestTone, 48_000.0);
+
+        render_pass(
+            &mut processor,
+            &mut midi,
+            &mut bus_scratch,
+            &mut scratch,
+            &mut out,
+            2,
+            &mut tone,
+        );
+        assert_eq!(
+            processor.sidechain_active,
+            Some(false),
+            "the standalone never feeds a sidechain"
+        );
+        assert_eq!(
+            processor.main_channels, 2,
+            "the main pair still ran, stereo"
+        );
+        assert!(
+            out.iter().any(|s| s.abs() > 0.25 + 1e-6),
+            "the main pair was processed (gain 2 on the -12 dBFS tone)"
         );
     }
 }

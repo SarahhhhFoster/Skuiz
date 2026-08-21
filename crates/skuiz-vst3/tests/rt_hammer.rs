@@ -7,7 +7,7 @@
 
 #![allow(non_snake_case)]
 
-use skuiz_core::{ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, ParamDef, PluginInfo, Processor};
 use skuiz_vst3::vst3::Steinberg::Vst::*;
 use skuiz_vst3::vst3::Steinberg::*;
 use skuiz_vst3::vst3::{Class, ComPtr, ComRef, ComWrapper, Interface};
@@ -54,11 +54,18 @@ impl Processor for Gain {
     fn get_param(&self, _id: u32) -> f64 {
         self.0
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _midi: &mut skuiz_core::MidiOut,
+    ) {
         let g = self.0 as f32;
-        for ch in channels.iter_mut() {
-            for s in ch.iter_mut() {
-                *s *= g;
+        if let Some(out) = outputs.main() {
+            for ch in out.channels() {
+                for s in ch.iter_mut() {
+                    *s *= g;
+                }
             }
         }
     }

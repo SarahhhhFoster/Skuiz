@@ -23,12 +23,36 @@ typedef struct {
     uint32_t choiceCount;
 } SkuizParamInfo;
 
+/// Mirrors `SkuizAudioBusInfo` in crates/skuiz-auv3/src/lib.rs.
+typedef struct {
+    uint32_t channelCount;
+    uint8_t optional;
+    const char *_Nullable name;
+} SkuizAudioBusInfo;
+
+/// Bounds of the bus topology, mirroring `MAX_BUS_CHANNELS` and
+/// `MAX_BUSES_PER_DIRECTION` in crates/skuiz-core/src/bus.rs.
+#define kSkuizMaxBusChannels 8u
+#define kSkuizMaxBusesPerDirection 4u
+
+/// Mirrors `SkuizAudioBusBuffers` in crates/skuiz-auv3/src/lib.rs: one bus's
+/// channel pointers for a render call. The render entry point takes a fixed
+/// array of `kSkuizMaxBusesPerDirection` of these per direction.
+typedef struct {
+    float *_Nullable channels[kSkuizMaxBusChannels];
+    uint32_t channelCount;
+    uint8_t active;
+} SkuizAudioBusBuffers;
+
 extern void *skuiz_auv3_init(const char *appGroupDir);
 extern void skuiz_auv3_destroy(void *inst);
 extern void skuiz_auv3_activate(void *inst, double sampleRate, uint32_t maxFrames);
 extern void skuiz_auv3_deactivate(void *inst);
-extern void skuiz_auv3_render(void *inst, float *const *channels,
-                              uint32_t channelCount, uint32_t frames);
+extern uint32_t skuiz_auv3_audio_bus_count(uint8_t direction);
+extern bool skuiz_auv3_audio_bus_info(uint8_t direction, uint32_t index,
+                                      SkuizAudioBusInfo *out);
+extern void skuiz_auv3_render(void *inst, const SkuizAudioBusBuffers *inputs,
+                              const SkuizAudioBusBuffers *outputs, uint32_t frames);
 extern uint32_t skuiz_auv3_param_count(void);
 extern bool skuiz_auv3_param_info(uint32_t index, SkuizParamInfo *out);
 extern const char *skuiz_auv3_choice_label(uint32_t paramID, uint32_t choiceIndex);
@@ -41,8 +65,6 @@ extern void skuiz_auv3_reset(void *inst);
 extern uint32_t skuiz_auv3_midi_count(void *inst);
 extern bool skuiz_auv3_midi_event(void *inst, uint32_t index, uint32_t *frame, uint8_t *bytes3);
 
-/// Channels the render path handles, matching the Processor contract.
-#define kSkuizMaxChannels 2u
 /// Key the state blob is stored under inside `fullState`.
 static NSString *const kSkuizStateKey = @"skuiz.state";
 
@@ -56,17 +78,45 @@ typedef struct {
     double value;
 } SkuizParamEvent;
 
-/// Render `channels[start..end]` in place and hand the segment's MIDI to the
-/// host, offset back into block time. Called once per automation segment, so
-/// MIDI frames the DSP stamps are segment-relative.
-static void SkuizRenderSegment(void *instance, float *const *channels, uint32_t channelCount,
-                               uint32_t start, uint32_t end, AUMIDIOutputEventBlock midiOut,
-                               const AudioTimeStamp *timestamp) {
-    float *segment[kSkuizMaxChannels] = {NULL, NULL};
-    for (uint32_t i = 0; i < channelCount; i++) {
-        segment[i] = channels[i] + start;
+/// Preallocated pull targets for the sidechain input buses (every declared
+/// input past the main one). The render block must not allocate, so these
+/// are sized to `maximumFramesToRender` in `allocateRenderResources` and
+/// freed in `deallocateRenderResources`. The main input needs no storage:
+/// it is pulled straight into the host's output buffers.
+typedef struct {
+    /// Frames each channel buffer holds; blocks larger than this render
+    /// with sidechains inactive rather than overrunning the buffers.
+    uint32_t capacity;
+    /// One buffer list per declared sidechain bus (slot 0 stays NULL). A
+    /// host may substitute its own `mData` pointers when pulled, so the
+    /// render block re-points these at `data` before every pull.
+    AudioBufferList *_Nullable lists[kSkuizMaxBusesPerDirection];
+    float *_Nullable data[kSkuizMaxBusesPerDirection];
+} SkuizPullStorage;
+
+/// Render the segment `[start, end)` of every connected bus and hand the
+/// segment's MIDI to the host, offset back into block time. Called once per
+/// automation segment, so MIDI frames the DSP stamps are segment-relative.
+static void SkuizRenderSegment(void *instance, const SkuizAudioBusBuffers *inputs,
+                               const SkuizAudioBusBuffers *outputs, uint32_t start, uint32_t end,
+                               AUMIDIOutputEventBlock midiOut, const AudioTimeStamp *timestamp) {
+    SkuizAudioBusBuffers segmentInputs[kSkuizMaxBusesPerDirection];
+    SkuizAudioBusBuffers segmentOutputs[kSkuizMaxBusesPerDirection];
+    memcpy(segmentInputs, inputs, sizeof(segmentInputs));
+    memcpy(segmentOutputs, outputs, sizeof(segmentOutputs));
+    for (uint32_t b = 0; b < kSkuizMaxBusesPerDirection; b++) {
+        for (uint32_t c = 0; c < segmentInputs[b].channelCount; c++) {
+            if (segmentInputs[b].channels[c] != NULL) {
+                segmentInputs[b].channels[c] += start;
+            }
+        }
+        for (uint32_t c = 0; c < segmentOutputs[b].channelCount; c++) {
+            if (segmentOutputs[b].channels[c] != NULL) {
+                segmentOutputs[b].channels[c] += start;
+            }
+        }
     }
-    skuiz_auv3_render(instance, segment, channelCount, end - start);
+    skuiz_auv3_render(instance, segmentInputs, segmentOutputs, end - start);
 
     if (midiOut != NULL) {
         uint32_t segmentFrames = end - start;
@@ -91,13 +141,115 @@ static void SkuizRenderSegment(void *instance, float *const *channels, uint32_t 
 
 static NSString *_Nullable gSkuizAppGroupDirectory = nil;
 
+/// One `AUAudioUnitBus` from the declared topology (`direction` 0 = input,
+/// 1 = output), named after the bus and sized to its layout.
+static AUAudioUnitBus *_Nullable SkuizCreateBus(uint8_t direction, uint32_t index,
+                                                NSError **outError) {
+    SkuizAudioBusInfo info;
+    if (!skuiz_auv3_audio_bus_info(direction, index, &info) || info.channelCount == 0 ||
+        info.channelCount > kSkuizMaxBusChannels) {
+        return nil;
+    }
+    AVAudioFormat *format =
+        [[AVAudioFormat alloc] initStandardFormatWithSampleRate:44100.0
+                                                       channels:info.channelCount];
+    AUAudioUnitBus *bus = [[AUAudioUnitBus alloc] initWithFormat:format error:outError];
+    if (bus != nil && info.name != NULL) {
+        bus.name = @(info.name);
+    }
+    return bus;
+}
+
+/// The declared topology, captured by value into the render block (blocks
+/// cannot capture bare C arrays). Immutable at runtime.
+typedef struct {
+    uint32_t inputBusCount;
+    uint32_t outputBusCount;
+    /// Declared channel count per bus, clamped to `kSkuizMaxBusChannels`.
+    uint32_t inputChannels[kSkuizMaxBusesPerDirection];
+    uint32_t outputChannels[kSkuizMaxBusesPerDirection];
+} SkuizBusTopology;
+
+/// The declared buses in one direction as an `AUAudioUnitBusArray`, or nil
+/// on failure. A direction with no declared buses (an instrument's inputs)
+/// yields an array with zero busses — an absent input, not a failure.
+static AUAudioUnitBusArray *_Nullable SkuizCreateBusArray(AUAudioUnit *unit,
+                                                          AUAudioUnitBusType busType,
+                                                          uint8_t direction, NSError **outError) {
+    uint32_t count = skuiz_auv3_audio_bus_count(direction);
+    // validate_buses caps the count in Rust; refuse to init rather than
+    // guess at a topology we cannot represent.
+    if (count > kSkuizMaxBusesPerDirection) {
+        return nil;
+    }
+    NSMutableArray<AUAudioUnitBus *> *busses = [NSMutableArray arrayWithCapacity:count];
+    for (uint32_t b = 0; b < count; b++) {
+        AUAudioUnitBus *bus = SkuizCreateBus(direction, b, outError);
+        if (bus == nil) {
+            return nil;
+        }
+        [busses addObject:bus];
+    }
+    return [[AUAudioUnitBusArray alloc] initWithAudioUnit:unit busType:busType busses:busses];
+}
+
+/// Allocate the sidechain pull targets: one buffer list per declared input
+/// past the main bus, sized to `maxFrames`. Main thread only.
+static SkuizPullStorage *_Nullable SkuizAllocPullStorage(uint32_t maxFrames) {
+    uint32_t inputCount = skuiz_auv3_audio_bus_count(0);
+    if (inputCount <= 1 || inputCount > kSkuizMaxBusesPerDirection || maxFrames == 0) {
+        return NULL;
+    }
+    SkuizPullStorage *storage = calloc(1, sizeof(SkuizPullStorage));
+    if (storage == NULL) {
+        return NULL;
+    }
+    storage->capacity = maxFrames;
+    for (uint32_t b = 1; b < inputCount; b++) {
+        SkuizAudioBusInfo info;
+        if (!skuiz_auv3_audio_bus_info(0, b, &info) || info.channelCount == 0 ||
+            info.channelCount > kSkuizMaxBusChannels) {
+            continue;
+        }
+        size_t listSize = sizeof(AudioBufferList) + (info.channelCount - 1) * sizeof(AudioBuffer);
+        AudioBufferList *list = calloc(1, listSize);
+        float *data = calloc((size_t)info.channelCount * maxFrames, sizeof(float));
+        if (list == NULL || data == NULL) {
+            free(list);
+            free(data);
+            continue;
+        }
+        list->mNumberBuffers = info.channelCount;
+        for (uint32_t c = 0; c < info.channelCount; c++) {
+            list->mBuffers[c] = (AudioBuffer){.mNumberChannels = 1,
+                                              .mDataByteSize = maxFrames * sizeof(float),
+                                              .mData = data + (size_t)c * maxFrames};
+        }
+        storage->lists[b] = list;
+        storage->data[b] = data;
+    }
+    return storage;
+}
+
+static void SkuizFreePullStorage(SkuizPullStorage *_Nullable storage) {
+    if (storage == NULL) {
+        return;
+    }
+    for (uint32_t b = 0; b < kSkuizMaxBusesPerDirection; b++) {
+        free(storage->lists[b]);
+        free(storage->data[b]);
+    }
+    free(storage);
+}
+
 @implementation SkuizAudioUnit {
     void *_instance;
-    AUAudioUnitBus *_inputBus;
-    AUAudioUnitBus *_outputBus;
     AUAudioUnitBusArray *_inputBusArray;
     AUAudioUnitBusArray *_outputBusArray;
     AUParameterTree *_parameterTree;
+    /// Sidechain pull targets, allocated with the render resources. Main
+    /// thread only; the render block captures the pointer.
+    SkuizPullStorage *_pullStorage;
 }
 
 + (nullable NSString *)skuizAppGroupDirectory {
@@ -126,19 +278,14 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
         return nil;
     }
 
-    AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:44100.0
-                                                                          channels:kSkuizMaxChannels];
-    _inputBus = [[AUAudioUnitBus alloc] initWithFormat:format error:outError];
-    _outputBus = [[AUAudioUnitBus alloc] initWithFormat:format error:outError];
-    if (_inputBus == nil || _outputBus == nil) {
+    // The declared bus topology is the single source of truth; translate it
+    // into the AUAudioUnit bus model. An instrument declares no input buses
+    // and gets a zero-count input array.
+    _inputBusArray = SkuizCreateBusArray(self, AUAudioUnitBusTypeInput, 0, outError);
+    _outputBusArray = SkuizCreateBusArray(self, AUAudioUnitBusTypeOutput, 1, outError);
+    if (_inputBusArray == nil || _outputBusArray == nil) {
         return nil;
     }
-    _inputBusArray = [[AUAudioUnitBusArray alloc] initWithAudioUnit:self
-                                                           busType:AUAudioUnitBusTypeInput
-                                                            busses:@[ _inputBus ]];
-    _outputBusArray = [[AUAudioUnitBusArray alloc] initWithAudioUnit:self
-                                                            busType:AUAudioUnitBusTypeOutput
-                                                             busses:@[ _outputBus ]];
 
     [self skuizBuildParameterTree];
     self.maximumFramesToRender = 4096;
@@ -146,6 +293,8 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
 }
 
 - (void)dealloc {
+    SkuizFreePullStorage(_pullStorage);
+    _pullStorage = NULL;
     if (_instance != NULL) {
         skuiz_auv3_destroy(_instance);
         _instance = NULL;
@@ -268,14 +417,25 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
     if (![super allocateRenderResourcesAndReturnError:outError]) {
         return NO;
     }
-    skuiz_auv3_activate(_instance, _outputBus.format.sampleRate,
-                        (uint32_t)self.maximumFramesToRender);
+    // Sidechain pull targets must exist before the render block can run;
+    // the render thread must not allocate.
+    SkuizFreePullStorage(_pullStorage);
+    _pullStorage = SkuizAllocPullStorage((uint32_t)self.maximumFramesToRender);
+    // The main output's format drives the engine; a topology without
+    // outputs falls back to the default rate.
+    AUAudioUnitBus *mainOutput = _outputBusArray.count > 0 ? _outputBusArray[0] : nil;
+    double sampleRate = mainOutput != nil ? mainOutput.format.sampleRate : 44100.0;
+    skuiz_auv3_activate(_instance, sampleRate, (uint32_t)self.maximumFramesToRender);
     return YES;
 }
 
 - (void)deallocateRenderResources {
     // The pair of allocateRenderResourcesAndReturnError's activate.
     skuiz_auv3_deactivate(_instance);
+    // Hosts serialise this against render calls, so the captured storage
+    // pointer the render block holds is dead by now.
+    SkuizFreePullStorage(_pullStorage);
+    _pullStorage = NULL;
     [super deallocateRenderResources];
 }
 
@@ -296,6 +456,27 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
     // render thread would message an Objective-C object mid-callback. Hosts
     // install this before asking for the render block.
     AUMIDIOutputEventBlock midiOut = self.MIDIOutputEventBlock;
+    // Sidechain pull targets, allocated with the render resources. A block
+    // fetched before allocation captures NULL and renders with sidechains
+    // inactive.
+    SkuizPullStorage *pullStorage = _pullStorage;
+    // The declared topology, captured by value: the Rust side clamps to
+    // these too, and the topology cannot change at runtime.
+    SkuizBusTopology topology = {0};
+    topology.inputBusCount = skuiz_auv3_audio_bus_count(0);
+    topology.outputBusCount = skuiz_auv3_audio_bus_count(1);
+    for (uint32_t b = 0; b < topology.inputBusCount && b < kSkuizMaxBusesPerDirection; b++) {
+        SkuizAudioBusInfo info;
+        if (skuiz_auv3_audio_bus_info(0, b, &info)) {
+            topology.inputChannels[b] = MIN(info.channelCount, kSkuizMaxBusChannels);
+        }
+    }
+    for (uint32_t b = 0; b < topology.outputBusCount && b < kSkuizMaxBusesPerDirection; b++) {
+        SkuizAudioBusInfo info;
+        if (skuiz_auv3_audio_bus_info(1, b, &info)) {
+            topology.outputChannels[b] = MIN(info.channelCount, kSkuizMaxBusChannels);
+        }
+    }
 
     return ^AUAudioUnitStatus(AudioUnitRenderActionFlags *actionFlags,
                               const AudioTimeStamp *timestamp,
@@ -345,6 +526,8 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
 
         // Pull the upstream audio straight into the output buffers, then
         // process in place — the same shape every other Skuiz adapter uses.
+        // The main input aliases the main output on the Rust side; only
+        // sidechain buses get pointers of their own.
         if (pullInputBlock != NULL) {
             AudioUnitRenderActionFlags pullFlags = 0;
             AUAudioUnitStatus status =
@@ -361,15 +544,62 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
             }
         }
 
-        float *channels[kSkuizMaxChannels] = {NULL, NULL};
-        UInt32 channelCount = outputData->mNumberBuffers;
-        if (channelCount > kSkuizMaxChannels) {
-            channelCount = kSkuizMaxChannels;
-        }
-        for (UInt32 i = 0; i < channelCount; i++) {
-            channels[i] = (float *)outputData->mBuffers[i].mData;
-            if (channels[i] == NULL) {
+        SkuizAudioBusBuffers inputs[kSkuizMaxBusesPerDirection] = {0};
+        SkuizAudioBusBuffers outputs[kSkuizMaxBusesPerDirection] = {0};
+
+        // The main output bus is the one non-negotiable piece: a null
+        // channel pointer here is a host bug and stays a hard error.
+        uint32_t mainChannels =
+            MIN((uint32_t)outputData->mNumberBuffers, topology.outputChannels[0]);
+        for (uint32_t i = 0; i < mainChannels; i++) {
+            float *channel = (float *)outputData->mBuffers[i].mData;
+            if (channel == NULL) {
                 return kAudioUnitErr_InvalidParameter;
+            }
+            outputs[0].channels[i] = channel;
+        }
+        outputs[0].channelCount = mainChannels;
+        outputs[0].active = mainChannels > 0 ? 1 : 0;
+
+        // Sidechain inputs: pull each declared bus past the main one, but
+        // only when the host connected it. A failed or impossible pull
+        // leaves the bus inactive — it is optional, never an error. A block
+        // larger than the preallocated pull targets also renders with
+        // sidechains inactive rather than overrunning the buffers.
+        if (pullInputBlock != NULL && pullStorage != NULL &&
+            frameCount <= pullStorage->capacity) {
+            for (uint32_t b = 1;
+                 b < topology.inputBusCount && b < kSkuizMaxBusesPerDirection; b++) {
+                AudioBufferList *list = pullStorage->lists[b];
+                if (list == NULL) {
+                    continue;
+                }
+                // Re-point at our buffers: a host may have substituted its
+                // own mData pointers on the previous pull.
+                for (uint32_t c = 0; c < topology.inputChannels[b]; c++) {
+                    list->mBuffers[c].mNumberChannels = 1;
+                    list->mBuffers[c].mDataByteSize = pullStorage->capacity * sizeof(float);
+                    list->mBuffers[c].mData =
+                        pullStorage->data[b] + (size_t)c * pullStorage->capacity;
+                }
+                AudioUnitRenderActionFlags pullFlags = 0;
+                AUAudioUnitStatus status =
+                    pullInputBlock(&pullFlags, timestamp, frameCount, (NSInteger)b, list);
+                if (status != noErr) {
+                    continue;
+                }
+                uint32_t count = MIN((uint32_t)list->mNumberBuffers, topology.inputChannels[b]);
+                uint32_t used = 0;
+                for (uint32_t c = 0; c < count; c++) {
+                    float *channel = (float *)list->mBuffers[c].mData;
+                    if (channel == NULL) {
+                        break;
+                    }
+                    inputs[b].channels[c] = channel;
+                    used++;
+                }
+                inputs[b].channelCount = used;
+                inputs[b].active = used > 0 ? 1 : 0;
             }
         }
 
@@ -380,14 +610,14 @@ static NSString *_Nullable gSkuizAppGroupDirectory = nil;
         uint32_t pos = 0;
         for (uint32_t i = 0; i < timedCount; i++) {
             if (timed[i].frame > pos) {
-                SkuizRenderSegment(instance, channels, channelCount, pos, timed[i].frame,
+                SkuizRenderSegment(instance, inputs, outputs, pos, timed[i].frame,
                                    midiOut, timestamp);
                 pos = timed[i].frame;
             }
             skuiz_auv3_set_param_from_render(instance, timed[i].address, timed[i].value);
         }
         if (pos < (uint32_t)frameCount) {
-            SkuizRenderSegment(instance, channels, channelCount, pos, (uint32_t)frameCount,
+            SkuizRenderSegment(instance, inputs, outputs, pos, (uint32_t)frameCount,
                                midiOut, timestamp);
         }
         return noErr;
@@ -435,6 +665,19 @@ int skuiz_auv3_selftest(void) {
             return 5;
         }
 
+        // The declared topology must surface as bus arrays: stereo main in,
+        // an optional mono sidechain in, stereo main out.
+        if (unit.inputBusses.count != 2 || unit.outputBusses.count != 1) {
+            return 18;
+        }
+        AUAudioUnitBus *mainIn = unit.inputBusses[0];
+        AUAudioUnitBus *sidechainBus = unit.inputBusses[1];
+        if (mainIn.format.channelCount != 2 || ![mainIn.name isEqualToString:@"Main"] ||
+            sidechainBus.format.channelCount != 1 ||
+            ![sidechainBus.name isEqualToString:@"Sidechain"]) {
+            return 19;
+        }
+
         // Render a block of ones and check the processor changed it. With
         // the fixture's gain at 0.25 the output must come back quartered.
         const AUAudioFrameCount frames = 128;
@@ -471,10 +714,16 @@ int skuiz_auv3_selftest(void) {
             }
         }
 
-        // Now with an input: a pull block supplying ones.
+        // Now with an input: a pull block supplying ones. Only the main bus
+        // is connected — the fixture declares a sidechain too, and a host
+        // that never connected it fails the pull, which the shim must treat
+        // as an inactive bus, not an error.
         AURenderPullInputBlock pull =
             ^AUAudioUnitStatus(AudioUnitRenderActionFlags *pullFlags, const AudioTimeStamp *ts,
                                AUAudioFrameCount count, NSInteger bus, AudioBufferList *data) {
+                if (bus != 0) {
+                    return kAudioUnitErr_InvalidElement;
+                }
                 for (UInt32 b = 0; b < data->mNumberBuffers; b++) {
                     float *samples = (float *)data->mBuffers[b].mData;
                     for (AUAudioFrameCount i = 0; i < count; i++) {
@@ -549,6 +798,40 @@ int skuiz_auv3_selftest(void) {
         }
         if (midiSeen != 1 || (midiStatus & 0xF0) != 0x90) {
             return 13;
+        }
+
+        // With the sidechain connected, the DSP must see it: the fixture
+        // writes 100 + sidechain[0] into frame 0 when the bus is active.
+        // Every render above went through a pull block that refuses bus 1,
+        // so their plain-gain results already prove an unconnected
+        // sidechain stays inactive.
+        AURenderPullInputBlock pullWithSidechain =
+            ^AUAudioUnitStatus(AudioUnitRenderActionFlags *pullFlags, const AudioTimeStamp *ts,
+                               AUAudioFrameCount count, NSInteger bus, AudioBufferList *data) {
+                float fill = bus == 0 ? 1.0f : 0.5f;
+                for (UInt32 b = 0; b < data->mNumberBuffers; b++) {
+                    float *samples = (float *)data->mBuffers[b].mData;
+                    for (AUAudioFrameCount i = 0; i < count; i++) {
+                        samples[i] = fill;
+                    }
+                }
+                return noErr;
+            };
+        status = render(&flags, &timestamp, frames, 0, bufferList, NULL, pullWithSidechain);
+        if (status != noErr) {
+            return 20;
+        }
+        // Gain is 0.25 here: frame 0 carries the marker, the rest is gain.
+        if (fabsf(left[0] - 100.5f) > 1e-4f || fabsf(left[1] - 0.25f) > 1e-5f) {
+            return 21;
+        }
+        // And a later block without the sidechain must see it gone again.
+        status = render(&flags, &timestamp, frames, 0, bufferList, NULL, pull);
+        if (status != noErr) {
+            return 20;
+        }
+        if (fabsf(left[0] - 0.25f) > 1e-5f) {
+            return 21;
         }
 
         // State must survive a save/load cycle through fullState.

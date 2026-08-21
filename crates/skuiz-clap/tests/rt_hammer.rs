@@ -58,7 +58,13 @@ impl Processor for Gain {
     fn get_param(&self, _id: u32) -> f64 {
         self.0
     }
-    fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {}
+    fn process(
+        &mut self,
+        _inputs: &skuiz_core::AudioInputs,
+        _outputs: &mut skuiz_core::AudioOutputs,
+        _midi: &mut skuiz_core::MidiOut,
+    ) {
+    }
 }
 
 /// Every value any thread ever sends. The default (1.0) is a candidate too,

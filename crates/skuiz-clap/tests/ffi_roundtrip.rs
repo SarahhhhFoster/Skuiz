@@ -50,7 +50,13 @@ impl Processor for Gain {
     fn get_param(&self, _id: u32) -> f64 {
         self.0
     }
-    fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {}
+    fn process(
+        &mut self,
+        _inputs: &skuiz_core::AudioInputs,
+        _outputs: &mut skuiz_core::AudioOutputs,
+        _midi: &mut skuiz_core::MidiOut,
+    ) {
+    }
 }
 
 unsafe fn ext<T>(plugin: *const clap_plugin, id: &std::ffi::CStr) -> &'static T {
@@ -107,9 +113,16 @@ impl Processor for Fill {
     fn get_param(&self, _id: u32) -> f64 {
         self.0
     }
-    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut skuiz_core::MidiOut) {
-        for ch in channels.iter_mut() {
-            ch.fill(self.0 as f32);
+    fn process(
+        &mut self,
+        _inputs: &skuiz_core::AudioInputs,
+        outputs: &mut skuiz_core::AudioOutputs,
+        _midi: &mut skuiz_core::MidiOut,
+    ) {
+        if let Some(main) = outputs.main() {
+            for ch in main.channels() {
+                ch.fill(self.0 as f32);
+            }
         }
     }
 }

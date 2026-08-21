@@ -5,10 +5,16 @@
 
 #![warn(missing_docs)]
 
+pub mod bus;
 pub mod diag;
 pub mod engine;
 pub mod lww;
 pub mod rt;
+
+pub use bus::{
+    AudioBusSpec, AudioInputs, AudioOutputs, BusDirection, BusId, ChannelLayout, InputBus,
+    OutputBus,
+};
 
 /// Static metadata identifying a plugin to hosts.
 pub struct PluginInfo {
@@ -437,6 +443,25 @@ pub trait Processor: Send + 'static {
     where
         Self: Sized;
 
+    /// The plugin's audio bus topology: which input/output buses exist,
+    /// their channel layouts, and which are optional. Static metadata, like
+    /// [`Processor::params`] — hosts snapshot it at load time and negotiate
+    /// activation from it; the topology itself never changes at runtime.
+    ///
+    /// Default: [`bus::DEFAULT_EFFECT_BUSES`] — one stereo main input and
+    /// one stereo main output, matching what every adapter hardcoded before
+    /// topologies were declarative. Instruments return
+    /// [`bus::INSTRUMENT_BUSES`]; sidechain effects declare their optional
+    /// input explicitly. See `docs/concepts/buses.md`.
+    ///
+    /// Called on any thread, and expected to be a constant.
+    fn audio_buses() -> &'static [AudioBusSpec]
+    where
+        Self: Sized,
+    {
+        bus::DEFAULT_EFFECT_BUSES
+    }
+
     /// Prepare for playback at a known sample rate and maximum block size.
     ///
     /// **Main thread.** This is the one place to allocate buffers, build
@@ -472,12 +497,18 @@ pub trait Processor: Send + 'static {
     /// the engine's parameter mirror instead.
     fn get_param(&self, id: u32) -> f64;
 
-    /// Process one block of audio, in place.
+    /// Process one block of audio.
     ///
-    /// `channels[c]` arrives holding the input and must leave holding the
-    /// output; every slice is the same length, which is the block size for
-    /// this call and varies between calls. `channels` may be empty for a
-    /// plugin with no audio output, so a MIDI-only plugin still runs.
+    /// `inputs` and `outputs` are views over the declared bus topology for
+    /// this block (see [`bus`]): read from input channels, write to output
+    /// channels. Every channel slice is the block size for this call, which
+    /// varies between calls. A bus the host left inactive reports
+    /// [`InputBus::active`] `false` and no channels — check it, or use
+    /// [`AudioInputs::main`], before indexing.
+    ///
+    /// The main input's channels may alias the main output's (hosts process
+    /// in place), so read a frame before writing it; optional inputs never
+    /// alias outputs.
     ///
     /// Push any MIDI the DSP generates into `midi`, which arrives cleared;
     /// see [`MidiOut::push`].
@@ -489,7 +520,7 @@ pub trait Processor: Send + 'static {
     /// block renders silence and leaves the processor in an unknown
     /// state. Everything expensive belongs in
     /// [`Processor::activate`].
-    fn process(&mut self, channels: &mut [&mut [f32]], midi: &mut MidiOut);
+    fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut);
 
     /// Delay this plugin adds between its input and output, in frames.
     ///
@@ -625,7 +656,13 @@ mod tests {
         fn get_param(&self, _id: u32) -> f64 {
             self.0
         }
-        fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut MidiOut) {}
+        fn process(
+            &mut self,
+            _inputs: &AudioInputs,
+            _outputs: &mut AudioOutputs,
+            _midi: &mut MidiOut,
+        ) {
+        }
     }
 
     #[test]

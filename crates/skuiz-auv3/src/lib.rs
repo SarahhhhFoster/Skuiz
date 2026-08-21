@@ -44,6 +44,7 @@
 //! earns its place, because the ordinary case — the user deleting the
 //! instance that happened to be serving — leaves the process alive.
 
+use skuiz_core::bus::{AudioBusSpec, BusDirection};
 use skuiz_core::engine::{AudioToken, Engine};
 use skuiz_core::Processor;
 use std::cell::RefCell;
@@ -81,6 +82,96 @@ pub struct SkuizParamInfo {
     /// Number of choices, or 0 for a continuous parameter. When non-zero,
     /// fetch each label with `skuiz_auv3_choice_label`.
     pub choice_count: u32,
+}
+
+/// Static description of one declared audio bus, handed to the Objective-C
+/// side, which turns each into an `AUAudioUnitBus`.
+#[repr(C)]
+pub struct SkuizAudioBusInfo {
+    /// Channels in the declared layout.
+    pub channel_count: u32,
+    /// Non-zero when the host may leave this bus disconnected (never the
+    /// main bus of a direction).
+    pub optional: u8,
+    /// NUL-terminated, owned by Rust and valid for the process lifetime (bus
+    /// names are `&'static str`); null for an empty name.
+    pub name: *const c_char,
+}
+
+/// One bus's channel pointers for a render call, mirroring the shim's
+/// `SkuizAudioBusBuffers`. The shim passes a fixed array of
+/// [`skuiz_core::bus::MAX_BUSES_PER_DIRECTION`] of these per direction, in
+/// declaration order; slots past the declared count stay zeroed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SkuizAudioBusBuffers {
+    /// Channel buffers, valid for `frames` samples; only the first
+    /// `channel_count` entries are read.
+    pub channels: [*mut f32; skuiz_core::bus::MAX_BUS_CHANNELS],
+    /// Channels actually supplied for this bus; the Rust side clamps to the
+    /// declared layout.
+    pub channel_count: u32,
+    /// Non-zero when the host connected/activated this bus for this block.
+    pub active: u8,
+}
+
+impl SkuizAudioBusBuffers {
+    /// An inactive bus with no channels.
+    pub const fn empty() -> Self {
+        Self {
+            channels: [std::ptr::null_mut(); skuiz_core::bus::MAX_BUS_CHANNELS],
+            channel_count: 0,
+            active: 0,
+        }
+    }
+}
+
+impl Default for SkuizAudioBusBuffers {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// The declared buses in one direction (`0` = input, anything else =
+/// output), in declaration order.
+#[doc(hidden)]
+pub fn bus_spec<P: Processor>(direction: u8, index: u32) -> Option<&'static AudioBusSpec> {
+    let dir = if direction == 0 {
+        BusDirection::Input
+    } else {
+        BusDirection::Output
+    };
+    P::audio_buses()
+        .iter()
+        .filter(move |s| s.direction == dir)
+        .nth(index as usize)
+}
+
+/// NUL-terminated bus name for the C side, or null for an empty name.
+///
+/// Bus names are `&'static str`, so the leaked `CString` is a one-time,
+/// bounded cost keyed by the string's address.
+pub fn bus_name_ptr(name: &'static str) -> *const c_char {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    if name.is_empty() {
+        return std::ptr::null();
+    }
+    static NAMES: OnceLock<CStrCache<usize>> = OnceLock::new();
+    let map = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let key = name.as_ptr() as usize;
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(found) = map.get(&key) {
+        return found.as_ptr();
+    }
+    let owned: &'static CStr = Box::leak(
+        std::ffi::CString::new(name)
+            .unwrap_or_default()
+            .into_boxed_c_str(),
+    );
+    map.insert(key, owned);
+    owned.as_ptr()
 }
 
 /// The live plugin instance behind the opaque pointer the shim holds.
@@ -229,8 +320,11 @@ pub unsafe fn optional_path(path: *const c_char) -> Option<PathBuf> {
 /// void     skuiz_auv3_destroy(void *inst);
 /// void     skuiz_auv3_activate(void *inst, double sample_rate, uint32_t max_frames);
 /// void     skuiz_auv3_deactivate(void *inst);
-/// void     skuiz_auv3_render(void *inst, float *const *channels,
-///                            uint32_t channel_count, uint32_t frames);
+/// uint32_t skuiz_auv3_audio_bus_count(uint8_t direction); // 0 = input, 1 = output
+/// bool     skuiz_auv3_audio_bus_info(uint8_t direction, uint32_t index,
+///                                    SkuizAudioBusInfo *out);
+/// void     skuiz_auv3_render(void *inst, const SkuizAudioBusBuffers *inputs,
+///                            const SkuizAudioBusBuffers *outputs, uint32_t frames);
 /// uint32_t skuiz_auv3_param_count(void);
 /// bool     skuiz_auv3_param_info(uint32_t index, SkuizParamInfo *out);
 /// const char *skuiz_auv3_choice_label(uint32_t param_id, uint32_t choice_index);
@@ -319,15 +413,68 @@ macro_rules! export_auv3 {
                 )
             }
 
+            /// Number of declared buses in a direction (0 = input, 1 =
+            /// output). The shim queries this at init to build its
+            /// `AUAudioUnitBusArray`s.
+            #[no_mangle]
+            pub unsafe extern "C" fn skuiz_auv3_audio_bus_count(direction: u8) -> u32 {
+                $crate::ffi_guard(
+                    || {
+                        let mut count = 0u32;
+                        while $crate::bus_spec::<$P>(direction, count).is_some() {
+                            count += 1;
+                        }
+                        count
+                    },
+                    0,
+                )
+            }
+
+            /// Static description of one declared bus. Returns false for an
+            /// out-of-range index.
+            #[no_mangle]
+            pub unsafe extern "C" fn skuiz_auv3_audio_bus_info(
+                direction: u8,
+                index: u32,
+                out: *mut $crate::SkuizAudioBusInfo,
+            ) -> bool {
+                $crate::ffi_guard(
+                    || {
+                        let Some(spec) = $crate::bus_spec::<$P>(direction, index) else {
+                            return false;
+                        };
+                        let Some(out) = out.as_mut() else { return false };
+                        out.channel_count = spec.layout.channels() as u32;
+                        out.optional = spec.optional as u8;
+                        out.name = $crate::bus_name_ptr(spec.name);
+                        true
+                    },
+                    false,
+                )
+            }
+
+            /// Render one block (or one automation segment — the shim splits
+            /// blocks at timed parameter events and offsets the pointers).
+            ///
+            /// `inputs`/`outputs` each point at
+            /// [`MAX_BUSES_PER_DIRECTION`](skuiz_core::bus::MAX_BUSES_PER_DIRECTION)
+            /// entries in declaration order; either may be null when the
+            /// direction has no buses this block. The main input aliases the
+            /// main output — the shim already pulled the upstream audio into
+            /// the output buffers, which is the copy-in.
             #[no_mangle]
             pub unsafe extern "C" fn skuiz_auv3_render(
                 ptr: *mut ::std::ffi::c_void,
-                channels: *const *mut f32,
-                channel_count: u32,
+                inputs: *const $crate::SkuizAudioBusBuffers,
+                outputs: *const $crate::SkuizAudioBusBuffers,
                 frames: u32,
             ) {
                 $crate::ffi_guard(
                     || {
+                        use $crate::skuiz_core::bus::{
+                            BusDirection, MAX_BUS_CHANNELS, MAX_BUSES_PER_DIRECTION,
+                        };
+
                         let Some(i) = inst(ptr) else { return };
                         // AUv3 has no start/stop_processing pair, so the
                         // audio state brackets each render call: claimed
@@ -345,22 +492,99 @@ macro_rules! export_auv3 {
                         };
                         i.engine.drain_commands(core);
 
-                        let n_ch = (channel_count as usize).min(2);
-                        let mut chans: [&mut [f32]; 2] = [&mut [], &mut []];
-                        let mut used = 0;
-                        if !channels.is_null() && frames > 0 {
-                            for c in 0..n_ch {
-                                let p = *channels.add(c);
+                        // The validated declaration the scratch was sized
+                        // from; a `&'static` copy, so no borrow of `core`.
+                        let specs = core.bus_scratch.specs();
+                        let len = frames as usize;
+                        let scratch = &mut core.bus_scratch;
+                        scratch.clear();
+
+                        // Outputs: each declared bus maps to the shim's slot
+                        // of the same index (today only bus 0 is wired; AUv3
+                        // hands the unit one output buffer list per render).
+                        // The main bus's pointers are remembered for the
+                        // main-input alias below.
+                        let mut main_out: [*mut f32; MAX_BUS_CHANNELS] =
+                            [::std::ptr::null_mut(); MAX_BUS_CHANNELS];
+                        let mut main_out_n = 0usize;
+                        if !outputs.is_null() && frames > 0 {
+                            for (b, spec) in specs
+                                .iter()
+                                .filter(|s| s.direction == BusDirection::Output)
+                                .enumerate()
+                                .take(MAX_BUSES_PER_DIRECTION)
+                            {
+                                let bus = &*outputs.add(b);
+                                if bus.active == 0 {
+                                    continue;
+                                }
+                                let n = (bus.channel_count as usize)
+                                    .min(spec.layout.channels() as usize);
+                                if n == 0 {
+                                    continue;
+                                }
+                                scratch.set_active(BusDirection::Output, b, true);
+                                for (c, &p) in
+                                    bus.channels.iter().enumerate().take(n)
+                                {
+                                    if p.is_null() {
+                                        break;
+                                    }
+                                    scratch.set_channel(BusDirection::Output, b, c, p, len);
+                                    if b == 0 {
+                                        main_out[c] = p;
+                                        main_out_n = c + 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Inputs: the main bus aliases the main output (the
+                        // pull already landed there); any further declared
+                        // input is a read-only sidechain, active only when
+                        // the host connected it — absence is not an error.
+                        for (b, spec) in specs
+                            .iter()
+                            .filter(|s| s.direction == BusDirection::Input)
+                            .enumerate()
+                            .take(MAX_BUSES_PER_DIRECTION)
+                        {
+                            if b == 0 {
+                                if main_out_n == 0 {
+                                    continue;
+                                }
+                                scratch.set_active(BusDirection::Input, 0, true);
+                                for (c, &p) in
+                                    main_out.iter().enumerate().take(main_out_n)
+                                {
+                                    scratch.set_channel(BusDirection::Input, 0, c, p, len);
+                                }
+                                continue;
+                            }
+                            if inputs.is_null() || frames == 0 {
+                                continue;
+                            }
+                            let bus = &*inputs.add(b);
+                            if bus.active == 0 {
+                                continue;
+                            }
+                            let n = (bus.channel_count as usize)
+                                .min(spec.layout.channels() as usize);
+                            if n == 0 {
+                                continue;
+                            }
+                            scratch.set_active(BusDirection::Input, b, true);
+                            for (c, &p) in bus.channels.iter().enumerate().take(n) {
                                 if p.is_null() {
                                     break;
                                 }
-                                chans[c] = ::std::slice::from_raw_parts_mut(p, frames as usize);
-                                used += 1;
+                                scratch.set_channel(BusDirection::Input, b, c, p, len);
                             }
                         }
 
                         core.midi_out.clear();
-                        core.processor.process(&mut chans[..used], &mut core.midi_out);
+                        let (inputs, mut outputs) = scratch.views();
+                        core.processor.process(&inputs, &mut outputs, &mut core.midi_out);
                         i.engine.diag().midi_events_dropped.fetch_add(
                             core.midi_out.dropped() as u64,
                             ::std::sync::atomic::Ordering::Relaxed,

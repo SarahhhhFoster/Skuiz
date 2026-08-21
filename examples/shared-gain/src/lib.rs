@@ -3,7 +3,7 @@
 //! A plain stereo gain, plus the webview UI and the IPC-shared parameter
 //! this example exists to demonstrate.
 
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
 
 const P_GAIN: u32 = 0;
 
@@ -62,11 +62,16 @@ impl Processor for SharedGain {
         (320, 120)
     }
 
-    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
         // No gain ramping: slider drags click. Deliberate for brevity —
-        // see solid-synth for the smoothing pattern.
+        // see solid-synth for the smoothing pattern. The adapter already
+        // copied the input into the output buffers (the main pair may
+        // alias), so scaling the outputs in place is the whole effect.
         let g = self.gain as f32;
-        for ch in channels.iter_mut() {
+        let Some(main) = outputs.main() else {
+            return;
+        };
+        for ch in main.channels() {
             for s in ch.iter_mut() {
                 *s *= g;
             }

@@ -8,7 +8,7 @@
 //! Solid and solid-knobs are vendored as prebuilt bundles (see
 //! `src/vendor/`), so building this needs cargo and no JavaScript toolchain.
 
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
 
 const P_FREQ: u32 = 0;
 const P_WAVE: u32 = 1;
@@ -157,7 +157,16 @@ impl Processor for SolidSynth {
         }
     }
 
-    fn process(&mut self, channels: &mut [&mut [f32]], _midi: &mut MidiOut) {
+    fn audio_buses() -> &'static [skuiz_core::AudioBusSpec] {
+        // An instrument: stereo main out, no inputs.
+        skuiz_core::bus::INSTRUMENT_BUSES
+    }
+
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+        let Some(main) = outputs.main() else {
+            return;
+        };
+        let channels = main.channels();
         let Some(frames) = channels.first().map(|c| c.len()) else {
             return;
         };
@@ -219,9 +228,23 @@ mod tests {
 
     fn render(synth: &mut SolidSynth, frames: usize) -> Vec<f32> {
         let mut buf = vec![0.0f32; frames];
-        let mut chans: [&mut [f32]; 1] = [&mut buf];
+        let mut scratch = skuiz_core::bus::TopologyScratch::new(SolidSynth::audio_buses());
+        scratch.clear();
+        scratch.set_active(skuiz_core::BusDirection::Output, 0, true);
+        // SAFETY: `buf` outlives the views; the view borrow ends before
+        // `buf` is read back.
+        unsafe {
+            scratch.set_channel(
+                skuiz_core::BusDirection::Output,
+                0,
+                0,
+                buf.as_mut_ptr(),
+                frames,
+            );
+        }
+        let (inputs, mut outputs) = scratch.views();
         let mut midi = MidiOut::with_capacity(4);
-        synth.process(&mut chans, &mut midi);
+        synth.process(&inputs, &mut outputs, &mut midi);
         buf
     }
 

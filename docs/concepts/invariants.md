@@ -14,8 +14,8 @@ breaks it; the fix is scheduled P0/P1 work).
 No other thread may call into the processor while a block is rendering.
 Ownership is structural — the processor lives in audio-side state that
 only the audio-side entry points can reach (`process`, the CLAP
-`params_flush`, between-block state-op servicing, and the `MidiOut`
-accessor) — not mutual exclusion.
+`params_flush`, between-block state-op servicing, the `MidiOut`
+accessor, and the bus-view scaffolding) — not mutual exclusion.
 
 - **Enforced by:** `Engine`'s three-state access machine
   (`crates/skuiz-core/src/engine.rs`): the processor lives behind an
@@ -52,7 +52,10 @@ preallocated and fixed-capacity.
 - **Enforced by:** `MidiOut::with_capacity` (never reallocates —
   tested), preallocated param-event staging, bounded command queues
   allocated at instance setup, and state-payload buffers recycled back
-  to the main thread so the audio thread never frees them.
+  to the main thread so the audio thread never frees them. The bus
+  scaffolding (`TopologyScratch`) is sized from the declared topology at
+  engine construction; per block the adapter only rewrites raw pointers
+  and the views are built on the stack.
 - **Status: held, with one documented exception.** While the transport
   runs, host-initiated `save_state`/`load_state` must execute where the
   processor lives — the audio thread, between blocks — and the plugin's

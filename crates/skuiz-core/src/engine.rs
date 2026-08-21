@@ -64,6 +64,12 @@ pub struct AudioCore<P: Processor> {
     pub processor: P,
     /// MIDI scratch for the current block, preallocated.
     pub midi_out: MidiOut,
+    /// Bus scaffolding for the current block: adapters repoint it at the
+    /// host's buffers at the top of each block, then build stack views via
+    /// [`crate::bus::TopologyScratch::views`]. Sized from `P::audio_buses()`
+    /// at engine
+    /// construction; never allocates on the audio thread.
+    pub bus_scratch: crate::bus::TopologyScratch,
     cmd_rx: CommandConsumer,
     state_cmd_rx: Consumer<StateCommand>,
     state_tx: Producer<StateResponse>,
@@ -177,6 +183,11 @@ impl<P: Processor + Default> Engine<P> {
     /// handle's `Weak` points at. Main thread (instance setup). The mirror
     /// starts at the processor's initial values.
     pub fn new(midi_capacity: usize) -> Arc<Self> {
+        debug_assert!(
+            crate::bus::validate_buses(P::audio_buses()).is_ok(),
+            "invalid bus topology: {:?}",
+            crate::bus::validate_buses(P::audio_buses())
+        );
         let processor = P::default();
         let mirror = ParamMirror::new(P::params(), |id| processor.get_param(id));
         // Seed the latency cache at construction: hosts may query latency
@@ -190,6 +201,7 @@ impl<P: Processor + Default> Engine<P> {
             core: UnsafeCell::new(AudioCore {
                 processor,
                 midi_out: MidiOut::with_capacity(midi_capacity),
+                bus_scratch: crate::bus::TopologyScratch::new(P::audio_buses()),
                 cmd_rx,
                 state_cmd_rx,
                 state_tx,
@@ -596,7 +608,7 @@ impl<P: Processor> Engine<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParamDef, PluginInfo};
+    use crate::{AudioInputs, AudioOutputs, ParamDef, PluginInfo};
 
     struct Gain(f64);
     impl Default for Gain {
@@ -631,7 +643,13 @@ mod tests {
         fn get_param(&self, _id: u32) -> f64 {
             self.0
         }
-        fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut MidiOut) {}
+        fn process(
+            &mut self,
+            _inputs: &AudioInputs,
+            _outputs: &mut AudioOutputs,
+            _midi: &mut MidiOut,
+        ) {
+        }
     }
 
     #[test]
@@ -1024,7 +1042,13 @@ mod tests {
         fn latency(&self) -> u32 {
             self.0
         }
-        fn process(&mut self, _channels: &mut [&mut [f32]], _midi: &mut MidiOut) {}
+        fn process(
+            &mut self,
+            _inputs: &AudioInputs,
+            _outputs: &mut AudioOutputs,
+            _midi: &mut MidiOut,
+        ) {
+        }
     }
 
     #[test]
