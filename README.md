@@ -178,6 +178,17 @@ To start your own plugin, scaffold from an example and install it:
 cd my-gain && ./install.sh       # build + install to your user CLAP dir
 ```
 
+To ship one, `skuiz-package` builds the project and packages everything it
+finds — plugin bundles plus the standalone app — for the host OS:
+
+```sh
+cargo run -p skuiz-package -- path/to/my-gain            # all host-buildable formats
+cargo run -p skuiz-package -- my-gain --dmg --vst3       # select formats
+```
+
+See [docs/guides/packaging.md](docs/guides/packaging.md#shipping-skuiz-package)
+for the flag list and per-OS tool requirements.
+
 ## Standalone
 
 Any processor runs as a desktop app — window, webview editor, audio device

@@ -2265,6 +2265,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "skuiz-package"
+version = "0.1.0"
+
+[[package]]
 name = "skuiz-standalone"
 version = "0.1.0"
 dependencies = [

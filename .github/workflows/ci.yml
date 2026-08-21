@@ -69,6 +69,7 @@ jobs:
           set -e
           for c in skuiz-core skuiz-midi skuiz-dsp skuiz-ui \
                    skuiz-clap skuiz-vst3 skuiz-auv3 skuiz-standalone \
+                   skuiz-package \
                    shared-gain trigger-note solid-synth pd-tremolo \
                    ducking-compressor; do
             echo "=== $c ==="

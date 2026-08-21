@@ -85,6 +85,42 @@ No packaging: `cargo run -p my-plugin --bin my-plugin-standalone`, or
 `cargo build --release` and ship the binary. See
 [standalone](../formats/standalone.md).
 
+## Shipping: skuiz-package
+
+`tools/skuiz-package` is the end-to-end packager: point it at a plugin
+project (an example in this repo or a scaffolded standalone project) and
+it runs the cargo build, assembles the plugin bundles and standalone app,
+validates the CLAP bundle when `clap-validator` is on PATH, and emits any
+selected permutation of `.dmg`, `.AppImage`, and `.exe`:
+
+```sh
+cargo run -p skuiz-package -- path/to/my-gain              # every format the host can build
+cargo run -p skuiz-package -- my-gain --dmg --vst3         # pick formats
+cargo run -p skuiz-package -- my-gain --exe --installer    # Windows: standalone + Inno installer
+cargo run -p skuiz-package -- my-gain --dry-run            # show the resolved plan only
+```
+
+Identity (name, version, bundle id) is derived from the project's
+`Cargo.toml` and `PluginInfo`; override with `--name` / `--version` /
+`--identifier`. Useful flags: `--debug`, `--features a,b`, `--vst3`,
+`--target <triple>`, `--no-standalone`, `--no-plugins`, `--icon`,
+`--out <dir>`, `--appimagetool <path>`, `--iscc <path>`,
+`--skip-validation`. `--help` prints the full list.
+
+Formats are host-bound, because the packaging tools are:
+
+- **.dmg** — macOS only (`hdiutil`). Contains the `.clap` bundle, the
+  `.vst3` bundle (with `--vst3`), the standalone `.app`, and an
+  INSTALL.txt.
+- **.AppImage** — Linux only (`appimagetool` on PATH or via
+  `--appimagetool`). Wraps the standalone app; a project without a
+  `src/bin` binary can't produce one.
+- **.exe** — Windows, or cross-compiled with `--target
+  x86_64-pc-windows-msvc`. The standalone binary as
+  `<name>-<version>-windows.exe`; `--installer` additionally generates an
+  Inno Setup script and compiles it with `iscc` (installs plugins to
+  `%COMMONPROGRAMFILES%\CLAP|VST3`, the app to Program Files).
+
 ## What CI checks
 
 CI runs on pushes to `main` and on pull requests (feature branches are
@@ -96,5 +132,5 @@ commands work locally — see [contributing](../contributing.md).
 
 ## Not covered here
 
-Code signing and notarization for distribution, installer building, and
-AUv3/Xcode packaging (which lives in `crates/skuiz-auv3/scaffold/`).
+Code signing and notarization for distribution, and AUv3/Xcode packaging
+(which lives in `crates/skuiz-auv3/scaffold/`).
