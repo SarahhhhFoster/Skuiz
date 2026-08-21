@@ -51,26 +51,36 @@ pub fn package_appimage(
         None => std::fs::write(&icon, DEFAULT_ICON).map_err(|e| e.to_string())?,
     }
     // AppRun is the entry point: a relative symlink to the binary.
-    std::os::unix::fs::symlink(format!("usr/bin/{bin}"), appdir.join("AppRun"))
-        .map_err(|e| format!("cannot create AppRun symlink: {e}"))?;
+    // (The plan gates AppImage to Linux; the cfg keeps the crate
+    // compiling on Windows.)
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(format!("usr/bin/{bin}"), appdir.join("AppRun"))
+            .map_err(|e| format!("cannot create AppRun symlink: {e}"))?;
 
-    let tool = util::tool(
-        &cfg.appimagetool,
-        "appimagetool",
-        "get it from https://appimage.github.io/appimagetool/",
-    )?;
-    let image = out.join(format!(
-        "{}-{}-linux.AppImage",
-        meta.crate_name, meta.version
-    ));
-    util::run(
-        &tool.to_string_lossy(),
-        &[
-            appdir.to_string_lossy().into_owned(),
-            image.to_string_lossy().into_owned(),
-        ],
-    )?;
-    Ok(image)
+        let tool = util::tool(
+            &cfg.appimagetool,
+            "appimagetool",
+            "get it from https://appimage.github.io/appimagetool/",
+        )?;
+        let image = out.join(format!(
+            "{}-{}-linux.AppImage",
+            meta.crate_name, meta.version
+        ));
+        util::run(
+            &tool.to_string_lossy(),
+            &[
+                appdir.to_string_lossy().into_owned(),
+                image.to_string_lossy().into_owned(),
+            ],
+        )?;
+        Ok(image)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cfg, meta, out);
+        Err("AppImage requires a Unix host".into())
+    }
 }
 
 #[cfg(test)]
