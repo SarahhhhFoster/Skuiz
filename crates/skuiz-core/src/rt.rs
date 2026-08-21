@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 /// their own queue ([`StateCommand`]) so a flood of parameter moves cannot
 /// delay a state op, and a heavyweight state op cannot extend the drain of
 /// ordinary commands.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Command {
     /// Apply a parameter change at the top of the next block.
     SetParam {

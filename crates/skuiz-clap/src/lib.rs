@@ -199,10 +199,12 @@ pub fn ffi_guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(fallback)
 }
 
-unsafe fn apply_param_events<P: Processor>(
-    proc_: &mut P,
+/// Walk a host input event list, invoking `f` for every well-formed
+/// PARAM_VALUE event naming a declared parameter. Shared by the flush paths
+/// and by process()'s untimed application.
+unsafe fn for_each_param_event<P: Processor>(
     list: *const clap_input_events,
-    mirror: &skuiz_core::rt::ParamMirror,
+    mut f: impl FnMut(u32, f64),
 ) {
     let Some(l) = list.as_ref() else { return };
     let (Some(size), Some(get)) = (l.size, l.get) else {
@@ -222,14 +224,23 @@ unsafe fn apply_param_events<P: Processor>(
         {
             let ev = &*(hdr as *const clap_event_param_value);
             if P::params().iter().any(|p| p.id == ev.param_id) {
-                proc_.set_param(ev.param_id, ev.value);
-                // Publish the readback, not the request: processors may
-                // round or clamp, and the mirror must hold the value
-                // actually in force.
-                mirror.publish(ev.param_id, proc_.get_param(ev.param_id));
+                f(ev.param_id, ev.value);
             }
         }
     }
+}
+
+unsafe fn apply_param_events<P: Processor>(
+    proc_: &mut P,
+    list: *const clap_input_events,
+    mirror: &skuiz_core::rt::ParamMirror,
+) {
+    for_each_param_event::<P>(list, |id, value| {
+        proc_.set_param(id, value);
+        // Publish the readback, not the request: processors may round or
+        // clamp, and the mirror must hold the value actually in force.
+        mirror.publish(id, proc_.get_param(id));
+    });
 }
 
 /// Collect the block's timed parameter events into `out` (pre-allocated,
@@ -415,18 +426,19 @@ impl<P: Processor> Vt<P> {
                 }
                 if proto::parse_sync_request(msg).is_some() {
                     // A late joiner asked for shared state; answer with the
-                    // parameters we hold a version for — i.e. ones that were
-                    // actually edited over the bus. Never-edited parameters
-                    // are omitted: their value may be host automation, which
-                    // is per-instance (invariant 10). Every instance answers
-                    // — LWW makes duplicates safe.
+                    // parameters we hold a *fresh* version for — ones edited
+                    // over the bus and not rewritten by a project load
+                    // since. Never-edited and post-load parameters are
+                    // omitted: their value is host automation or project
+                    // state, which is per-instance (invariant 10). Every
+                    // instance answers — LWW makes duplicates safe.
                     let entries: Vec<(u32, f64, u64, u64)> = handle
                         .snapshot_params()
                         .into_iter()
                         .filter(|(id, _)| skuiz_core::syncs_over_bus::<P>(*id))
                         .filter_map(|(id, value)| {
                             lww_cb
-                                .known_version(id)
+                                .advertised_version(id)
                                 .map(|(seq, origin)| (id, value, seq, origin))
                         })
                         .collect();
@@ -519,9 +531,14 @@ impl<P: Processor> Vt<P> {
         })
     }
 
-    // ponytail: no-op. Processor has no reset hook, so there is nothing to
-    // forward; DSP that must clear state between runs does it in activate.
-    unsafe extern "C" fn reset(_plugin: *const clap_plugin) {}
+    /// `clap_plugin.reset`: main thread, transport running or stopped.
+    /// `Engine::reset` covers both — direct when stopped, queued for the top
+    /// of the next block when running, so DSP state clears between blocks.
+    unsafe extern "C" fn reset(plugin: *const clap_plugin) {
+        ffi_guard((), || {
+            inst::<P>(plugin).engine.reset();
+        })
+    }
 
     /// Requested via `clap_host::request_callback` after remote (IPC) param
     /// changes landed: tell the host, refresh the editor. Also where a
@@ -946,6 +963,12 @@ impl<P: Processor> Vt<P> {
         })
     }
 
+    /// `clap_plugin_params.flush`: the spec threads this as [audio-thread
+    /// when processing, main-thread otherwise], which is exactly the
+    /// dispatch below. Flush events are untimed — "apply these now" — so
+    /// they apply in list order, last write wins; sample-accurate timed
+    /// delivery stays `process()`'s job. Both paths publish the processor's
+    /// readback to the mirror, same as the sample-accurate path.
     unsafe extern "C" fn params_flush(
         plugin: *const clap_plugin,
         in_events: *const clap_input_events,
@@ -959,9 +982,18 @@ impl<P: Processor> Vt<P> {
                 let token = inst.audio_token.borrow();
                 let core = engine.audio_core(token.as_ref().expect("AUDIO implies a token"));
                 apply_param_events::<P>(&mut core.processor, in_events, engine.mirror());
-            } else {
-                engine.with_main(|core| {
+            } else if engine
+                .with_main(|core| {
                     apply_param_events::<P>(&mut core.processor, in_events, engine.mirror())
+                })
+                .is_none()
+            {
+                // The stopped main state is contended (a state op in
+                // flight): route each event through the engine instead of
+                // dropping it silently — set_param applies synchronously on
+                // a stopped engine, or counts the drop (invariant 8).
+                for_each_param_event::<P>(in_events, |id, value| {
+                    engine.set_param(id, value);
                 });
             }
         })
@@ -1278,6 +1310,10 @@ impl<P: Processor> Vt<P> {
             if !inst.engine.load_state(data) {
                 return false;
             }
+            // Project state replaced the parameter values without versions:
+            // stop advertising them to the bus until a shared edit lands
+            // (invariant 10).
+            inst.lww.on_state_load();
             // Loading changed parameter values; the host must be told to rescan.
             Self::host_rescan_params(inst.host);
             true

@@ -246,9 +246,10 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
         }
         if proto::parse_sync_request(msg).is_some() {
             // A late joiner asked for shared state; answer from the mirror
-            // (wait-free, invariant 6) with the parameters we hold a version
-            // for — ones actually edited over the bus. Never-edited
-            // parameters are omitted: their value may be host automation,
+            // (wait-free, invariant 6) with the parameters we hold a *fresh*
+            // version for — ones edited over the bus and not rewritten by a
+            // project load since. Never-edited and post-load parameters are
+            // omitted: their value is host automation or project state,
             // which is per-instance (invariant 10). LWW makes duplicate
             // answers safe.
             let entries: Vec<(u32, f64, u64, u64)> = bus_engine
@@ -258,7 +259,7 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                 .filter(|(id, _)| skuiz_core::syncs_over_bus::<P>(*id))
                 .filter_map(|(id, value)| {
                     lww_cb
-                        .known_version(id)
+                        .advertised_version(id)
                         .map(|(seq, origin)| (id, value, seq, origin))
                 })
                 .collect();
