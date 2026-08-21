@@ -69,7 +69,8 @@ jobs:
           set -e
           for c in skuiz-core skuiz-midi skuiz-dsp skuiz-ui \
                    skuiz-clap skuiz-vst3 skuiz-auv3 skuiz-standalone \
-                   shared-gain trigger-note solid-synth pd-tremolo; do
+                   shared-gain trigger-note solid-synth pd-tremolo \
+                   ducking-compressor; do
             echo "=== $c ==="
             cargo test -p "$c"
           done
@@ -126,7 +127,7 @@ jobs:
       - name: Validate example plugins
         run: |
           set -eu
-          for example in shared-gain trigger-note solid-synth pd-tremolo; do
+          for example in shared-gain trigger-note solid-synth pd-tremolo ducking-compressor; do
             ./examples/$example/bundle.sh
             clap-validator validate "target/$example.clap"
           done

@@ -74,6 +74,8 @@ cargo build                            # skuiz-vst3 is a default member
   patch (libpd, opt-in feature)
 - `examples/solid-synth` — SolidJS editor driving a Rust oscillator; the
   quickest way to hear the stack work
+- `examples/ducking-compressor` — rudimentary ducking compressor driven by
+  an optional sidechain bus; the declarative bus-topology showcase
 
 ## Instance sync
 

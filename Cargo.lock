@@ -565,6 +565,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ducking-compressor"
+version = "0.1.0"
+dependencies = [
+ "skuiz-clap",
+ "skuiz-core",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

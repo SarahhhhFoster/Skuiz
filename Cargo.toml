@@ -14,6 +14,7 @@ members = [
     "examples/trigger-note",
     "examples/solid-synth",
     "examples/pd-tremolo",
+    "examples/ducking-compressor",
 ]
 
 # Every member is a default member: the reason skuiz-vst3 was excluded
@@ -33,6 +34,7 @@ default-members = [
     "examples/trigger-note",
     "examples/solid-synth",
     "examples/pd-tremolo",
+    "examples/ducking-compressor",
 ]
 
 [workspace.package]
