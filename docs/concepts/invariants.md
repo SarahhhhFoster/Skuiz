@@ -149,15 +149,22 @@ convergence but must never prevent it.
   the identical version re-delivered later still wins; and because the
   lock serializes apply order with version order, concurrent updates
   can never leave the engine holding a stale value under a fresh
-  version.
+  version. The engine side of the guarantee (`Engine::set_param`): a
+  *stopped* engine never reports success for a change it only queued —
+  the queue moves only while blocks flow, so a stopped-but-contended
+  change is retried briefly and then refused, never parked unseen.
+  Queued work also stays ordered ahead of direct work: every main-thread
+  access drains the queues first, so a change queued in a stop/start
+  race heals at the next access instead of stalling until the next run.
 - **Status: held.** Stale or reordered frames lose by version; a late
   joiner converges from the snapshot exchange; server death mid-stream
   is survived (traffic resumes after re-election, tested cross-process
   in `crates/skuiz-ipc/src/lib.rs`). The full-queue regression —
-  dropped frame, no mark, re-delivery heals — is tested in
-  `crates/skuiz-core/src/engine.rs`. Legacy unversioned frames still
-  apply but never displace versioned state permanently — the next sync
-  round heals them.
+  dropped frame, no mark, re-delivery heals — and the stopped-state
+  regression — contended change refused, nothing claimed, mirror
+  untouched — are tested in `crates/skuiz-core/src/engine.rs`. Legacy
+  unversioned frames still apply but never displace versioned state
+  permanently — the next sync round heals them.
 
 ## 10. Host automation and shared-state synchronization have explicitly defined semantics and are not accidentally conflated
 
@@ -168,10 +175,25 @@ cross-instance, block-timed, and restricted to parameters declared
 - **Enforced by:** `ParamDef::shared` — only editor-originated changes
   to shared parameters publish to the bus, and receivers ignore frames
   naming local parameters; host automation and project state loads
-  never cross the bus.
-- **Status: held.** `shared` is a declared property of every parameter,
-  all four adapters filter both broadcast and receive through it, and a
-  test proves local parameters ignore bus frames.
+  never cross the bus. For sync answers specifically, `Lww` tracks
+  per-parameter *freshness*: a parameter is advertised only while the
+  value in force is the one its recorded version refers to. A
+  `load_state` stales every record (`Lww::on_state_load`) — the
+  win/lose memory is kept so stale frames still lose, but the loaded
+  values stay local until a shared edit lands after the load and
+  re-claims the parameter.
+- **Status: held, with one documented gap.** `shared` is a declared
+  property of every parameter, all four adapters filter both broadcast
+  and receive through it, tests prove local parameters ignore bus
+  frames, and a project load's values no longer leak through
+  `sync_state` under a stale version
+  (`crates/skuiz-clap/tests/ipc_sync.rs`). The gap: while the transport
+  runs, *host automation* moves the mirror without touching the LWW
+  record, so a `sync_state` answer in that window can still pair an
+  automation value with the last bus version. Closing it needs an
+  RT-safe taint flag in `ParamMirror`; until then the bound is that
+  only instances whose record is older than that version will accept
+  the value.
 
 ## Changing an invariant
 

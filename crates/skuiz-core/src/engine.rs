@@ -160,6 +160,11 @@ pub struct Engine<P: Processor> {
     /// the host (CLAP `clap_host_latency.changed`, VST3
     /// `kLatencyChanged`).
     latency_changed: std::sync::atomic::AtomicBool,
+    /// A main-thread access drains commands the audio thread left behind
+    /// (`with_main`); if that drain applied remote changes, the host rescan
+    /// / editor refresh bounce is deferred to the next block's report here
+    /// rather than dropped.
+    notify_pending: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: `core` is touched only by the thread holding the access state
@@ -198,6 +203,7 @@ impl<P: Processor + Default> Engine<P> {
             buffers: RefCell::new(Vec::new()),
             latency: std::sync::atomic::AtomicU32::new(initial_latency),
             latency_changed: std::sync::atomic::AtomicBool::new(false),
+            notify_pending: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -271,6 +277,12 @@ impl<P: Processor> Engine<P> {
     /// Run `f` with direct processor access, but only if the transport is
     /// stopped. Returns `None` while blocks are flowing — the caller falls
     /// back to the command queue. Main thread.
+    ///
+    /// The access first drains whatever the audio thread left in the queues:
+    /// a command pushed during a stop/start race must not stall until the
+    /// next run, and queued work stays ordered ahead of the direct work `f`
+    /// is about to do. A drain that applied remote changes defers the
+    /// host/editor bounce to the next block's report via `notify_pending`.
     pub fn with_main<R>(&self, f: impl FnOnce(&mut AudioCore<P>) -> R) -> Option<R> {
         if self
             .access
@@ -292,6 +304,9 @@ impl<P: Processor> Engine<P> {
         // AUDIO concurrently (CAS above), and hosts do not call
         // start_processing concurrently with main-thread callbacks.
         let core = unsafe { &mut *self.core.get() };
+        if self.drain_commands(core).notify_main {
+            self.notify_pending.store(true, Ordering::Release);
+        }
         Some(f(core))
     }
 
@@ -302,31 +317,62 @@ impl<P: Processor> Engine<P> {
     /// Main or bus thread; realtime-safe by construction (never locks the
     /// processor).
     ///
-    /// Returns `false` when the change went nowhere (command queue full;
+    /// Returns `false` when the change went nowhere (command queue full, or
+    /// a stopped engine's main state stayed contended past the retry budget;
     /// counted via `commands_dropped`). Callers tracking versions (LWW)
     /// must only record a change that returned `true` — otherwise the
     /// version is marked accepted for a value that never landed, and
     /// convergence breaks (invariant 9).
     pub fn set_param(&self, id: u32, value: f64) -> bool {
-        let applied = self.with_main(|core| {
-            core.processor.set_param(id, value);
-            // Publish the readback, not the request: processors may round
-            // or clamp, and the mirror must reflect the value actually in
-            // force (hosts diff it against serialized state).
-            core.processor.get_param(id)
-        });
-        match applied {
-            Some(actual) => {
-                self.mirror.publish(id, actual);
-                true
-            }
-            None => match self.cmd_tx.push(Command::SetParam { id, value }) {
-                Ok(()) => true,
-                Err(_) => {
-                    DiagCounters::bump(&self.diag.commands_dropped);
-                    false
-                }
+        self.run_or_queue(
+            |engine| {
+                engine.with_main(|core| {
+                    core.processor.set_param(id, value);
+                    // Publish the readback, not the request: processors may
+                    // round or clamp, and the mirror must reflect the value
+                    // actually in force (hosts diff it against serialized
+                    // state).
+                    let actual = core.processor.get_param(id);
+                    engine.mirror.publish(id, actual);
+                })
             },
+            Command::SetParam { id, value },
+        )
+    }
+
+    /// Shared ingress for cheap commands: direct through a main access when
+    /// the transport is stopped, queued for the next block while running.
+    ///
+    /// A stopped engine never reports success for work nobody drained: the
+    /// queue only moves while blocks flow, so a stopped-but-contended main
+    /// state (another main access in flight, e.g. a slow state load) gets a
+    /// short bounded retry, and past that the change is counted and refused.
+    /// Reporting success for a parked command would let a caller claim an
+    /// LWW version for a value the mirror does not hold, splitting the
+    /// instance from its peers (invariant 9).
+    fn run_or_queue(&self, direct: impl Fn(&Self) -> Option<()>, cmd: Command) -> bool {
+        if direct(self).is_some() {
+            return true;
+        }
+        let deadline = Instant::now() + Duration::from_millis(1);
+        loop {
+            if self.is_processing() {
+                return match self.cmd_tx.push(cmd) {
+                    Ok(()) => true,
+                    Err(_) => {
+                        DiagCounters::bump(&self.diag.commands_dropped);
+                        false
+                    }
+                };
+            }
+            if direct(self).is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                DiagCounters::bump(&self.diag.commands_dropped);
+                return false;
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -418,19 +464,12 @@ impl<P: Processor> Engine<P> {
     /// Reset DSP state (`Processor::reset`). Main thread. Direct when
     /// stopped; queued for the top of the next block when running, so the
     /// reset lands between blocks rather than mid-buffer. Returns `false`
-    /// when the command queue was full (counted via `commands_dropped`).
+    /// when the command went nowhere (same contract as `set_param`).
     pub fn reset(&self) -> bool {
-        let applied = self.with_main(|core| core.processor.reset());
-        match applied {
-            Some(()) => true,
-            None => match self.cmd_tx.push(Command::Reset) {
-                Ok(()) => true,
-                Err(_) => {
-                    DiagCounters::bump(&self.diag.commands_dropped);
-                    false
-                }
-            },
-        }
+        self.run_or_queue(
+            |engine| engine.with_main(|core| core.processor.reset()),
+            Command::Reset,
+        )
     }
 
     /// The cached latency for the host's query — any thread, wait-free.
@@ -477,6 +516,12 @@ impl<P: Processor> Engine<P> {
     /// `save_state`).
     pub fn drain_commands(&self, core: &mut AudioCore<P>) -> DrainReport {
         let mut report = DrainReport::default();
+        // A main-thread access may have drained remote changes while the
+        // transport was stopped (see `with_main`); their host/editor bounce
+        // rides along with the next block's report.
+        if self.notify_pending.swap(false, Ordering::Acquire) {
+            report.notify_main = true;
+        }
         while let Some(cmd) = core.cmd_rx.pop() {
             match cmd {
                 Command::SetParam { id, value } => {
@@ -870,6 +915,90 @@ mod tests {
         });
         audio.join().unwrap();
         assert!(!engine.is_processing());
+    }
+
+    /// The stopped-state race (invariant 9): while another thread holds a
+    /// main access on a stopped engine, a param change must fail — never
+    /// report success for a value the processor and mirror do not hold, or
+    /// an LWW stamp over it would pair a fresh version with a stale value
+    /// and split the bus.
+    #[test]
+    fn stopped_contended_set_param_fails_and_claims_nothing() {
+        use crate::lww::Lww;
+
+        let engine = Engine::<Gain>::new(64);
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = std::thread::spawn({
+            let engine = Arc::clone(&engine);
+            let held = Arc::clone(&held);
+            let release = Arc::clone(&release);
+            move || {
+                engine.with_main(|_core| {
+                    held.store(true, Ordering::Relaxed);
+                    while !release.load(Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !held.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "holder never acquired MAIN");
+            std::thread::yield_now();
+        }
+
+        // Contended past the retry budget: refused, mirror untouched, and
+        // no version can be claimed over the failed apply.
+        assert!(!engine.set_param(7, 0.9));
+        assert_eq!(engine.mirror().get(7), Some(0.5));
+        let lww = Lww::new();
+        assert_eq!(lww.stamp_with(7, || engine.set_param(7, 0.9)), None);
+        assert_eq!(lww.known_version(7), None);
+        assert!(
+            engine.diag().commands_dropped.load(Ordering::Relaxed) >= 2,
+            "both refusals were counted, not silent"
+        );
+
+        release.store(true, Ordering::Relaxed);
+        holder.join().unwrap();
+        // With the access free, the same change applies synchronously.
+        assert!(engine.set_param(7, 0.9));
+        assert_eq!(engine.mirror().get(7), Some(0.9));
+    }
+
+    /// A command queued in the instant before the transport stops must not
+    /// stall until the next run: the next main-thread access drains and
+    /// applies it, ahead of its own direct work, and defers the host/editor
+    /// bounce to the next block rather than dropping it.
+    #[test]
+    fn queued_change_heals_at_the_next_main_access() {
+        let engine = Engine::<Gain>::new(64);
+        let token = engine.begin_audio();
+        assert!(engine.set_param(7, 0.25)); // queued: the engine is running
+        engine.end_audio(token); // stopped before any block drained it
+        assert_eq!(engine.mirror().get(7), Some(0.5), "not applied yet");
+
+        // Any main access heals the queue before doing its own work...
+        engine.with_main(|_| ());
+        assert_eq!(engine.mirror().get(7), Some(0.25));
+
+        // ...and queued work stays ordered ahead of a later direct edit:
+        // the edit below drains 0.75 first, then applies 0.1.
+        let token = engine.begin_audio();
+        assert!(engine.set_param(7, 0.75));
+        engine.end_audio(token);
+        assert!(engine.set_param(7, 0.1));
+        assert_eq!(engine.mirror().get(7), Some(0.1));
+
+        // The drains inside those main accesses deferred their bounce; it
+        // rides the next block's report, exactly once.
+        let token = engine.begin_audio();
+        let report = engine.drain_commands(engine.audio_core(&token));
+        assert!(report.notify_main, "the deferred bounce arrives");
+        let report = engine.drain_commands(engine.audio_core(&token));
+        assert!(!report.notify_main, "consumed once");
+        engine.end_audio(token);
     }
 
     /// A processor whose latency moves at runtime.

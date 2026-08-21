@@ -10,10 +10,29 @@
 //!
 //! This tracker runs on the bus and main/UI threads only; the audio thread
 //! never sees it (the engine's command queue is the boundary).
+//!
+//! One more rule keeps project state off the bus: a `load_state` rewrites
+//! values without versions, so it stales every record's advertisement
+//! ([`Lww::on_state_load`]) — a `sync_state` answer includes a parameter
+//! only while the value in force is the one its version refers to.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+/// Per-parameter record: the last winning version, and whether the value
+/// currently in force is the one that version refers to.
+///
+/// The freshness half is what a `sync_state` answer may advertise. A
+/// project-state load rewrites values without versions, so until a shared
+/// edit lands after the load the instance must not pair its (now
+/// project-owned) value with a stale bus version — a joiner would accept
+/// project state as bus state (invariant 10). The version half is kept
+/// across a load so stale in-flight frames still lose.
+struct Record {
+    version: (u64, u64),
+    fresh: bool,
+}
 
 /// Per-parameter versions plus this instance's identity.
 pub struct Lww {
@@ -23,9 +42,9 @@ pub struct Lww {
     /// Lamport clock: bumped on every local stamp, advanced on every
     /// accepted frame.
     clock: AtomicU64,
-    /// Last accepted `(seq, origin)` per parameter. Mutex'd, but only ever
+    /// Last accepted record per parameter. Mutex'd, but only ever
     /// taken on non-realtime threads (bus callback, editor IPC handler).
-    last: Mutex<HashMap<u32, (u64, u64)>>,
+    last: Mutex<HashMap<u32, Record>>,
 }
 
 impl Default for Lww {
@@ -56,10 +75,13 @@ impl Lww {
     /// Send path: stamp a local change with a fresh version and record it.
     pub fn stamp(&self, id: u32) -> (u64, u64) {
         let seq = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
-        self.last
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, (seq, self.origin));
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            Record {
+                version: (seq, self.origin),
+                fresh: true,
+            },
+        );
         (seq, self.origin)
     }
 
@@ -78,12 +100,18 @@ impl Lww {
             return true;
         };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let wins = match last.get(&id).copied() {
-            Some((lseq, lorigin)) => (seq, origin) > (lseq, lorigin),
+        let wins = match last.get(&id) {
+            Some(record) => (seq, origin) > record.version,
             None => true,
         };
         if wins {
-            last.insert(id, (seq, origin));
+            last.insert(
+                id,
+                Record {
+                    version: (seq, origin),
+                    fresh: true,
+                },
+            );
             // Advance the clock so our next local edit wins against
             // anything we just learned about.
             self.clock.fetch_max(seq, Ordering::Relaxed);
@@ -115,8 +143,8 @@ impl Lww {
             return apply();
         };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let wins = match last.get(&id).copied() {
-            Some((lseq, lorigin)) => (seq, origin) > (lseq, lorigin),
+        let wins = match last.get(&id) {
+            Some(record) => (seq, origin) > record.version,
             None => true,
         };
         if !wins {
@@ -125,7 +153,13 @@ impl Lww {
         if !apply() {
             return false; // not recorded: a later re-delivery can still win
         }
-        last.insert(id, (seq, origin));
+        last.insert(
+            id,
+            Record {
+                version: (seq, origin),
+                fresh: true,
+            },
+        );
         // Advance the clock so our next local edit wins against anything we
         // just learned about.
         self.clock.fetch_max(seq, Ordering::Relaxed);
@@ -145,21 +179,56 @@ impl Lww {
             return None;
         }
         let seq = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
-        last.insert(id, (seq, self.origin));
+        last.insert(
+            id,
+            Record {
+                version: (seq, self.origin),
+                fresh: true,
+            },
+        );
         Some((seq, self.origin))
     }
 
-    /// The recorded version for `id`, if any was ever stamped or accepted.
-    /// `None` means this instance never saw a bus edit for the parameter —
-    /// and a `sync_state` answer must omit such parameters entirely, because
-    /// the current value may have come from host automation, which is
-    /// per-instance and must not propagate to joiners (invariant 10).
+    /// A project-state load rewrote every parameter without a version: all
+    /// records become stale. Win/lose memory is kept (old frames still
+    /// lose), but `advertised_version` goes silent until a shared edit
+    /// lands after the load — the loaded values are project state, and
+    /// project state never crosses the bus (invariant 10).
+    pub fn on_state_load(&self) {
+        for record in self
+            .last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            record.fresh = false;
+        }
+    }
+
+    /// The version a `sync_state` answer may advertise for `id`: the
+    /// recorded version, but only while the value in force is the one that
+    /// version refers to. `None` means omit the parameter from the answer —
+    /// either never bus-edited (the value may be host automation) or
+    /// rewritten by a project load since (invariant 10).
+    pub fn advertised_version(&self, id: u32) -> Option<(u64, u64)> {
+        self.last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .and_then(|record| record.fresh.then_some(record.version))
+    }
+
+    /// The recorded version for `id`, if any was ever stamped or accepted
+    /// — regardless of freshness. `None` means this instance never saw a
+    /// bus edit for the parameter. This is the win/lose memory; for
+    /// `sync_state` answers use [`Lww::advertised_version`], which also
+    /// withholds parameters a project load has rewritten (invariant 10).
     pub fn known_version(&self, id: u32) -> Option<(u64, u64)> {
         self.last
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&id)
-            .copied()
+            .map(|record| record.version)
     }
 }
 
@@ -250,5 +319,41 @@ mod tests {
         assert_eq!(lww.stamp_with(0, || false), None);
         let v2 = lww.stamp_with(0, || true).unwrap();
         assert!(v2 > v);
+    }
+
+    /// A project load silences advertisements without losing win/lose
+    /// memory: loaded values never ride a stale version onto the bus, stale
+    /// frames still lose afterwards, and the next shared edit re-claims the
+    /// parameter (invariant 10).
+    #[test]
+    fn state_load_stales_advertisement_but_keeps_memory() {
+        let lww = Lww::new();
+        let v = lww.stamp_with(0, || true).unwrap();
+        assert_eq!(lww.advertised_version(0), Some(v));
+
+        lww.on_state_load();
+        assert_eq!(
+            lww.advertised_version(0),
+            None,
+            "a loaded value is not advertised"
+        );
+        assert_eq!(lww.known_version(0), Some(v), "win/lose memory kept");
+        assert!(
+            !lww.accept_with(0, Some(v), || panic!("stale frame applied")),
+            "the pre-load version still loses"
+        );
+
+        // A newer bus frame wins and re-freshes the advertisement.
+        let newer = (v.0 + 1, v.1);
+        assert!(lww.accept_with(0, Some(newer), || true));
+        assert_eq!(lww.advertised_version(0), Some(newer));
+
+        // So does a fresh local edit.
+        lww.on_state_load();
+        let v2 = lww.stamp_with(0, || true).unwrap();
+        assert_eq!(lww.advertised_version(0), Some(v2));
+
+        // A never-edited parameter has nothing to advertise either way.
+        assert_eq!(lww.advertised_version(3), None);
     }
 }

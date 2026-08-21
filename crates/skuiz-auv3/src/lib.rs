@@ -161,17 +161,19 @@ impl<P: Processor + Default> AuInstance<P> {
             }
             if proto::parse_sync_request(msg).is_some() {
                 // A late joiner asked for shared state; answer with the
-                // parameters we hold a version for — ones actually edited
-                // over the bus. Never-edited parameters are omitted: their
-                // value may be host automation, which is per-instance
-                // (invariant 10). LWW makes duplicate answers safe.
+                // parameters we hold a *fresh* version for — ones edited
+                // over the bus and not rewritten by a project load since.
+                // Never-edited and post-load parameters are omitted: their
+                // value is host automation or project state, which is
+                // per-instance (invariant 10). LWW makes duplicate answers
+                // safe.
                 let entries: Vec<(u32, f64, u64, u64)> = handle
                     .snapshot_params()
                     .into_iter()
                     .filter(|(id, _)| skuiz_core::syncs_over_bus::<P>(*id))
                     .filter_map(|(id, value)| {
                         lww_cb
-                            .known_version(id)
+                            .advertised_version(id)
                             .map(|(seq, origin)| (id, value, seq, origin))
                     })
                     .collect();
@@ -544,7 +546,14 @@ macro_rules! export_auv3 {
                             return false;
                         }
                         let data = ::std::slice::from_raw_parts(buf, len as usize);
-                        i.engine.load_state(data.to_vec())
+                        let ok = i.engine.load_state(data.to_vec());
+                        if ok {
+                            // Project state replaced the parameter values
+                            // without versions: stop advertising them to the
+                            // bus until a shared edit lands (invariant 10).
+                            i.lww.on_state_load();
+                        }
+                        ok
                     },
                     false,
                 )
