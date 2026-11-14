@@ -959,7 +959,18 @@ impl<P: Processor> Vst3Plugin<P> {
 }
 
 impl<P: Processor + Default> Class for Vst3Plugin<P> {
-    type Interfaces = (IComponent, IAudioProcessor, IEditController);
+    type Interfaces = (
+        IComponent,
+        IAudioProcessor,
+        IEditController,
+        IProcessContextRequirements,
+    );
+}
+
+impl<P: Processor + Default> IProcessContextRequirementsTrait for Vst3Plugin<P> {
+    unsafe fn getProcessContextRequirements(&self) -> uint32 {
+        0
+    }
 }
 
 impl<P: Processor + Default> IPluginBaseTrait for Vst3Plugin<P> {

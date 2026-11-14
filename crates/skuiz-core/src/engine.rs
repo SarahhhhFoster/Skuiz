@@ -126,7 +126,7 @@ impl EditorSender {
 /// Same shape as [`EditorSender`]: `send` is allocation-free and
 /// realtime-safe (fixed-size UTF-8 in a bounded SPSC ring), so a processor
 /// may broadcast from `process` or `on_editor_message` even though the
-/// underlying [`skuiz_ipc::Bus`] socket write is main-thread work. Adapters
+/// underlying `skuiz_ipc::Bus` socket write is main-thread work. Adapters
 /// drain the queue on their main thread and forward each message to the
 /// bus; a dedicated pump thread covers instances with no editor open.
 /// Overlong messages or a full queue return `false` and bump
