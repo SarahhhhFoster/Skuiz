@@ -8,7 +8,7 @@
 //! by the plugin interface layer, and configuration dropdowns that are just
 //! choice parameters.
 
-use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 
 const P_THRESHOLD: u32 = 0;
 const P_NOTE: u32 = 1;
@@ -151,7 +151,13 @@ impl Processor for TriggerNote {
         }
     }
 
-    fn process(&mut self, inputs: &AudioInputs, _outputs: &mut AudioOutputs, midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        inputs: &AudioInputs,
+        _outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        midi: &mut MidiOut,
+    ) {
         // The envelope follower listens to the main input's first channel;
         // with no connected input there is nothing to trigger on.
         let Some(input) = inputs.main().and_then(|main| main.channel(0)) else {

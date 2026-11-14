@@ -43,7 +43,9 @@ the audio thread.
 
 ## Limitations
 
-- **No audio input** (above).
+- **No audio or MIDI device input** (above). `Processor::accepts_midi`
+  processors receive an empty `MidiIn` in the shell; use a CLAP/VST3/AUv3
+  host to develop note-triggered DSP.
 - **Generated MIDI is dropped** — the standalone drains `MidiOut` and
   discards it; MIDI output from the shell is deferred.
 - **Editor platform support** is the webview's: macOS tested; Windows

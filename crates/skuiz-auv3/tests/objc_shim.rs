@@ -9,7 +9,7 @@
 #![cfg(target_os = "macos")]
 
 use skuiz_core::{
-    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiOut, ParamDef, PluginInfo,
+    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiIn, MidiOut, ParamDef, PluginInfo,
     Processor,
 };
 
@@ -92,7 +92,13 @@ impl Processor for Fixture {
             _ => 0.0,
         }
     }
-    fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        midi: &mut MidiOut,
+    ) {
         let side = inputs.at(1).and_then(|b| b.channel(0)).map(|c| c[0]);
         let g = self.gain as f32;
         if let Some(out) = outputs.main() {

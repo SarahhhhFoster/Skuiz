@@ -114,6 +114,7 @@ fn parameter_reaches_patch_receivers() {
     proc_.activate(48_000.0, 512);
 
     let mut midi = skuiz_core::MidiOut::with_capacity(1);
+    let notes = skuiz_core::MidiIn::with_capacity(0);
     let run = |proc_: &mut PdTremolo, midi: &mut skuiz_core::MidiOut| {
         let mut l = [0.7f32; 512];
         let mut r = [0.7f32; 512];
@@ -131,7 +132,7 @@ fn parameter_reaches_patch_receivers() {
             }
         }
         let (inputs, mut outputs) = scratch.views();
-        proc_.process(&inputs, &mut outputs, midi);
+        proc_.process(&inputs, &mut outputs, &notes, midi);
         (l, r)
     };
 

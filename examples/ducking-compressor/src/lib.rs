@@ -7,7 +7,7 @@
 
 use skuiz_core::bus::BusId;
 use skuiz_core::{
-    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiOut, ParamDef, PluginInfo,
+    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiIn, MidiOut, ParamDef, PluginInfo,
     Processor,
 };
 
@@ -145,7 +145,13 @@ impl Processor for DuckingCompressor {
         (320, 220)
     }
 
-    fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        _midi: &mut MidiOut,
+    ) {
         // No sidechain connected: the bus reports inactive and yields no
         // channels, so the audio (already copied into the outputs by the
         // adapter) passes through untouched.
@@ -229,8 +235,9 @@ mod tests {
             scratch.set_channel(BusDirection::Input, 1, 0, bufs.side.as_mut_ptr(), FRAMES);
         }
         let (inputs, mut outputs) = scratch.views();
+        let notes = MidiIn::with_capacity(0);
         let mut midi = MidiOut::with_capacity(4);
-        duck.process(&inputs, &mut outputs, &mut midi);
+        duck.process(&inputs, &mut outputs, &notes, &mut midi);
         bufs.out[0]
     }
 

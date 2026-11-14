@@ -38,7 +38,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use skuiz_core::bus::{BusDirection, TopologyScratch};
 use skuiz_core::engine::{AudioToken, Engine};
-use skuiz_core::{MidiOut, Processor};
+use skuiz_core::{MidiIn, MidiOut, Processor};
 use std::sync::Arc;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -54,6 +54,8 @@ const SCRATCH_FRAMES: usize = 2048;
 enum UserEvent {
     /// A parameter changed on another instance, via the bus.
     RemoteParam(u32, f64),
+    /// Processor custom messages are ready for the webview.
+    FlushEditor,
 }
 
 /// What the processor receives as input.
@@ -161,8 +163,11 @@ fn main_bus_channels<P: Processor>(dir: BusDirection) -> usize {
 /// declared main bus layouts. The two differ on devices wider than the main
 /// output — the stream callback duplicates the last produced channel over
 /// the extras.
+// Kept as separate views so the device-free tests can construct each one.
+#[allow(clippy::too_many_arguments)]
 fn render_pass<P: Processor>(
     processor: &mut P,
+    notes: &MidiIn,
     midi: &mut MidiOut,
     bus_scratch: &mut TopologyScratch,
     scratch: &mut Scratch,
@@ -215,7 +220,7 @@ fn render_pass<P: Processor>(
 
     {
         let (inputs, mut outputs) = bus_scratch.views();
-        processor.process(&inputs, &mut outputs, midi);
+        processor.process(&inputs, &mut outputs, notes, midi);
     }
 
     let mapped = out_channels.min(device_channels);
@@ -267,13 +272,16 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     let sender_slot: Arc<std::sync::Mutex<Option<skuiz_ipc::BusSender>>> =
         Arc::new(std::sync::Mutex::new(None));
     let cb_sender = Arc::clone(&sender_slot);
-    let bus = Arc::new(skuiz_ipc::Bus::join(info.id, move |frame| {
+    let bus = Arc::new(skuiz_ipc::Bus::join(P::bus_scope(), move |frame| {
         use skuiz_core::protocol as proto;
         if frame == skuiz_ipc::LINK_UP_FRAME {
             // Link (back) up: re-sync so frames dropped while the
             // cross-process link was down heal (invariant 9).
             if let Some(sender) = cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 sender.send(proto::sync_request(lww_cb.origin()).as_bytes());
+                if let Some(custom) = P::on_bus_link_up() {
+                    sender.send(custom.as_bytes());
+                }
             }
             return;
         }
@@ -327,11 +335,19 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                     });
                 }
             }
+            return;
         }
+        // Custom companion-plugin frame: hand to the processor and wake
+        // the UI so any editor response flushes.
+        bus_engine.editor_message(msg);
+        let _ = proxy.send_event(UserEvent::FlushEditor);
     }));
     *sender_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus.sender());
     // Late joiner: ask the bus for current shared state.
     bus.send(skuiz_core::protocol::sync_request(lww.origin()).as_bytes());
+    if let Some(custom) = P::on_bus_link_up() {
+        bus.send(custom.as_bytes());
+    }
 
     // --- audio ------------------------------------------------------------
 
@@ -354,6 +370,7 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
 
     let stream = {
         let engine = Arc::clone(&engine);
+        let audio_proxy = event_loop.create_proxy();
         // The main input aliases the main output, so the scratch must hold
         // the wider of the two declared layouts.
         let scratch_channels = main_bus_channels::<P>(BusDirection::Input)
@@ -379,7 +396,6 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                     let core =
                         engine.audio_core(audio_token.as_ref().expect("AUDIO implies a token"));
                     let report = engine.drain_commands(core);
-                    let _ = report; // no host to notify in a standalone shell
                     core.midi_out.clear();
 
                     // Process in scratch-sized passes so no buffer size can
@@ -388,6 +404,7 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                     for chunk in data.chunks_mut(max_chunk) {
                         render_pass(
                             &mut core.processor,
+                            &core.midi_in,
                             &mut core.midi_out,
                             &mut core.bus_scratch,
                             &mut scratch,
@@ -412,6 +429,12 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                     // ponytail: generated MIDI is drained and dropped; the
                     // standalone has no MIDI destination until a virtual
                     // port (midir) is wired up.
+                    if report.notify_main
+                        || engine.editor_output_pending()
+                        || engine.bus_output_pending()
+                    {
+                        let _ = audio_proxy.send_event(UserEvent::FlushEditor);
+                    }
                     if let Some(token) = audio_token.take() {
                         engine.end_audio(token);
                     }
@@ -440,6 +463,18 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     let webview = wry::WebViewBuilder::new()
         .with_html(html)
         .with_ipc_handler(move |req| {
+            if req.body() == skuiz_core::protocol::POLL {
+                ui_engine.drain_editor_output(|message| {
+                    if let Some(wv) = handler_slot.borrow().as_ref() {
+                        let js = skuiz_core::protocol::on_editor_message_js(message);
+                        let _ = wv.evaluate_script(&js);
+                    }
+                });
+                ui_engine.drain_bus_output(|message| {
+                    ui_bus.send(message.as_bytes());
+                });
+                return;
+            }
             if req.body() == skuiz_core::protocol::DIAG_QUERY {
                 let js = skuiz_core::protocol::on_diag_js(ui_engine.diag());
                 if let Some(wv) = handler_slot.borrow().as_ref() {
@@ -448,6 +483,16 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                 return;
             }
             let Some((id, value)) = skuiz_core::protocol::parse_set_param(req.body()) else {
+                ui_engine.editor_message(req.body());
+                ui_engine.drain_editor_output(|message| {
+                    if let Some(wv) = handler_slot.borrow().as_ref() {
+                        let js = skuiz_core::protocol::on_editor_message_js(message);
+                        let _ = wv.evaluate_script(&js);
+                    }
+                });
+                ui_engine.drain_bus_output(|message| {
+                    ui_bus.send(message.as_bytes());
+                });
                 return;
             };
             let Some(def) = P::params().iter().find(|d| d.id == id) else {
@@ -495,6 +540,7 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
     // `run_return` rather than tao's `run`: `run` never returns, which would
     // make `deactivate` unreachable.
     let rt_engine = Arc::clone(&engine);
+    let rt_bus = Arc::clone(&bus);
     let rt_webview = std::rc::Rc::clone(&webview_slot);
     event_loop.run_return(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -516,6 +562,17 @@ pub fn run<P: Processor + Default>(input: Input) -> Result<(), Error> {
                 if let Some(wv) = rt_webview.borrow().as_ref() {
                     let _ = wv.evaluate_script(&skuiz_core::protocol::on_param_js(id, value));
                 }
+            }
+            Event::UserEvent(UserEvent::FlushEditor) => {
+                rt_engine.drain_editor_output(|message| {
+                    if let Some(wv) = rt_webview.borrow().as_ref() {
+                        let js = skuiz_core::protocol::on_editor_message_js(message);
+                        let _ = wv.evaluate_script(&js);
+                    }
+                });
+                rt_engine.drain_bus_output(|message| {
+                    rt_bus.send(message.as_bytes());
+                });
             }
             _ => {}
         }
@@ -579,6 +636,7 @@ mod tests {
             &mut self,
             _inputs: &AudioInputs,
             outputs: &mut AudioOutputs,
+            _notes: &MidiIn,
             _midi: &mut MidiOut,
         ) {
             let g = self.0 as f32;
@@ -630,6 +688,7 @@ mod tests {
             &mut self,
             inputs: &AudioInputs,
             outputs: &mut AudioOutputs,
+            _notes: &MidiIn,
             _midi: &mut MidiOut,
         ) {
             self.sidechain_active = inputs.at(1).map(|bus| bus.active());
@@ -664,6 +723,7 @@ mod tests {
     #[test]
     fn render_pass_interleaves_and_applies_the_processor() {
         let mut processor = Gain(1.0);
+        let notes = MidiIn::with_capacity(0);
         let mut midi = MidiOut::with_capacity(8);
         let mut bus_scratch = TopologyScratch::new(Gain::audio_buses());
         let mut scratch = Scratch::new(2);
@@ -672,6 +732,7 @@ mod tests {
 
         render_pass(
             &mut processor,
+            &notes,
             &mut midi,
             &mut bus_scratch,
             &mut scratch,
@@ -698,6 +759,7 @@ mod tests {
         tone.phase = 0.0;
         render_pass(
             &mut processor,
+            &notes,
             &mut midi,
             &mut bus_scratch,
             &mut scratch,
@@ -715,6 +777,7 @@ mod tests {
     #[test]
     fn silence_input_produces_silence() {
         let mut processor = Gain(1.0);
+        let notes = MidiIn::with_capacity(0);
         let mut midi = MidiOut::with_capacity(8);
         let mut bus_scratch = TopologyScratch::new(Gain::audio_buses());
         // The scratch follows the declared stereo topology even when the
@@ -725,6 +788,7 @@ mod tests {
 
         render_pass(
             &mut processor,
+            &notes,
             &mut midi,
             &mut bus_scratch,
             &mut scratch,
@@ -743,6 +807,7 @@ mod tests {
     #[test]
     fn oversized_buffers_are_processed_in_passes() {
         let mut processor = Gain(1.0);
+        let notes = MidiIn::with_capacity(0);
         let mut midi = MidiOut::with_capacity(8);
         let mut bus_scratch = TopologyScratch::new(Gain::audio_buses());
         let mut scratch = Scratch::new(2);
@@ -753,6 +818,7 @@ mod tests {
         for chunk in out.chunks_mut(SCRATCH_FRAMES) {
             render_pass(
                 &mut processor,
+                &notes,
                 &mut midi,
                 &mut bus_scratch,
                 &mut scratch,
@@ -772,6 +838,7 @@ mod tests {
     #[test]
     fn declared_sidechain_is_always_inactive() {
         let mut processor = SidechainFx::default();
+        let notes = MidiIn::with_capacity(0);
         let mut midi = MidiOut::with_capacity(8);
         let mut bus_scratch = TopologyScratch::new(SidechainFx::audio_buses());
         let mut scratch = Scratch::new(2);
@@ -780,6 +847,7 @@ mod tests {
 
         render_pass(
             &mut processor,
+            &notes,
             &mut midi,
             &mut bus_scratch,
             &mut scratch,

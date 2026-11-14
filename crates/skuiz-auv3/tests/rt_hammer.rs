@@ -4,7 +4,7 @@
 //! reads always answer with a real value.
 
 use skuiz_auv3::SkuizAudioBusBuffers;
-use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -45,7 +45,13 @@ impl Processor for Gain {
     fn get_param(&self, _id: u32) -> f64 {
         self.0
     }
-    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        _midi: &mut MidiOut,
+    ) {
         let g = self.0 as f32;
         if let Some(out) = outputs.main() {
             for ch in out.channels() {

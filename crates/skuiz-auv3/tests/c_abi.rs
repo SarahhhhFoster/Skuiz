@@ -2,7 +2,7 @@
 //! boundary is exercised even though the Xcode target does not exist here.
 
 use skuiz_auv3::{SkuizAudioBusBuffers, SkuizParamInfo};
-use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 use std::ffi::{c_void, CStr, CString};
 
 struct Fixture {
@@ -58,6 +58,9 @@ impl Processor for Fixture {
     fn emits_midi() -> bool {
         true
     }
+    fn accepts_midi() -> bool {
+        true
+    }
     fn set_param(&mut self, id: u32, v: f64) {
         match id {
             0 => self.gain = v,
@@ -72,7 +75,13 @@ impl Processor for Fixture {
             _ => 0.0,
         }
     }
-    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        midi: &mut MidiOut,
+    ) {
         let g = self.gain as f32;
         if let Some(out) = outputs.main() {
             for ch in out.channels() {
@@ -80,6 +89,9 @@ impl Processor for Fixture {
                     *s *= g;
                 }
             }
+        }
+        for (frame, event) in _notes.events() {
+            midi.push(frame, event);
         }
         midi.push(7, skuiz_core::MidiEvent::from_midi1([0x90, 64, 100]));
     }
@@ -107,6 +119,10 @@ extern "C" {
     fn skuiz_auv3_save_state(inst: *mut c_void, buf: *mut u8, cap: u32) -> u32;
     fn skuiz_auv3_load_state(inst: *mut c_void, buf: *const u8, len: u32) -> bool;
     fn skuiz_auv3_midi_count(inst: *mut c_void) -> u32;
+    fn skuiz_auv3_accepts_midi() -> bool;
+    fn skuiz_auv3_midi_input_begin(inst: *mut c_void);
+    fn skuiz_auv3_midi_input(inst: *mut c_void, frame: u32, bytes: *const u8, len: u32);
+    fn skuiz_auv3_midi_input_range(inst: *mut c_void, start: u32, end: u32);
     fn skuiz_auv3_midi_event(
         inst: *mut c_void,
         index: u32,
@@ -247,5 +263,42 @@ fn state_round_trips_with_size_query() {
 
         skuiz_auv3_destroy(a);
         skuiz_auv3_destroy(b);
+    }
+}
+
+#[test]
+fn midi_input_is_rebased_for_the_selected_render_range() {
+    unsafe {
+        let inst = skuiz_auv3_init(std::ptr::null());
+        skuiz_auv3_activate(inst, 48_000.0, 512);
+        assert!(skuiz_auv3_accepts_midi());
+        skuiz_auv3_midi_input_begin(inst);
+        let note = [0x91, 60, 101];
+        skuiz_auv3_midi_input(inst, 11, note.as_ptr(), 3);
+        skuiz_auv3_midi_input_range(inst, 11, 64);
+
+        let mut left = [0.0f32; 53];
+        let mut outputs = [SkuizAudioBusBuffers::empty(); 4];
+        outputs[0].channels[0] = left.as_mut_ptr();
+        outputs[0].channel_count = 1;
+        outputs[0].active = 1;
+        skuiz_auv3_render(inst, std::ptr::null(), outputs.as_ptr(), 53);
+
+        // The echo proves the note reached the DSP at relative frame zero;
+        // the fixture's own note follows at its usual frame seven.
+        assert_eq!(skuiz_auv3_midi_count(inst), 2);
+        let mut frame = u32::MAX;
+        let mut bytes = [0u8; 3];
+        assert!(skuiz_auv3_midi_event(
+            inst,
+            0,
+            &mut frame,
+            bytes.as_mut_ptr()
+        ));
+        assert_eq!(frame, 0);
+        assert_eq!(bytes, note);
+
+        skuiz_auv3_deactivate(inst);
+        skuiz_auv3_destroy(inst);
     }
 }

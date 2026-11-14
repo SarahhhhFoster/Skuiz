@@ -12,6 +12,7 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::clap_process;
 use skuiz_clap::ClapDescriptor;
 use skuiz_core::bus::{validate_buses, BusId};
+use skuiz_core::MidiIn;
 use skuiz_core::{
     AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, ParamDef, PluginInfo, Processor,
 };
@@ -60,6 +61,8 @@ impl Processor for SidechainFx {
         &mut self,
         inputs: &AudioInputs,
         outputs: &mut AudioOutputs,
+
+        _notes: &MidiIn,
         _midi: &mut skuiz_core::MidiOut,
     ) {
         let side = inputs

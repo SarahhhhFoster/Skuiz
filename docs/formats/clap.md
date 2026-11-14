@@ -62,8 +62,10 @@ it over every example; make it a habit before debugging a host.
 - **Host automation is sample-accurate; IPC and editor changes are
   not** — timed events split the block, but values arriving over the
   bus carry no timestamp and apply at block top.
-- **No MIDI input** — note ports are output-only; the `Processor`
-  trait has no MIDI-input surface yet (deferred).
+- **MIDI input is sample-accurate** — native note on/off plus raw MIDI
+  1.0 and MIDI 2.0 UMP events are collected into a bounded `MidiIn`;
+  note and automation offsets both split the block. Note expressions and
+  sysex remain out of scope.
 - **GUI moves don't record automation gestures** — editor changes reach
   the host as a value rescan, which syncs values without a recorded
   gesture (VST3 does record; see its page).

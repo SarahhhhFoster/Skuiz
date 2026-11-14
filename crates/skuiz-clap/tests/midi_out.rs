@@ -11,7 +11,7 @@ use clap_sys::ext::note_ports::{
 };
 use clap_sys::process::clap_process;
 use skuiz_clap::ClapDescriptor;
-use skuiz_core::{MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 
@@ -43,6 +43,7 @@ impl Processor for TwoWorlds {
         &mut self,
         _inputs: &skuiz_core::AudioInputs,
         _outputs: &mut skuiz_core::AudioOutputs,
+        _notes: &MidiIn,
         midi: &mut MidiOut,
     ) {
         midi.push(3, skuiz_midi::note_on(0, 60, 100));

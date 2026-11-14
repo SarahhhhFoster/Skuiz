@@ -63,7 +63,10 @@ entry-point symbols, same compiled library inside both bundles.
   pressure become native VST3 events; CC, pitch bend and channel pressure
   become `kLegacyMIDICCOutEvent`. UMP-only MIDI 2.0 events are skipped —
   VST3 has no UMP event type (a documented ponytail).
-- **No MIDI input** — same trait-level gap as CLAP.
+- **MIDI input is native note on/off only.** Events are sorted and split
+  sample-accurately alongside automation, with normalized velocities
+  reduced to MIDI 1.0's 7-bit representation. VST3 has no UMP input type;
+  other event kinds are not converted.
 - MIDI event frame offsets are clamped into the block; DSP that
   timestamps past the block end loses that timing.
 - **Remote changes reach the host, not the open editor.** When a
@@ -73,7 +76,9 @@ entry-point symbols, same compiled library inside both bundles.
   converge. The webview editor is *not* pushed a refresh: VST3 has no
   equivalent of CLAP's `request_callback`, and a webview `eval` is only
   legal on the thread that created it (a documented ponytail — a UI
-  timer would close it).
+  timer would close it). Custom `EditorSender` messages *are* drained to
+  the open editor at this same polling point; the limitation above is
+  specifically the automatic parameter refresh.
 
 ## Validating
 

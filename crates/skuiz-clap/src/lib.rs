@@ -7,9 +7,9 @@ pub use clap_sys;
 pub use skuiz_core;
 
 use clap_sys::events::{
-    clap_event_header, clap_event_midi, clap_event_midi2, clap_event_param_value,
+    clap_event_header, clap_event_midi, clap_event_midi2, clap_event_note, clap_event_param_value,
     clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI,
-    CLAP_EVENT_MIDI2, CLAP_EVENT_PARAM_VALUE,
+    CLAP_EVENT_MIDI2, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE,
 };
 use clap_sys::ext::audio_ports::{
     clap_audio_port_info, clap_plugin_audio_ports, CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS,
@@ -42,7 +42,7 @@ use clap_sys::version::CLAP_VERSION;
 use skuiz_core::bus::{AudioBusSpec, BusDirection, ChannelLayout};
 use skuiz_core::diag::DiagCounters;
 use skuiz_core::engine::{AudioCore, AudioToken, Engine};
-use skuiz_core::{MidiOut, Processor};
+use skuiz_core::{MidiEvent, MidiIn, MidiOut, Processor};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::marker::PhantomData;
@@ -283,6 +283,68 @@ unsafe fn collect_param_events<P: Processor>(
     out.sort_unstable_by_key(|e| e.0);
 }
 
+/// Collect host note input into the block's preallocated [`MidiIn`].
+/// Native CLAP note on/off events are reduced to MIDI 1.0 (Skuiz's internal
+/// channel-message representation); raw MIDI and MIDI 2.0 events retain
+/// their original bytes/words. Other CLAP note-expression event types are
+/// intentionally left out until the core representation can carry them.
+unsafe fn collect_midi_events(
+    list: *const clap_input_events,
+    out: &mut MidiIn,
+    diag: &DiagCounters,
+) {
+    let Some(l) = list.as_ref() else { return };
+    let (Some(size), Some(get)) = (l.size, l.get) else {
+        return;
+    };
+    for i in 0..size(list) {
+        let hdr = get(list, i);
+        if hdr.is_null() {
+            continue;
+        }
+        let h = &*hdr;
+        if h.space_id != CLAP_CORE_EVENT_SPACE_ID {
+            continue;
+        }
+        let event = match h.type_ {
+            CLAP_EVENT_NOTE_ON if h.size as usize >= std::mem::size_of::<clap_event_note>() => {
+                let ev = &*(hdr as *const clap_event_note);
+                MidiEvent::from_midi1([
+                    0x90 | ev.channel.clamp(0, 15) as u8,
+                    ev.key.clamp(0, 127) as u8,
+                    (ev.velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                ])
+            }
+            CLAP_EVENT_NOTE_OFF if h.size as usize >= std::mem::size_of::<clap_event_note>() => {
+                let ev = &*(hdr as *const clap_event_note);
+                MidiEvent::from_midi1([
+                    0x80 | ev.channel.clamp(0, 15) as u8,
+                    ev.key.clamp(0, 127) as u8,
+                    (ev.velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                ])
+            }
+            CLAP_EVENT_MIDI if h.size as usize >= std::mem::size_of::<clap_event_midi>() => {
+                MidiEvent::from_midi1((*(hdr as *const clap_event_midi)).data)
+            }
+            CLAP_EVENT_MIDI2 if h.size as usize >= std::mem::size_of::<clap_event_midi2>() => {
+                let words = &(*(hdr as *const clap_event_midi2)).data;
+                // CLAP's wire struct is always four words; UMP's message
+                // type determines how many are meaningful.
+                let len = match words[0] >> 28 {
+                    0..=2 => 1,
+                    3..=4 => 2,
+                    _ => 4,
+                };
+                MidiEvent::from_ump(&words[..len])
+            }
+            _ => continue,
+        };
+        if !out.push(h.time, event) {
+            DiagCounters::bump(&diag.midi_in_events_dropped);
+        }
+    }
+}
+
 /// Push generated MIDI into the host's output queue. MIDI 1.0 messages go
 /// out as native MIDI events; anything wider (MIDI 2.0) goes as a UMP
 /// `clap_event_midi2`. `offset` is the segment's start within the block
@@ -390,7 +452,7 @@ impl<P: Processor> Vt<P> {
             // only exists after join returns — hence the slot, filled below.
             let sender_slot: Arc<Mutex<Option<skuiz_ipc::BusSender>>> = Arc::new(Mutex::new(None));
             let cb_sender = Arc::clone(&sender_slot);
-            let bus = skuiz_ipc::Bus::join(P::info().id, move |frame| {
+            let bus = skuiz_ipc::Bus::join(P::bus_scope(), move |frame| {
                 if frame == skuiz_ipc::LINK_UP_FRAME {
                     // The cross-process link is (back) up: ask everyone for
                     // shared state so frames dropped while it was down heal
@@ -399,6 +461,9 @@ impl<P: Processor> Vt<P> {
                         cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
                     {
                         sender.send(proto::sync_request(lww_cb.origin()).as_bytes());
+                        if let Some(custom) = P::on_bus_link_up() {
+                            sender.send(custom.as_bytes());
+                        }
                     }
                     return;
                 }
@@ -454,13 +519,30 @@ impl<P: Processor> Vt<P> {
                             });
                         }
                     }
+                    return;
                 }
+                // Custom companion-plugin frame: hand to the processor.
+                handle.editor_message(msg);
             });
+            let pump_sender = bus.sender();
             *sender_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus.sender());
             // Late joiner: ask the bus for current shared state. The initial
             // answer set is the convergence floor; LINK_UP covers reconnects.
             bus.send(proto::sync_request(lww.origin()).as_bytes());
+            if let Some(custom) = P::on_bus_link_up() {
+                bus.send(custom.as_bytes());
+            }
             *inst.bus.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus);
+            let weak_engine = Arc::downgrade(&inst.engine);
+            std::thread::spawn(move || {
+                while let Some(engine) = weak_engine.upgrade() {
+                    engine.drain_bus_output(|msg| {
+                        pump_sender.send(msg.as_bytes());
+                    });
+                    drop(engine);
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+            });
             true
         })
     }
@@ -487,14 +569,20 @@ impl<P: Processor> Vt<P> {
     ) -> bool {
         ffi_guard(false, || {
             let engine = &inst::<P>(plugin).engine;
-            // activate is main-thread with the transport stopped, so direct
-            // access must succeed; a host calling it while processing is
-            // breaking the spec, and we say no rather than race.
-            let Some(latency) = engine.with_main(|core| {
-                core.processor.activate(sample_rate, max_frames);
-                core.processor.latency()
-            }) else {
-                return false;
+            // activate is main-thread with the transport stopped; wait out
+            // any sub-microsecond bus callback holding MAIN before failing.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
+            let latency = loop {
+                if let Some(lat) = engine.with_main(|core| {
+                    core.processor.activate(sample_rate, max_frames);
+                    core.processor.latency()
+                }) {
+                    break lat;
+                }
+                if engine.is_processing() || std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::yield_now();
             };
             engine.set_latency(latency);
             true
@@ -574,6 +662,27 @@ impl<P: Processor> Vt<P> {
                 let _ = editor.eval(&skuiz_core::protocol::on_param_js(id, value));
             }
         }
+        Self::flush_editor_messages(inst);
+    }
+
+    /// Deliver custom processor → page messages on the main thread. With
+    /// no editor open, drain and discard these transient UI notifications.
+    unsafe fn flush_editor_messages(inst: &Instance<P>) {
+        inst.engine.drain_editor_output(|message| {
+            if let Some(editor) = inst.editor.borrow().as_ref() {
+                let js = skuiz_core::protocol::on_editor_message_js(message);
+                let _ = editor.eval(&js);
+            }
+        });
+        if inst.engine.bus_output_pending() {
+            if let Ok(bus) = inst.bus.lock() {
+                if let Some(bus) = bus.as_ref() {
+                    inst.engine.drain_bus_output(|message| {
+                        bus.send(message.as_bytes());
+                    });
+                }
+            }
+        }
     }
 
     unsafe extern "C" fn process(
@@ -605,6 +714,11 @@ impl<P: Processor> Vt<P> {
             let events = &mut *inst.param_events.get();
             events.clear();
             collect_param_events::<P>(p.in_events, p.frames_count, events, engine.diag());
+            core.midi_in.clear();
+            if P::accepts_midi() {
+                collect_midi_events(p.in_events, &mut core.midi_in, engine.diag());
+            }
+            core.midi_in.prepare(p.frames_count);
 
             // Copy the main input into the main output once (unless the
             // host already processes in place) and zero what no input
@@ -612,25 +726,36 @@ impl<P: Processor> Vt<P> {
             // sidechain input is read directly from the host's buffers.
             Self::copy_main_into_output(p);
 
-            // Split the block at event times: render up to the next event,
-            // apply it, continue. Segments re-slice the same host buffers.
+            // Split at both automation and MIDI times. Events at `pos`
+            // belong to the segment starting there; an event at a
+            // segment's end is seen by the next segment, never twice.
             let frames = p.frames_count as usize;
             let mut pos = 0usize;
-            for &(time, id, value) in events.iter() {
-                let t = (time as usize).min(frames);
-                if t > pos {
-                    Self::process_segment(engine, core, p, pos, t);
-                    pos = t;
+            let mut param_index = 0usize;
+            while pos < frames || param_index < events.len() {
+                while param_index < events.len() && events[param_index].0 as usize <= pos {
+                    let (_, id, value) = events[param_index];
+                    core.processor.set_param(id, value);
+                    // Readback publish: the mirror must hold the value the
+                    // processor actually kept (it may round or clamp).
+                    engine.mirror().publish(id, core.processor.get_param(id));
+                    param_index += 1;
                 }
-                core.processor.set_param(id, value);
-                // Readback publish: the mirror must hold the value the
-                // processor actually kept (it may round or clamp).
-                engine.mirror().publish(id, core.processor.get_param(id));
+                if pos >= frames {
+                    break;
+                }
+                let next_param = events
+                    .get(param_index)
+                    .map_or(frames, |event| (event.0 as usize).min(frames));
+                let next_note = core
+                    .midi_in
+                    .first_frame_after(pos as u32)
+                    .map_or(frames, |frame| (frame as usize).min(frames));
+                let end = next_param.min(next_note).max(pos + 1).min(frames);
+                Self::process_segment(engine, core, p, pos, end);
+                pos = end;
             }
-            if pos < frames {
-                Self::process_segment(engine, core, p, pos, frames);
-            }
-            if report.notify_main {
+            if report.notify_main || engine.editor_output_pending() || engine.bus_output_pending() {
                 // Bounce to the main thread for host rescan + editor refresh.
                 if let Some(h) = inst.host.as_ref() {
                     if let Some(request_callback) = h.request_callback {
@@ -769,9 +894,11 @@ impl<P: Processor> Vt<P> {
         }
 
         let (inputs, mut outputs) = scratch.views();
+        core.midi_in.set_range(start as u32, end as u32);
         let midi = &mut core.midi_out;
         midi.clear();
-        core.processor.process(&inputs, &mut outputs, midi);
+        core.processor
+            .process(&inputs, &mut outputs, &core.midi_in, midi);
         // MIDI pushed past capacity is a counted drop (invariant 8).
         if midi.dropped() > 0 {
             engine
@@ -799,7 +926,7 @@ impl<P: Processor> Vt<P> {
                 &Self::STATE as *const clap_plugin_state as *const c_void
             } else if id == CLAP_EXT_LATENCY {
                 &Self::LATENCY as *const clap_plugin_latency as *const c_void
-            } else if id == CLAP_EXT_NOTE_PORTS && P::emits_midi() {
+            } else if id == CLAP_EXT_NOTE_PORTS && (P::accepts_midi() || P::emits_midi()) {
                 &Self::NOTE_PORTS as *const clap_plugin_note_ports as *const c_void
             } else if EDITOR_SUPPORTED && id == CLAP_EXT_GUI && P::editor_html().is_some() {
                 &Self::GUI as *const clap_plugin_gui as *const c_void
@@ -897,7 +1024,7 @@ impl<P: Processor> Vt<P> {
         ffi_guard(0, || inst::<P>(plugin).engine.latency())
     }
 
-    // --- note-ports extension (one output: MIDI 1.0 + MIDI 2.0 UMP) ------
+    // --- note-ports extension (MIDI 1.0 + MIDI 2.0 UMP) -----------------
 
     const NOTE_PORTS: clap_plugin_note_ports = clap_plugin_note_ports {
         count: Some(Self::np_count),
@@ -905,7 +1032,13 @@ impl<P: Processor> Vt<P> {
     };
 
     unsafe extern "C" fn np_count(_plugin: *const clap_plugin, is_input: bool) -> u32 {
-        ffi_guard(0, || if is_input { 0 } else { 1 })
+        ffi_guard(0, || {
+            if is_input {
+                u32::from(P::accepts_midi())
+            } else {
+                u32::from(P::emits_midi())
+            }
+        })
     }
 
     unsafe extern "C" fn np_get(
@@ -915,7 +1048,11 @@ impl<P: Processor> Vt<P> {
         info: *mut clap_note_port_info,
     ) -> bool {
         ffi_guard(false, || {
-            if is_input || index != 0 || info.is_null() {
+            if index != 0
+                || info.is_null()
+                || (is_input && !P::accepts_midi())
+                || (!is_input && !P::emits_midi())
+            {
                 return false;
             }
             let out = &mut *info;
@@ -925,7 +1062,7 @@ impl<P: Processor> Vt<P> {
                 preferred_dialect: CLAP_NOTE_DIALECT_MIDI,
                 name: [0; CLAP_NAME_SIZE],
             };
-            write_cstr(&mut out.name, "MIDI Out");
+            write_cstr(&mut out.name, if is_input { "MIDI In" } else { "MIDI Out" });
             true
         })
     }
@@ -1298,6 +1435,12 @@ impl<P: Processor> Vt<P> {
     // request_flush + output events when automation recording matters.
     unsafe fn handle_ui_message(plugin: *const clap_plugin, msg: &str) {
         let inst = inst::<P>(plugin);
+        if msg == skuiz_core::protocol::POLL {
+            // The page's keepalive: deliver whatever the processor emitted
+            // since the last flush. Never forwarded.
+            Self::flush_editor_messages(inst);
+            return;
+        }
         if msg == skuiz_core::protocol::DIAG_QUERY {
             // Diagnostics for the page: counters are atomics, so this is
             // a plain read; the eval back is main-thread editor work.
@@ -1308,6 +1451,11 @@ impl<P: Processor> Vt<P> {
             return;
         }
         let Some((id, value)) = skuiz_core::protocol::parse_set_param(msg) else {
+            // Everything outside the built-in protocol belongs to the
+            // processor. Direct when stopped, bounded block-top delivery
+            // while running. A direct call may answer synchronously.
+            inst.engine.editor_message(msg);
+            Self::flush_editor_messages(inst);
             return;
         };
         let Some(def) = P::params().iter().find(|p| p.id == id) else {

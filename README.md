@@ -61,7 +61,8 @@ cargo build                            # skuiz-vst3 is a default member
   plus one cross-process socket link per process, with zero-config election
   and automatic promotion
 - `crates/skuiz-midi` — MIDI 1.0 and MIDI 2.0 (UMP) messages, output
-  configuration
+  configuration; the core adapters carry host MIDI input and plugin MIDI
+  output
 - `crates/skuiz-dsp` — embedded Pure Data via libpd (feature `libpd`)
 - `crates/skuiz-vst3` — VST3 adapter (default member; see Licensing above)
 - `crates/skuiz-auv3` — AUv3 C ABI, `AUAudioUnit` shim, packaging scaffold
@@ -253,7 +254,8 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 - GPU spectral resynthesis example
 - MPE per-note expression — the UMP event type (`MidiEvent`) and MIDI 2.0
   output are in; MPE note-expression events are still out
-- MIDI *input* (only output ports are declared today)
+- MPE per-note expression and sysex input — note on/off and raw MIDI
+  1.0/2.0 input are in; per-note expression and sysex are still out
 - AUv3 Xcode project, provisioning and signing (the C ABI and the
   `AUAudioUnit` shim are done and tested; see crates/skuiz-auv3/scaffold)
 - Standalone input capture (output-only today; the shell feeds a test tone)

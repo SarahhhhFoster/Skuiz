@@ -38,7 +38,7 @@ Alongside that spine sit services an adapter wires in for you:
 
 | Crate | Purpose | You use it |
 | --- | --- | --- |
-| `skuiz-core` | The `Processor` trait, `ParamDef`, `MidiOut`, wire protocol | Always |
+| `skuiz-core` | The `Processor` trait, `ParamDef`, `MidiIn`, `MidiOut`, wire protocol | Always |
 | `skuiz-clap` | CLAP adapter and `export_clap!` | To ship CLAP |
 | `skuiz-vst3` | VST3 adapter and `export_vst3!` | To ship VST3 |
 | `skuiz-auv3` | AUv3 C ABI and `AUAudioUnit` shim | To ship AUv3 |

@@ -11,6 +11,7 @@ use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::stream::{clap_istream, clap_ostream};
 use skuiz_clap::ClapDescriptor;
+use skuiz_core::MidiIn;
 use skuiz_core::{ParamDef, PluginInfo, Processor};
 use std::ffi::{c_char, c_void};
 use std::ptr::null_mut;
@@ -54,6 +55,8 @@ impl Processor for Gain {
         &mut self,
         _inputs: &skuiz_core::AudioInputs,
         _outputs: &mut skuiz_core::AudioOutputs,
+
+        _notes: &MidiIn,
         _midi: &mut skuiz_core::MidiOut,
     ) {
     }
@@ -117,6 +120,8 @@ impl Processor for Fill {
         &mut self,
         _inputs: &skuiz_core::AudioInputs,
         outputs: &mut skuiz_core::AudioOutputs,
+
+        _notes: &MidiIn,
         _midi: &mut skuiz_core::MidiOut,
     ) {
         if let Some(main) = outputs.main() {

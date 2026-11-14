@@ -11,15 +11,17 @@ A host drives your type in a fixed order:
 
 1. **`Default::default()`** — the instance's initial state. Skuiz
    constructs instances with `Default`, so put your defaults here.
-2. **Bus join** — the adapter seats the instance on the
+2. **`set_editor_sender(sender)`** — optional hook supplying the custom
+   processor → editor channel; store it if needed. Default drops it.
+3. **Bus join** — the adapter seats the instance on the
    [instance-sync](instance-sync.md) bus before any audio runs.
-3. **`activate(sample_rate, max_frames)`** — the one place to allocate
+4. **`activate(sample_rate, max_frames)`** — the one place to allocate
    buffers, build tables, and reset state. Called again if the sample
    rate changes.
-4. **`process(...)`** — called per block, on the audio thread, until
+5. **`process(...)`** — called per block, on the audio thread, until
    playback stops.
-5. **`deactivate()`** — release what `activate` set up.
-6. **Destroy** — the instance is dropped.
+6. **`deactivate()`** — release what `activate` set up.
+7. **Destroy** — the instance is dropped.
 
 ## The methods
 
@@ -47,8 +49,9 @@ thread when the engine is stopped (state load, direct edits), so keep it
 to arithmetic and assignment, and clamp — hosts are not obliged to
 respect your declared range.
 
-**`process(inputs, outputs, midi)`** renders one block: read from the
-input bus channels, write to the output bus channels. All channel slices
+**`process(inputs, outputs, notes, midi)`** renders one block: read from the
+input bus channels, write to the output bus channels, and consume host
+MIDI from `notes`. All channel slices
 are the same length, which varies between calls. A bus the host left
 inactive yields no channels — `outputs.main()` returns `None` when nothing
 is connected, so a MIDI-only plugin still gets called. The main input may
@@ -58,8 +61,11 @@ writing it. Push generated MIDI into
 never allocates, and refuses events once full — the refusal is counted in
 the `midi_events_dropped` diagnostic, never silent, and a full buffer
 means the DSP is emitting far too many events per block, which is a bug
-in the DSP. This method
-is realtime: read [threading](threading.md) before shipping.
+in the DSP. Host MIDI input is likewise bounded (512 events per block),
+pre-sorted and sample-timed; CLAP and VST3 split at note as well as
+automation boundaries, so offsets delivered by `notes.events()` are
+relative to the current processor call. See `accepts_midi()` below. This
+method is realtime: read [threading](threading.md) before shipping.
 
 **`reset()`** (default no-op) clears DSP state — delay lines, filter
 memory, LFO phase — without touching parameter values. Called between
@@ -74,6 +80,12 @@ updates the value hosts see and notifies them (CLAP and VST3; AUv3 and
 standalone report no change notification). Because of that poll it runs
 on the audio thread — keep it to reading a field.
 
+**`accepts_midi()`** (default `false`) tells adapters whether to
+advertise a note input port and collect host note events. CLAP delivers
+native note on/off, raw MIDI 1.0 and MIDI 2.0 UMP; VST3 delivers native
+note on/off; AUv3 delivers 1–3 byte `AURenderEventMIDI` packets. Standalone
+has no MIDI device input and always supplies an empty view.
+
 **`emits_midi()`** (default `false`) tells adapters whether to
 advertise a note output port, so an audio-only plugin doesn't show
 hosts a MIDI out that never fires.
@@ -81,6 +93,14 @@ hosts a MIDI out that never fires.
 **`editor_html()` / `editor_size()`** — the editor is a static HTML
 string (usually `include_str!`) plus a size in logical pixels. `None`
 (the default) means no GUI. See [editors](editors.md).
+
+**`on_editor_message(message)`** (default no-op) handles custom strings
+from the page — anything outside the built-in parameter and diagnostic
+protocol. Main thread when stopped, audio thread at block top while
+running; keep the running path cheap and realtime-safe.
+**`set_editor_sender(sender)`** stores the optional processor → page
+custom-message channel. Both directions are bounded and allocation-free;
+see [editors](editors.md#custom-messages).
 
 **`save_state()` / `load_state(data)`** — the default implementation
 writes a `SKZ1` version header followed by every parameter as 12-byte

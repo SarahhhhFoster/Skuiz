@@ -37,9 +37,8 @@ shim needs the App Group directory set **before instantiation**; see
 
 ## Deferred (add when needed)
 
-- MPE per-note expression (UMP events and MIDI 2.0 output are in;
-  MPE note-expression events are still out)
-- MIDI *input* (only output ports exist today)
+- MPE per-note expression and sysex input (note on/off and raw MIDI
+  1.0/2.0 input are in; expression and sysex are still out)
 - GPU spectral resynthesis example
 - AUv3 Xcode project, provisioning and signing
 - VST3 MIDI output covers note on/off, CC, pitch bend and poly pressure
