@@ -30,6 +30,45 @@ pub enum Command {
     Reset,
 }
 
+/// Maximum UTF-8 bytes in one custom editor message, in either direction.
+/// Fixed-size storage is what keeps queued delivery allocation-free on the
+/// audio thread.
+pub const EDITOR_MESSAGE_BYTES: usize = 256;
+
+/// Messages queued in each direction before overflow is refused and counted.
+pub const EDITOR_QUEUE_CAPACITY: usize = 64;
+
+/// One custom editor message. UTF-8 validity and the size bound are checked
+/// at construction, after which copies into and out of queues cannot fail.
+#[derive(Clone, Copy)]
+pub struct EditorMessage {
+    len: u16,
+    bytes: [u8; EDITOR_MESSAGE_BYTES],
+}
+
+impl EditorMessage {
+    /// Copy `message` into fixed storage; `None` means it exceeds
+    /// [`EDITOR_MESSAGE_BYTES`].
+    pub fn new(message: &str) -> Option<Self> {
+        if message.len() > EDITOR_MESSAGE_BYTES {
+            return None;
+        }
+        let mut bytes = [0; EDITOR_MESSAGE_BYTES];
+        bytes[..message.len()].copy_from_slice(message.as_bytes());
+        Some(Self {
+            len: message.len() as u16,
+            bytes,
+        })
+    }
+
+    /// The validated message text.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: `new` accepts only `&str`, and the byte array is never
+        // mutated after construction.
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[..self.len as usize]) }
+    }
+}
+
 /// A state operation for the audio thread: potentially expensive (the
 /// processor (de)serializes its whole state), so these travel on a
 /// separate, single-producer queue and the audio thread services at most

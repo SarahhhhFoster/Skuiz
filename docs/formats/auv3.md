@@ -10,7 +10,7 @@ assemble.**
 
 - **A flat C ABI** — `export_auv3!(MyProcessor)` generates
   `skuiz_auv3_init/destroy/activate/deactivate/render`, parameter
-  info/get/set, state save/load, a MIDI drain, and a bus-topology query
+  info/get/set, state save/load, MIDI input and output, and a bus-topology query
   (`skuiz_auv3_audio_bus_count/info`) over an opaque instance pointer.
   Covered by `cargo test -p skuiz-auv3`.
 - **An Objective-C shim** (`shim/SkuizAudioUnit.m`, compiled by
@@ -20,7 +20,10 @@ assemble.**
   the declared bus topology (optional sidechain buses are pulled only
   when the host connected them — see
   [buses](../concepts/buses.md)), pulls input in its render block, and
-  forwards generated MIDI with block-relative timestamps. The shim is
+  forwards generated MIDI with block-relative timestamps. Incoming
+  1–3 byte `AURenderEventMIDI` packets are collected, sorted and exposed
+  through the same `MidiIn` view as the other adapters; MIDI and parameter
+  offsets both split the block. Sysex remains out of scope. The shim is
   *executed* in tests — a selftest instantiates and renders a real unit
   in-process.
 - **A packaging scaffold** (`scaffold/`): an extension `Info.plist` and

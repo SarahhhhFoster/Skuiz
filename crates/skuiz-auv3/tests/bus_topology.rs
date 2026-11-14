@@ -7,7 +7,7 @@
 use skuiz_auv3::{SkuizAudioBusBuffers, SkuizAudioBusInfo};
 use skuiz_core::bus::{validate_buses, BusId};
 use skuiz_core::{
-    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiOut, ParamDef, PluginInfo,
+    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiIn, MidiOut, ParamDef, PluginInfo,
     Processor,
 };
 use std::ffi::{c_void, CStr};
@@ -50,7 +50,13 @@ impl Processor for SidechainFx {
     fn get_param(&self, _id: u32) -> f64 {
         0.0
     }
-    fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        _midi: &mut MidiOut,
+    ) {
         let side = inputs
             .get(BusId::input("Sidechain"))
             .and_then(|b| b.channel(0))

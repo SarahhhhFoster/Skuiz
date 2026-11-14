@@ -8,7 +8,7 @@
 //! Solid and solid-knobs are vendored as prebuilt bundles (see
 //! `src/vendor/`), so building this needs cargo and no JavaScript toolchain.
 
-use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 
 const P_FREQ: u32 = 0;
 const P_WAVE: u32 = 1;
@@ -162,7 +162,13 @@ impl Processor for SolidSynth {
         skuiz_core::bus::INSTRUMENT_BUSES
     }
 
-    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        _midi: &mut MidiOut,
+    ) {
         let Some(main) = outputs.main() else {
             return;
         };
@@ -243,8 +249,9 @@ mod tests {
             );
         }
         let (inputs, mut outputs) = scratch.views();
+        let notes = MidiIn::with_capacity(0);
         let mut midi = MidiOut::with_capacity(4);
-        synth.process(&inputs, &mut outputs, &mut midi);
+        synth.process(&inputs, &mut outputs, &notes, &mut midi);
         buf
     }
 

@@ -155,6 +155,107 @@ impl MidiEvent {
     }
 }
 
+/// MIDI received during one processing block, with block-relative frame
+/// offsets. Adapters fill this fixed-capacity buffer before rendering and
+/// sort it by offset, preserving host order for simultaneous events. No
+/// allocation or locking occurs on the audio thread; excess events are
+/// refused and counted by the adapter.
+///
+/// Adapters split blocks at automation *and* MIDI event times. Before
+/// each processor call they select a range, so [`MidiIn::events`] yields
+/// offsets relative to that call, exactly like [`MidiOut`]. An event at a
+/// range's start is included; one at its end belongs to the next range.
+pub struct MidiIn {
+    events: Vec<(u32, MidiEvent)>,
+    dropped: usize,
+    start: u32,
+    end: u32,
+}
+
+impl MidiIn {
+    /// Allocate room for `capacity` events. Call off the audio thread.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            events: Vec::with_capacity(capacity),
+            dropped: 0,
+            start: 0,
+            end: u32::MAX,
+        }
+    }
+
+    /// Queue `event` at `frame` within the host block. Adapters call this
+    /// while collecting host input; returns `false` without growing when
+    /// full. Events are sorted after collection, not here.
+    pub fn push(&mut self, frame: u32, event: MidiEvent) -> bool {
+        if self.events.len() < self.events.capacity() {
+            self.events.push((frame, event));
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
+
+    /// Sort collected events and clamp their offsets into `frames`.
+    /// Adapters call this once per host block, before rendering segments.
+    /// The insertion sort is stable and in-place: simultaneous notes keep
+    /// host order, no sorting allocation occurs, and already-sorted host
+    /// input takes the usual linear path.
+    pub fn prepare(&mut self, frames: u32) {
+        let last = frames.saturating_sub(1);
+        for (frame, _) in &mut self.events {
+            *frame = (*frame).min(last);
+        }
+        for i in 1..self.events.len() {
+            let mut j = i;
+            while j > 0 && self.events[j - 1].0 > self.events[j].0 {
+                self.events.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+
+    /// Select the half-open block range visible to the next processor call.
+    /// This only moves two cursors; it does not allocate or copy events.
+    pub fn set_range(&mut self, start: u32, end: u32) {
+        self.start = start;
+        self.end = end;
+    }
+
+    /// Events in the selected range, as `(segment_relative_frame, event)`.
+    /// The iterator is allocation-free. Call [`MidiIn::set_range`] first
+    /// when rendering part of a block.
+    pub fn events(&self) -> impl Iterator<Item = (u32, MidiEvent)> + '_ {
+        let first = self
+            .events
+            .partition_point(|(frame, _)| *frame < self.start);
+        let last = self.events.partition_point(|(frame, _)| *frame < self.end);
+        self.events[first..last]
+            .iter()
+            .map(move |(frame, event)| (frame - self.start, *event))
+    }
+
+    /// First collected event strictly after `frame`, used by adapters when
+    /// choosing the next block-split boundary.
+    pub fn first_frame_after(&self, frame: u32) -> Option<u32> {
+        let index = self.events.partition_point(|(at, _)| *at <= frame);
+        self.events.get(index).map(|(at, _)| *at)
+    }
+
+    /// Events refused because the input buffer was full since `clear`.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Drop all events from the previous host block, keeping the allocation.
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.dropped = 0;
+        self.start = 0;
+        self.end = u32::MAX;
+    }
+}
+
 /// MIDI emitted during one processing block, with the frame offset each
 /// event lands on. Events are UMP words (see [`MidiEvent`]): MIDI 1.0 and
 /// MIDI 2.0 both fit. Adapters drain this into the host's event output.
@@ -313,10 +414,44 @@ pub mod protocol {
         format!("window.skuizOnParam && window.skuizOnParam({id}, {value})")
     }
 
+    /// The JavaScript call delivering a custom processor → page message.
+    /// Pages implement `window.skuizOnMessage(text)`. The argument is JSON
+    /// escaped, including control characters and JavaScript's two line
+    /// separators, so arbitrary message text cannot break out of the call.
+    pub fn on_editor_message_js(message: &str) -> String {
+        let mut out = String::from("window.skuizOnMessage && window.skuizOnMessage(\"");
+        for ch in message.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{08}' => out.push_str("\\b"),
+                '\u{0c}' => out.push_str("\\f"),
+                c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push_str("\")");
+        out
+    }
+
     /// The page → plugin diagnostics query: the page posts this exact
     /// string and the plugin answers with [`on_diag_js`]. Typed beyond
     /// `set_param` — the editor protocol's second message kind.
     pub const DIAG_QUERY: &str = "skuiz_diag";
+
+    /// The page → plugin keepalive poll. Pages post this on a short
+    /// interval (e.g. 100 ms) because some hosts give the adapter no
+    /// main-thread callback of its own: without incoming page messages,
+    /// queued processor → page messages (state restores, trigger flashes)
+    /// would sit until the user happened to interact. Adapters answer the
+    /// poll themselves by flushing pending output; it never reaches the
+    /// processor.
+    pub const POLL: &str = "skuiz_poll";
 
     /// The JavaScript call answering a [`DIAG_QUERY`]; pages implement
     /// `window.skuizOnDiag(counters)` to receive it. `counters` is a plain
@@ -391,6 +526,17 @@ pub mod protocol {
             );
             assert_eq!(parse_sync_state("sync_state 1 0.5 3"), None);
             assert_eq!(parse_sync_state(&sync_state(&[])), Some(vec![]));
+        }
+
+        #[test]
+        fn editor_message_js_is_guarded_and_escaped() {
+            let js = on_editor_message_js("say \"hi\"\\\n\u{2028}");
+            assert!(js.starts_with("window.skuizOnMessage && window.skuizOnMessage(\""));
+            assert!(js.contains("\\\"hi\\\""));
+            assert!(js.contains("\\\\"));
+            assert!(js.contains("\\n"));
+            assert!(js.contains("\\u2028"));
+            assert!(!js.contains('\u{2028}'));
         }
 
         #[test]
@@ -510,6 +656,12 @@ pub trait Processor: Send + 'static {
     /// in place), so read a frame before writing it; optional inputs never
     /// alias outputs.
     ///
+    /// Host MIDI arrives in `notes`, with offsets relative to this processor
+    /// call. When automation splits a host block, adapters also split the
+    /// note view, so a note stamped at frame 41 is observed at frame 41.
+    /// Only plugins returning `true` from [`Processor::accepts_midi`]
+    /// receive events.
+    ///
     /// Push any MIDI the DSP generates into `midi`, which arrives cleared;
     /// see [`MidiOut::push`].
     ///
@@ -520,7 +672,13 @@ pub trait Processor: Send + 'static {
     /// block renders silence and leaves the processor in an unknown
     /// state. Everything expensive belongs in
     /// [`Processor::activate`].
-    fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut);
+    fn process(
+        &mut self,
+        inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        notes: &MidiIn,
+        midi: &mut MidiOut,
+    );
 
     /// Delay this plugin adds between its input and output, in frames.
     ///
@@ -535,6 +693,15 @@ pub trait Processor: Send + 'static {
     /// realtime-safe: no allocation, no locking, just read a field.
     fn latency(&self) -> u32 {
         0
+    }
+
+    /// Whether this plugin consumes MIDI. Adapters advertise a note input
+    /// port and collect host note events only when this is true.
+    fn accepts_midi() -> bool
+    where
+        Self: Sized,
+    {
+        false
     }
 
     /// Whether this plugin generates MIDI. Adapters only advertise a note
@@ -561,6 +728,54 @@ pub trait Processor: Send + 'static {
         Self: Sized,
     {
         (400, 300)
+    }
+
+    /// Receive the processor → page custom-message channel. Called once by
+    /// the engine immediately after `Default::default`, before `activate`.
+    /// The IPC bus scope this plugin joins. Defaults to [`PluginInfo::id`];
+    /// override to share a bus with companion plugins (e.g. a follower
+    /// plugin joining its leader's family scope).
+    fn bus_scope() -> &'static str
+    where
+        Self: Sized,
+    {
+        Self::info().id
+    }
+
+    /// Store the sender if the processor will post custom messages to its
+    /// editor; the default drops it. See [`engine::EditorSender::send`].
+    fn set_editor_sender(&mut self, sender: engine::EditorSender) {
+        let _ = sender;
+    }
+
+    /// Store the sender if the processor will broadcast custom messages on
+    /// the IPC bus; the default drops it. See
+    /// [`engine::BusBroadcastSender::send`].
+    fn set_bus_sender(&mut self, sender: engine::BusBroadcastSender) {
+        let _ = sender;
+    }
+
+    /// Custom frame to broadcast whenever the IPC link comes (back) up (or
+    /// right after joining). Companion plugins return a sync-request token
+    /// here (e.g. `"cf-sync"`); default `None` relies on parameter sync
+    /// alone.
+    fn on_bus_link_up() -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Handle a custom message posted by the editor page.
+    ///
+    /// Built-in `set_param` and `skuiz_diag` messages are handled by the
+    /// adapters; every other string arrives here. Called on the **main
+    /// thread** when stopped, or on the **audio thread at block top** while
+    /// running. The running-path contract is the same as `set_param`: no
+    /// allocation, locking, I/O, or expensive parsing. Messages are capped
+    /// at [`rt::EDITOR_MESSAGE_BYTES`] UTF-8 bytes.
+    fn on_editor_message(&mut self, message: &str) {
+        let _ = message;
     }
 
     /// Serialize state for the DAW project. Default: a versioned header
@@ -660,6 +875,7 @@ mod tests {
             &mut self,
             _inputs: &AudioInputs,
             _outputs: &mut AudioOutputs,
+            _notes: &MidiIn,
             _midi: &mut MidiOut,
         ) {
         }
@@ -754,5 +970,46 @@ mod tests {
 
         // Over-long input is truncated to four words, never panics.
         assert_eq!(MidiEvent::from_ump(&[0; 6]).words().len(), 4);
+    }
+
+    #[test]
+    fn midi_in_sorts_rebases_and_never_duplicates_boundary_events() {
+        let mut notes = MidiIn::with_capacity(3);
+        assert!(notes.push(20, MidiEvent::from_midi1([0x90, 64, 90])));
+        assert!(notes.push(5, MidiEvent::from_midi1([0x90, 60, 100])));
+        assert!(notes.push(99, MidiEvent::from_midi1([0x80, 64, 0])));
+        assert!(!notes.push(10, MidiEvent::from_midi1([0x90, 67, 100])));
+        assert_eq!(notes.dropped(), 1);
+        notes.prepare(32); // 99 clamps to the final frame
+
+        notes.set_range(0, 20);
+        let first: Vec<_> = notes.events().collect();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, 5);
+        assert_eq!(first[0].1.midi1_bytes(), Some([0x90, 60, 100]));
+
+        notes.set_range(20, 32);
+        let second: Vec<_> = notes.events().collect();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].0, 0, "range start is included and rebased");
+        assert_eq!(second[1].0, 11, "range end is excluded from the prior call");
+        assert_eq!(notes.first_frame_after(0), Some(5));
+        assert_eq!(notes.first_frame_after(20), Some(31));
+        notes.clear();
+        assert_eq!(notes.dropped(), 0);
+        assert_eq!(notes.events().count(), 0);
+
+        notes.push(4, MidiEvent::from_midi1([0x80, 60, 0]));
+        notes.push(4, MidiEvent::from_midi1([0x90, 60, 100]));
+        notes.prepare(8);
+        let simultaneous: Vec<_> = notes
+            .events()
+            .map(|(_, event)| event.midi1_bytes().unwrap())
+            .collect();
+        assert_eq!(
+            simultaneous,
+            vec![[0x80, 60, 0], [0x90, 60, 100]],
+            "simultaneous events retain host order"
+        );
     }
 }

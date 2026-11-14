@@ -40,7 +40,7 @@ the audio thread, ever.
   parameter mirror (`crates/skuiz-core/src/rt.rs`); the command queue's
   producer-side mutex is only ever taken on non-realtime threads (bus,
   UI), and the audio thread only pops.
-- **Status: held.** The processor, `MidiOut`, param-event staging and
+- **Status: held.** The processor, `MidiIn`, `MidiOut`, param-event staging and
   the IPC ingress path are all mutex-free on the audio thread in every
   adapter.
 
@@ -49,8 +49,9 @@ the audio thread, ever.
 Buffers are built in `activate`; every audio-thread structure is
 preallocated and fixed-capacity.
 
-- **Enforced by:** `MidiOut::with_capacity` (never reallocates —
-  tested), preallocated param-event staging, bounded command queues
+- **Enforced by:** `MidiIn`/`MidiOut::with_capacity` (never reallocates —
+  tested), fixed-size editor-message queues (no `String` crosses onto the
+  audio thread), preallocated param-event staging, bounded command queues
   allocated at instance setup, and state-payload buffers recycled back
   to the main thread so the audio thread never frees them. The bus
   scaffolding (`TopologyScratch`) is sized from the declared topology at
@@ -78,9 +79,9 @@ The audio thread never touches sockets, files, loggers, or webviews.
 
 ## 5. Host/UI/IPC parameter changes enter the audio thread through bounded, explicitly realtime-safe mechanisms
 
-Every ingress path — host automation, editor gestures, IPC sync — is a
-bounded structure with a documented overflow policy, and none of them
-lock the processor.
+Every ingress path — host automation, editor gestures, custom editor
+messages, IPC sync — is a bounded structure with a documented overflow
+policy, and none of them lock the processor.
 
 - **Enforced by:** the host's own event list (CLAP/VST3), and the
   engine's bounded command queues for everything else — one queue for
@@ -94,7 +95,10 @@ lock the processor.
   the bounded command queue (1024, `commands_dropped` on overflow), and
   the state queue holds at most two commands (capacity 2, and the
   engine's state-op lock keeps at most one round-trip in flight).
-  Neither path locks the processor.
+  Custom page messages use a separate 64-message queue of fixed 256-byte
+  UTF-8 slots, drained at block top; processor → page messages use the
+  same bounded representation in reverse and are drained on the main
+  thread. Neither path locks the processor.
 
 ## 6. Parameter reads exposed to non-audio threads do not require locking the `Processor`
 
@@ -109,14 +113,16 @@ mirror the audio thread publishes.
   `EngineHandle::snapshot_params` — which answers `sync_request` in all
   four adapters — reads the mirror rather than the processor.
 
-## 7. MIDI output is audio-thread-owned during processing and transferred without blocking
+## 7. MIDI is audio-thread-owned during processing and transferred without blocking
 
-The DSP's `MidiOut` is written only by `process` and drained into the
-host's event output inside the same callback. No other thread ever
-touches it.
+Host `MidiIn` is collected into engine-owned scratch before processing;
+the DSP's `MidiOut` is written only by `process` and drained into the
+host's event output inside the same callback. Neither buffer allocates,
+locks, or crosses to another thread.
 
-- **Enforced by:** `MidiOut` ownership inside the engine's audio-side
-  core; adapters drain inline after `process` returns.
+- **Enforced by:** both MIDI buffers' ownership inside the engine's
+  audio-side core; adapters re-slice input and drain output inline around
+  `process`.
 - **Status: held.** Ownership is structural: `MidiOut` lives in the
   audio-side `AudioCore` and is never behind a lock. (AUv3's shim reads
   the events after the render call returns — legal under the documented
@@ -130,9 +136,12 @@ Capacity is finite, so the full case is named, counted, and documented
 - **Enforced by:** `DiagCounters` (`crates/skuiz-core/src/diag.rs`)
   incremented on every overflow, with the policy written at the point
   of the bound.
-- **Status: held.** Every bound counts its drops: `MidiOut` (512),
+- **Status: held.** Every bound counts its drops: `MidiIn` and `MidiOut`
+  (512 events each, input drops reported as `midi_in_events_dropped`),
   param events (256/block, per-parameter overflow drops only that
-  point), the command queue (1024), the state-response ring. The
+  point), custom editor messages (64 in each direction, maximum 256
+  UTF-8 bytes, `editor_messages_dropped` on overflow or overlong input),
+  the command queue (1024), the state-response ring. The
   state-response ring additionally has a *proof* it cannot overflow —
   the state-op lock serializes round-trips, so at most one response is
   ever in flight against a capacity of two — and the audio thread still

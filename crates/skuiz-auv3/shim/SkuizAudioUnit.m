@@ -64,6 +64,11 @@ extern bool skuiz_auv3_load_state(void *inst, const uint8_t *buf, uint32_t len);
 extern void skuiz_auv3_reset(void *inst);
 extern uint32_t skuiz_auv3_midi_count(void *inst);
 extern bool skuiz_auv3_midi_event(void *inst, uint32_t index, uint32_t *frame, uint8_t *bytes3);
+extern bool skuiz_auv3_accepts_midi(void);
+extern void skuiz_auv3_midi_input_begin(void *inst);
+extern void skuiz_auv3_midi_input(void *inst, uint32_t frame, const uint8_t *bytes, uint32_t len);
+extern void skuiz_auv3_midi_input_overflow(void *inst);
+extern void skuiz_auv3_midi_input_range(void *inst, uint32_t start, uint32_t end);
 
 /// Key the state blob is stored under inside `fullState`.
 static NSString *const kSkuizStateKey = @"skuiz.state";
@@ -71,6 +76,15 @@ static NSString *const kSkuizStateKey = @"skuiz.state";
 /// Timed parameter events one block may carry before the excess is dropped.
 /// Fixed-size and stack-allocated: the render thread must not allocate.
 #define kSkuizMaxParamEvents 64u
+
+/// MIDI messages one block may carry. Matches the Rust MidiIn capacity.
+#define kSkuizMaxMidiEvents 512u
+
+typedef struct {
+    uint32_t frame;
+    uint8_t length;
+    uint8_t bytes[3];
+} SkuizMidiEvent;
 
 typedef struct {
     uint32_t frame;
@@ -116,6 +130,7 @@ static void SkuizRenderSegment(void *instance, const SkuizAudioBusBuffers *input
             }
         }
     }
+    skuiz_auv3_midi_input_range(instance, start, end);
     skuiz_auv3_render(instance, segmentInputs, segmentOutputs, end - start);
 
     if (midiOut != NULL) {
@@ -446,8 +461,12 @@ static void SkuizFreePullStorage(SkuizPullStorage *_Nullable storage) {
     [super reset];
 }
 
+- (NSArray<NSString *> *)MIDIInputNames {
+    return skuiz_auv3_accepts_midi() ? @[ @"MIDI In" ] : @[];
+}
+
 - (NSArray<NSString *> *)MIDIOutputNames {
-    return @[ @"MIDI Out" ];
+    return @[@"MIDI Out"];
 }
 
 - (AUInternalRenderBlock)internalRenderBlock {
@@ -496,21 +515,45 @@ static void SkuizFreePullStorage(SkuizPullStorage *_Nullable storage) {
         // cross-block state it needs, is a ponytail.
         SkuizParamEvent timed[kSkuizMaxParamEvents];
         uint32_t timedCount = 0;
+        SkuizMidiEvent midi[kSkuizMaxMidiEvents];
+        uint32_t midiCount = 0;
+        skuiz_auv3_midi_input_begin(instance);
         for (const AURenderEvent *event = realtimeEventListHead; event != NULL;
              event = event->head.next) {
-            if (event->head.eventType != AURenderEventParameter &&
-                event->head.eventType != AURenderEventParameterRamp) {
-                continue;
-            }
-            if (timedCount >= kSkuizMaxParamEvents) {
-                break; // full: drop the excess, same philosophy as MidiOut
-            }
             int64_t offset = event->head.eventSampleTime - (int64_t)timestamp->mSampleTime;
             if (offset < 0) {
                 offset = 0;
             }
             if (offset > (int64_t)frameCount) {
                 offset = (int64_t)frameCount;
+            }
+            if (event->head.eventType == AURenderEventMIDI && skuiz_auv3_accepts_midi()) {
+                if (event->MIDI.length == 0 || event->MIDI.length > 3) {
+                    continue;
+                }
+                if (midiCount >= kSkuizMaxMidiEvents) {
+                    skuiz_auv3_midi_input_overflow(instance);
+                    continue;
+                }
+                // Insertion sort by frame; fixed-size and allocation-free.
+                uint32_t i = midiCount++;
+                while (i > 0 && midi[i - 1].frame > (uint32_t)offset) {
+                    midi[i] = midi[i - 1];
+                    i--;
+                }
+                midi[i].frame = (uint32_t)offset;
+                midi[i].length = event->MIDI.length;
+                memcpy(midi[i].bytes, event->MIDI.data, event->MIDI.length);
+                skuiz_auv3_midi_input(instance, (uint32_t)offset, event->MIDI.data,
+                                      event->MIDI.length);
+                continue;
+            }
+            if (event->head.eventType != AURenderEventParameter &&
+                event->head.eventType != AURenderEventParameterRamp) {
+                continue;
+            }
+            if (timedCount >= kSkuizMaxParamEvents) {
+                break; // full: drop the excess, same philosophy as MidiOut
             }
             // Insertion sort by frame; the list is tiny and fixed-size, and
             // hosts are documented to deliver it time-ordered anyway.
@@ -603,22 +646,28 @@ static void SkuizFreePullStorage(SkuizPullStorage *_Nullable storage) {
             }
         }
 
-        // Split the block at event times: render up to the next event,
-        // apply it, continue. The render-safe setter allocates nothing and
-        // does not broadcast — host automation is not shared over IPC,
-        // matching the other adapters.
+        // Split at both parameter and MIDI times. MIDI at `pos` is visible
+        // to the segment starting there; MIDI at its end belongs to the next.
         uint32_t pos = 0;
-        for (uint32_t i = 0; i < timedCount; i++) {
-            if (timed[i].frame > pos) {
-                SkuizRenderSegment(instance, inputs, outputs, pos, timed[i].frame,
-                                   midiOut, timestamp);
-                pos = timed[i].frame;
+        uint32_t paramIndex = 0;
+        uint32_t midiIndex = 0;
+        while (pos < (uint32_t)frameCount || paramIndex < timedCount) {
+            while (paramIndex < timedCount && timed[paramIndex].frame <= pos) {
+                skuiz_auv3_set_param_from_render(instance, timed[paramIndex].address,
+                                                 timed[paramIndex].value);
+                paramIndex++;
             }
-            skuiz_auv3_set_param_from_render(instance, timed[i].address, timed[i].value);
-        }
-        if (pos < (uint32_t)frameCount) {
-            SkuizRenderSegment(instance, inputs, outputs, pos, (uint32_t)frameCount,
-                               midiOut, timestamp);
+            if (pos >= (uint32_t)frameCount) {
+                break;
+            }
+            while (midiIndex < midiCount && midi[midiIndex].frame <= pos) {
+                midiIndex++;
+            }
+            uint32_t nextParam = paramIndex < timedCount ? timed[paramIndex].frame : frameCount;
+            uint32_t nextMidi = midiIndex < midiCount ? midi[midiIndex].frame : frameCount;
+            uint32_t end = MIN(nextParam, nextMidi);
+            SkuizRenderSegment(instance, inputs, outputs, pos, end, midiOut, timestamp);
+            pos = end;
         }
         return noErr;
     };

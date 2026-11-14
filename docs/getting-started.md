@@ -112,7 +112,7 @@ impl Processor for MyGain {
         }
     }
 
-    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _notes: &skuiz_core::MidiIn, _midi: &mut MidiOut) {
         let g = self.gain as f32;
         // The adapter already copied the input into the output buffers,
         // so scaling the main output in place is the whole effect.
@@ -238,9 +238,11 @@ Then add two methods to your `impl Processor`:
 install alongside the plugin. Rebuild, reinstall, and the host will show
 your editor instead of its generic one.
 
-The two halves of the bridge — `window.ipc.postMessage` out and
-`window.skuizOnParam` in — are the entire protocol. See
-[editors](concepts/editors.md), including how to use a real framework.
+The two halves of the built-in parameter bridge — `window.ipc.postMessage`
+out and `window.skuizOnParam` in — are all a simple parameter UI needs.
+Custom event strings and processor → page messages are covered in
+[editors](concepts/editors.md#custom-messages), including how to use a real
+framework.
 
 ## 6. Try instance sync
 

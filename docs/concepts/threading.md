@@ -10,9 +10,11 @@ mechanics.
 | --- | --- |
 | `process` | Audio thread, once per block |
 | `set_param` | Audio thread while blocks flow; main thread when stopped |
+| `on_editor_message` | Audio thread at block top while blocks flow; main thread when stopped |
 | `get_param` | Same as `set_param` — while blocks flow, non-audio threads read the parameter mirror instead |
 | `activate` / `deactivate` | Main thread |
 | `info` / `params` / `editor_html` / `editor_size` | Any thread; expected to be constant |
+| `set_editor_sender` | Once on the main thread, immediately after construction |
 | `save_state` / `load_state` | Main thread when stopped; routed onto the audio thread between blocks while running |
 | `reset` | Audio thread between blocks while running; main thread when stopped |
 | `latency` | Audio thread (polled once per block) and main thread — must be realtime-safe |
@@ -40,7 +42,11 @@ an audible glitch. In `process` — and in anything it calls:
   an unknown state.
 
 `set_param` runs on the audio thread too, so the same rules apply to
-it in miniature: arithmetic and assignment only.
+it in miniature: arithmetic and assignment only. Custom editor messages
+use their own bounded 64-message queue and fixed 256-byte UTF-8 storage,
+so neither direction allocates or frees strings on the audio thread.
+`EditorSender::send` may run on the audio thread; only the resulting
+webview eval is deferred to the main thread.
 
 ## How the adapters are built (and what it means for you)
 
@@ -61,7 +67,9 @@ thread**:
   stack-built views over preallocated engine scratch that the adapter
   repoints at the host's buffers at block top — no allocation, no
   locking, no string lookup in the audio path (see
-  [buses](buses.md)).
+  [buses](buses.md)). Host MIDI uses the same pattern: `MidiIn` is a
+  preallocated, sorted block buffer, re-sliced at note and automation
+  boundaries so its event offsets are segment-relative.
 - **Main thread.** `activate`, `deactivate`, and state save/load take
   the main state — but only while the transport is stopped. While
   running, state save/load becomes a bounded round-trip on a *separate*
@@ -78,7 +86,9 @@ thread**:
   applies changes.
 
 Every queue is bounded and every overflow is counted in
-`skuiz_core::diag::DiagCounters` — never silently dropped. If a counter
+`skuiz_core::diag::DiagCounters` — never silently dropped. This includes
+host MIDI input (512 events/block, `midi_in_events_dropped`) as well as
+MIDI output. If a counter
 moves, something pathological happened (a host flooding thousands of
 parameter changes per second); the counter is how you find out.
 
@@ -102,6 +112,7 @@ Webview calls are main-thread-only: `Editor::attach`, `eval`,
 `resize`, and the `Editor` drop. Adapters seed a freshly opened editor
 from the parameter mirror — wait-free, so there is no lock to hold
 across a script eval of unbounded cost — and push later changes the same
-way. If you build editor-adjacent code of your own, follow the same
+way. Custom processor output is drained by `drain_editor_output` on the
+same main-thread paths. If you build editor-adjacent code of your own, follow the same
 rule: read the mirror, then talk to the webview, never the other way
 round.

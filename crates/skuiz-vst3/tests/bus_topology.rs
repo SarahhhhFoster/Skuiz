@@ -7,7 +7,7 @@
 
 use skuiz_core::bus::{validate_buses, BusId};
 use skuiz_core::{
-    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiOut, ParamDef, PluginInfo,
+    AudioBusSpec, AudioInputs, AudioOutputs, ChannelLayout, MidiIn, MidiOut, ParamDef, PluginInfo,
     Processor,
 };
 use skuiz_vst3::vst3::Steinberg::Vst::*;
@@ -53,7 +53,13 @@ impl Processor for SidechainFx {
     fn get_param(&self, _id: u32) -> f64 {
         0.0
     }
-    fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        _midi: &mut MidiOut,
+    ) {
         let side = inputs
             .get(BusId::input("Sidechain"))
             .and_then(|b| b.channel(0))

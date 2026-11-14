@@ -6,6 +6,7 @@ use clap_sys::ext::params::{clap_plugin_params, CLAP_EXT_PARAMS};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::clap_process;
 use skuiz_clap::ClapDescriptor;
+use skuiz_core::MidiIn;
 use skuiz_core::{ParamDef, PluginInfo, Processor};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
@@ -75,6 +76,8 @@ impl Processor for Gain {
         &mut self,
         _inputs: &skuiz_core::AudioInputs,
         _outputs: &mut skuiz_core::AudioOutputs,
+
+        _notes: &MidiIn,
         _midi: &mut skuiz_core::MidiOut,
     ) {
     }
@@ -106,9 +109,11 @@ impl Processor for ConvGain {
         &mut self,
         inputs: &skuiz_core::AudioInputs,
         outputs: &mut skuiz_core::AudioOutputs,
+
+        _notes: &MidiIn,
         midi: &mut skuiz_core::MidiOut,
     ) {
-        self.0.process(inputs, outputs, midi);
+        self.0.process(inputs, outputs, _notes, midi);
     }
 }
 
@@ -313,9 +318,11 @@ impl Processor for LoadGain {
         &mut self,
         inputs: &skuiz_core::AudioInputs,
         outputs: &mut skuiz_core::AudioOutputs,
+
+        _notes: &MidiIn,
         midi: &mut skuiz_core::MidiOut,
     ) {
-        self.0.process(inputs, outputs, midi);
+        self.0.process(inputs, outputs, _notes, midi);
     }
 }
 

@@ -30,10 +30,10 @@ use std::time::{Duration, Instant};
 
 use crate::diag::DiagCounters;
 use crate::rt::{
-    command_queue, spsc, Command, CommandConsumer, CommandProducer, Consumer, ParamMirror,
-    Producer, StateCommand, STATE_COMMAND_CAPACITY,
+    command_queue, spsc, Command, CommandConsumer, CommandProducer, Consumer, EditorMessage,
+    ParamMirror, Producer, StateCommand, EDITOR_QUEUE_CAPACITY, STATE_COMMAND_CAPACITY,
 };
-use crate::{MidiOut, Processor};
+use crate::{MidiIn, MidiOut, Processor};
 
 const IDLE: u8 = 0;
 const MAIN: u8 = 1;
@@ -62,6 +62,9 @@ enum StateResponse {
 pub struct AudioCore<P: Processor> {
     /// The plugin itself.
     pub processor: P,
+    /// Host MIDI for the current block, preallocated and re-sliced per
+    /// automation segment.
+    pub midi_in: MidiIn,
     /// MIDI scratch for the current block, preallocated.
     pub midi_out: MidiOut,
     /// Bus scaffolding for the current block: adapters repoint it at the
@@ -73,6 +76,8 @@ pub struct AudioCore<P: Processor> {
     cmd_rx: CommandConsumer,
     state_cmd_rx: Consumer<StateCommand>,
     state_tx: Producer<StateResponse>,
+    /// Custom page → processor messages, drained at block top.
+    editor_cmd_rx: Consumer<EditorMessage>,
 }
 
 /// Proof that the holder entered the AUDIO state via [`Engine::begin_audio`]
@@ -81,6 +86,73 @@ pub struct AudioCore<P: Processor> {
 /// and only while blocks are flowing. Adapters stash it in instance state
 /// for the duration of processing.
 pub struct AudioToken(());
+
+/// The processor → page custom-message channel. Received through
+/// [`Processor::set_editor_sender`].
+///
+/// `send` is allocation-free and realtime-safe: messages are fixed-size
+/// UTF-8 and queued in a bounded SPSC ring. Call it only from processor
+/// methods running under the engine's ownership (audio thread while
+/// running, main thread while stopped), never from a bus or arbitrary UI
+/// thread. The adapter forwards queued messages to `window.skuizOnMessage`
+/// on its main thread. Returns `false` for overlong messages or a full
+/// queue, counted as `editor_messages_dropped`.
+pub struct EditorSender {
+    tx: RefCell<Producer<EditorMessage>>,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    diag: Arc<DiagCounters>,
+}
+
+impl EditorSender {
+    /// Queue a custom message for the page. Maximum
+    /// [`crate::rt::EDITOR_MESSAGE_BYTES`] UTF-8 bytes.
+    pub fn send(&self, message: &str) -> bool {
+        let Some(message) = EditorMessage::new(message) else {
+            DiagCounters::bump(&self.diag.editor_messages_dropped);
+            return false;
+        };
+        if self.tx.borrow_mut().push(message).is_err() {
+            DiagCounters::bump(&self.diag.editor_messages_dropped);
+            return false;
+        }
+        self.pending.store(true, Ordering::Release);
+        true
+    }
+}
+
+/// The processor → IPC bus custom-message channel. Received through
+/// [`Processor::set_bus_sender`].
+///
+/// Same shape as [`EditorSender`]: `send` is allocation-free and
+/// realtime-safe (fixed-size UTF-8 in a bounded SPSC ring), so a processor
+/// may broadcast from `process` or `on_editor_message` even though the
+/// underlying [`skuiz_ipc::Bus`] socket write is main-thread work. Adapters
+/// drain the queue on their main thread and forward each message to the
+/// bus; a dedicated pump thread covers instances with no editor open.
+/// Overlong messages or a full queue return `false` and bump
+/// `bus_frames_dropped`.
+pub struct BusBroadcastSender {
+    tx: RefCell<Producer<EditorMessage>>,
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    diag: Arc<DiagCounters>,
+}
+
+impl BusBroadcastSender {
+    /// Queue a custom UTF-8 frame for the IPC bus. Maximum
+    /// [`crate::rt::EDITOR_MESSAGE_BYTES`] bytes.
+    pub fn send(&self, message: &str) -> bool {
+        let Some(message) = EditorMessage::new(message) else {
+            DiagCounters::bump(&self.diag.bus_frames_dropped);
+            return false;
+        };
+        if self.tx.borrow_mut().push(message).is_err() {
+            DiagCounters::bump(&self.diag.bus_frames_dropped);
+            return false;
+        }
+        self.pending.store(true, Ordering::Release);
+        true
+    }
+}
 
 impl std::fmt::Debug for AudioToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,6 +209,16 @@ impl<P: Processor> EngineHandle<P> {
             .map(|engine| engine.mirror().snapshot())
             .unwrap_or_default()
     }
+
+    /// Route a custom bus frame to [`Processor::on_editor_message`] (direct
+    /// when stopped, queued for block top while running). Returns `false`
+    /// if the instance is gone or the queue refused the message.
+    pub fn editor_message(&self, message: &str) -> bool {
+        match self.engine.upgrade() {
+            Some(engine) => engine.editor_message(message),
+            None => false,
+        }
+    }
 }
 
 /// Per-instance engine. `Sync` is unsafe-implemented: correctness rests on
@@ -154,6 +236,20 @@ pub struct Engine<P: Processor> {
     /// audio thread's response ring (capacity 2) cannot overflow. Main
     /// thread only.
     state_cmd_tx: Mutex<Producer<StateCommand>>,
+    /// Custom page → processor messages. Producer-side lock only; the
+    /// audio thread only pops.
+    editor_cmd_tx: Mutex<Producer<EditorMessage>>,
+    /// Processor → page messages. Main-thread consumer.
+    editor_output_rx: RefCell<Consumer<EditorMessage>>,
+    /// Set by `EditorSender` whenever output needs a main-thread flush.
+    editor_output_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Processor → IPC bus messages. Single consumer (the adapter's
+    /// main-thread/pump drain), synchronized with a non-realtime lock so a
+    /// background pump thread and main-thread poll points can share the
+    /// drain safely.
+    bus_output_rx: Mutex<Consumer<EditorMessage>>,
+    /// Set by `BusBroadcastSender` whenever a frame awaits bus delivery.
+    bus_output_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Main-thread only, hence RefCell: the response half of state ops.
     state_rx: RefCell<Consumer<StateResponse>>,
     /// Main-thread stash of freed state buffers, reused across loads.
@@ -188,7 +284,23 @@ impl<P: Processor + Default> Engine<P> {
             "invalid bus topology: {:?}",
             crate::bus::validate_buses(P::audio_buses())
         );
-        let processor = P::default();
+        let diag = Arc::new(DiagCounters::default());
+        let editor_output_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bus_output_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (editor_cmd_tx, editor_cmd_rx) = spsc(EDITOR_QUEUE_CAPACITY);
+        let (editor_output_tx, editor_output_rx) = spsc(EDITOR_QUEUE_CAPACITY);
+        let (bus_output_tx, bus_output_rx) = spsc(EDITOR_QUEUE_CAPACITY);
+        let mut processor = P::default();
+        processor.set_editor_sender(EditorSender {
+            tx: RefCell::new(editor_output_tx),
+            pending: Arc::clone(&editor_output_pending),
+            diag: Arc::clone(&diag),
+        });
+        processor.set_bus_sender(BusBroadcastSender {
+            tx: RefCell::new(bus_output_tx),
+            pending: Arc::clone(&bus_output_pending),
+            diag: Arc::clone(&diag),
+        });
         let mirror = ParamMirror::new(P::params(), |id| processor.get_param(id));
         // Seed the latency cache at construction: hosts may query latency
         // before activate, and the processor's static latency is already
@@ -200,17 +312,24 @@ impl<P: Processor + Default> Engine<P> {
         Arc::new(Self {
             core: UnsafeCell::new(AudioCore {
                 processor,
+                midi_in: MidiIn::with_capacity(midi_capacity),
                 midi_out: MidiOut::with_capacity(midi_capacity),
                 bus_scratch: crate::bus::TopologyScratch::new(P::audio_buses()),
                 cmd_rx,
                 state_cmd_rx,
                 state_tx,
+                editor_cmd_rx,
             }),
             access: AtomicU8::new(IDLE),
             mirror,
-            diag: Arc::new(DiagCounters::default()),
+            diag,
             cmd_tx,
             state_cmd_tx: Mutex::new(state_cmd_tx),
+            editor_cmd_tx: Mutex::new(editor_cmd_tx),
+            editor_output_rx: RefCell::new(editor_output_rx),
+            editor_output_pending,
+            bus_output_rx: Mutex::new(bus_output_rx),
+            bus_output_pending,
             state_rx: RefCell::new(state_rx),
             buffers: RefCell::new(Vec::new()),
             latency: std::sync::atomic::AtomicU32::new(initial_latency),
@@ -350,6 +469,84 @@ impl<P: Processor> Engine<P> {
             },
             Command::SetParam { id, value },
         )
+    }
+
+    /// Route a custom page message to [`Processor::on_editor_message`].
+    /// Direct on the main thread when stopped, queued for block top while
+    /// running. Returns `false` for overlong messages, a full queue, or a
+    /// stopped-but-contended engine; every refusal is counted.
+    pub fn editor_message(&self, message: &str) -> bool {
+        let Some(message) = EditorMessage::new(message) else {
+            DiagCounters::bump(&self.diag.editor_messages_dropped);
+            return false;
+        };
+        let direct = |engine: &Self| {
+            engine.with_main(|core| core.processor.on_editor_message(message.as_str()))
+        };
+        if direct(self).is_some() {
+            return true;
+        }
+        let deadline = Instant::now() + Duration::from_millis(1);
+        loop {
+            if self.is_processing() {
+                let pushed = self
+                    .editor_cmd_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(message);
+                if pushed.is_err() {
+                    DiagCounters::bump(&self.diag.editor_messages_dropped);
+                    return false;
+                }
+                return true;
+            }
+            if direct(self).is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                DiagCounters::bump(&self.diag.editor_messages_dropped);
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Whether the processor has page output awaiting a main-thread flush.
+    /// Adapters use this to schedule their usual main-thread bounce.
+    pub fn editor_output_pending(&self) -> bool {
+        self.editor_output_pending.load(Ordering::Acquire)
+    }
+
+    /// Deliver all pending processor → page messages. Main thread only.
+    /// The callback normally evals `protocol::on_editor_message_js`; with
+    /// no editor open, adapters should still drain (and discard) these
+    /// transient messages so the bounded queue cannot fill with stale UI.
+    pub fn drain_editor_output(&self, mut deliver: impl FnMut(&str)) {
+        // Clear before draining: a send racing the drain sets the flag
+        // again and therefore schedules another bounce instead of being
+        // lost behind a stale clear.
+        self.editor_output_pending.store(false, Ordering::Release);
+        let mut rx = self.editor_output_rx.borrow_mut();
+        while let Some(message) = rx.pop() {
+            deliver(message.as_str());
+        }
+    }
+
+    /// Whether the processor has IPC bus output awaiting a main/pump flush.
+    pub fn bus_output_pending(&self) -> bool {
+        self.bus_output_pending.load(Ordering::Acquire)
+    }
+
+    /// Deliver all pending processor → bus frames. Non-realtime threads
+    /// only (main thread or the adapter's pump thread).
+    pub fn drain_bus_output(&self, mut deliver: impl FnMut(&str)) {
+        if !self.bus_output_pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut rx = self.bus_output_rx.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(message) = rx.pop() {
+            deliver(message.as_str());
+        }
     }
 
     /// Shared ingress for cheap commands: direct through a main access when
@@ -550,6 +747,9 @@ impl<P: Processor> Engine<P> {
                 }
             }
         }
+        while let Some(message) = core.editor_cmd_rx.pop() {
+            core.processor.on_editor_message(message.as_str());
+        }
         // At most one state op per block: these can be arbitrarily heavy,
         // and the queue holds at most one more behind it.
         if let Some(cmd) = core.state_cmd_rx.pop() {
@@ -647,9 +847,99 @@ mod tests {
             &mut self,
             _inputs: &AudioInputs,
             _outputs: &mut AudioOutputs,
+            _notes: &crate::MidiIn,
             _midi: &mut MidiOut,
         ) {
         }
+    }
+
+    #[derive(Default)]
+    struct EditorEcho {
+        sender: Option<EditorSender>,
+    }
+
+    impl Processor for EditorEcho {
+        fn info() -> PluginInfo {
+            PluginInfo {
+                id: "test.editor-echo",
+                name: "e",
+                vendor: "t",
+                version: "0",
+                description: "",
+            }
+        }
+        fn params() -> &'static [ParamDef] {
+            &[]
+        }
+        fn set_param(&mut self, _id: u32, _v: f64) {}
+        fn get_param(&self, _id: u32) -> f64 {
+            0.0
+        }
+        fn set_editor_sender(&mut self, sender: EditorSender) {
+            self.sender = Some(sender);
+        }
+        fn on_editor_message(&mut self, message: &str) {
+            if message == "ping" {
+                self.sender.as_ref().unwrap().send("pong");
+            }
+        }
+        fn process(
+            &mut self,
+            _inputs: &AudioInputs,
+            _outputs: &mut AudioOutputs,
+            _notes: &crate::MidiIn,
+            _midi: &mut MidiOut,
+        ) {
+        }
+    }
+
+    #[test]
+    fn editor_messages_round_trip_stopped_and_running() {
+        let engine = Engine::<EditorEcho>::new(64);
+        assert!(engine.editor_message("ping"));
+        let mut replies = Vec::new();
+        engine.drain_editor_output(|message| replies.push(message.to_owned()));
+        assert_eq!(replies, ["pong"]);
+
+        let token = engine.begin_audio();
+        assert!(engine.editor_message("ping"));
+        assert!(
+            !engine.editor_output_pending(),
+            "incoming message is queued"
+        );
+        engine.drain_commands(engine.audio_core(&token));
+        assert!(engine.editor_output_pending());
+        engine.drain_editor_output(|message| replies.push(message.to_owned()));
+        assert_eq!(replies, ["pong", "pong"]);
+        engine.end_audio(token);
+    }
+
+    #[test]
+    fn editor_message_bounds_are_counted() {
+        let engine = Engine::<EditorEcho>::new(64);
+        let too_long = "x".repeat(crate::rt::EDITOR_MESSAGE_BYTES + 1);
+        assert!(!engine.editor_message(&too_long));
+        assert_eq!(
+            engine
+                .diag()
+                .editor_messages_dropped
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let token = engine.begin_audio();
+        for _ in 0..crate::rt::EDITOR_QUEUE_CAPACITY {
+            assert!(engine.editor_message("unhandled"));
+        }
+        assert!(!engine.editor_message("overflow"));
+        assert_eq!(
+            engine
+                .diag()
+                .editor_messages_dropped
+                .load(Ordering::Relaxed),
+            2
+        );
+        engine.end_audio(token);
     }
 
     #[test]
@@ -1046,6 +1336,7 @@ mod tests {
             &mut self,
             _inputs: &AudioInputs,
             _outputs: &mut AudioOutputs,
+            _notes: &crate::MidiIn,
             _midi: &mut MidiOut,
         ) {
         }

@@ -7,6 +7,7 @@
 
 #![allow(non_snake_case)]
 
+use skuiz_core::MidiIn;
 use skuiz_core::{AudioInputs, AudioOutputs, ParamDef, PluginInfo, Processor};
 use skuiz_vst3::vst3::Steinberg::Vst::*;
 use skuiz_vst3::vst3::Steinberg::*;
@@ -58,6 +59,8 @@ impl Processor for Gain {
         &mut self,
         _inputs: &AudioInputs,
         outputs: &mut AudioOutputs,
+
+        _notes: &MidiIn,
         _midi: &mut skuiz_core::MidiOut,
     ) {
         let g = self.0 as f32;

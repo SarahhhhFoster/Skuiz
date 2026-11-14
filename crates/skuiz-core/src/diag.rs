@@ -17,6 +17,11 @@ pub struct DiagCounters {
     pub param_events_dropped: AtomicU64,
     /// MIDI events dropped because `MidiOut` was full.
     pub midi_events_dropped: AtomicU64,
+    /// Host MIDI events dropped because the block's `MidiIn` was full.
+    pub midi_in_events_dropped: AtomicU64,
+    /// Custom editor messages refused because they were overlong or a
+    /// bounded incoming/outgoing queue was full.
+    pub editor_messages_dropped: AtomicU64,
     /// Commands (editor/IPC/state) dropped because the command queue was
     /// full.
     pub commands_dropped: AtomicU64,
@@ -40,7 +45,7 @@ impl DiagCounters {
     }
 
     /// Read them all: `(name, value)` pairs, for tests and the debug dump.
-    pub fn snapshot(&self) -> [(&'static str, u64); 6] {
+    pub fn snapshot(&self) -> [(&'static str, u64); 8] {
         [
             (
                 "param_events_dropped",
@@ -49,6 +54,14 @@ impl DiagCounters {
             (
                 "midi_events_dropped",
                 self.midi_events_dropped.load(Ordering::Relaxed),
+            ),
+            (
+                "midi_in_events_dropped",
+                self.midi_in_events_dropped.load(Ordering::Relaxed),
+            ),
+            (
+                "editor_messages_dropped",
+                self.editor_messages_dropped.load(Ordering::Relaxed),
             ),
             (
                 "commands_dropped",

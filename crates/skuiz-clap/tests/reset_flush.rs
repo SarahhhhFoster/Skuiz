@@ -12,6 +12,7 @@ use clap_sys::plugin::clap_plugin;
 use clap_sys::process::clap_process;
 use clap_sys::stream::clap_istream;
 use skuiz_clap::ClapDescriptor;
+use skuiz_core::MidiIn;
 use skuiz_core::{ParamDef, PluginInfo, Processor};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
@@ -82,6 +83,8 @@ impl Processor for Gain {
         &mut self,
         _inputs: &skuiz_core::AudioInputs,
         _outputs: &mut skuiz_core::AudioOutputs,
+
+        _notes: &MidiIn,
         _midi: &mut skuiz_core::MidiOut,
     ) {
     }

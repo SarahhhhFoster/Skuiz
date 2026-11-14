@@ -178,6 +178,7 @@ fn choice_params_drive_output_and_show_labels() {
         proc_.set_param(1, 3.0); // D#3 => key 63
         proc_.set_param(2, 2.0); // channel index 2 => status nibble 2
         proc_.activate(48_000.0, 512);
+        let notes = skuiz_core::MidiIn::with_capacity(0);
         let mut midi = skuiz_core::MidiOut::with_capacity(8);
         let mut block = [0.8f32; 512];
         let mut scratch = skuiz_core::bus::TopologyScratch::new(TriggerNote::audio_buses());
@@ -192,7 +193,7 @@ fn choice_params_drive_output_and_show_labels() {
             512,
         );
         let (inputs, mut outputs) = scratch.views();
-        proc_.process(&inputs, &mut outputs, &mut midi);
+        proc_.process(&inputs, &mut outputs, &notes, &mut midi);
         assert_eq!(midi.events().len(), 1);
         assert_eq!(
             midi.events()[0].1.midi1_bytes(),

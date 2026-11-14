@@ -233,6 +233,9 @@ impl<P: Processor + Default> AuInstance<P> {
                 // cross-process link was down heal (invariant 9).
                 if let Some(sender) = cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     sender.send(proto::sync_request(lww_cb.origin()).as_bytes());
+                    if let Some(custom) = P::on_bus_link_up() {
+                        sender.send(custom.as_bytes());
+                    }
                 }
                 return;
             }
@@ -282,16 +285,32 @@ impl<P: Processor + Default> AuInstance<P> {
                         lww_cb.accept_with(id, Some((seq, origin)), || handle.set_param(id, value));
                     }
                 }
+                return;
             }
+            handle.editor_message(msg);
         };
         let bus = match group_dir {
-            Some(dir) => skuiz_ipc::Bus::join_in(&dir, P::info().id, on_message),
-            None => skuiz_ipc::Bus::join(P::info().id, on_message),
+            Some(dir) => skuiz_ipc::Bus::join_in(&dir, P::bus_scope(), on_message),
+            None => skuiz_ipc::Bus::join(P::bus_scope(), on_message),
         };
+        let pump_sender = bus.sender();
         *sender_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus.sender());
         // Late joiner: ask the bus for current shared state.
         bus.send(proto::sync_request(lww.origin()).as_bytes());
+        if let Some(custom) = P::on_bus_link_up() {
+            bus.send(custom.as_bytes());
+        }
         *self.bus.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus);
+        let weak_engine = Arc::downgrade(&self.engine);
+        std::thread::spawn(move || {
+            while let Some(engine) = weak_engine.upgrade() {
+                engine.drain_bus_output(|msg| {
+                    pump_sender.send(msg.as_bytes());
+                });
+                drop(engine);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        });
     }
 }
 
@@ -462,6 +481,87 @@ macro_rules! export_auv3 {
             /// direction has no buses this block. The main input aliases the
             /// main output — the shim already pulled the upstream audio into
             /// the output buffers, which is the copy-in.
+            /// Clear host MIDI before collecting a new AU render block.
+            #[no_mangle]
+            pub unsafe extern "C" fn skuiz_auv3_midi_input_begin(ptr: *mut ::std::ffi::c_void) {
+                if let Some(i) = inst(ptr) {
+                    let token = i.engine.begin_audio();
+                    i.engine.audio_core(&token).midi_in.clear();
+                    i.engine.end_audio(token);
+                }
+            }
+
+            /// Queue one 1–3 byte MIDI message at a block-relative frame.
+            /// The shim calls this off the audio-side processor borrow,
+            /// before each render segment selects its visible range.
+            #[no_mangle]
+            pub unsafe extern "C" fn skuiz_auv3_midi_input(
+                ptr: *mut ::std::ffi::c_void,
+                frame: u32,
+                bytes: *const u8,
+                len: u32,
+            ) {
+                $crate::ffi_guard(
+                    || {
+                        let Some(i) = inst(ptr) else { return };
+                        if bytes.is_null() || len == 0 || len > 3 {
+                            return;
+                        }
+                        let mut data = [0u8; 3];
+                        for (dst, src) in data
+                            .iter_mut()
+                            .zip(::std::slice::from_raw_parts(bytes, len as usize))
+                        {
+                            *dst = *src;
+                        }
+                        let token = i.engine.begin_audio();
+                        let midi = &mut i.engine.audio_core(&token).midi_in;
+                        if !midi.push(frame, $crate::skuiz_core::MidiEvent::from_midi1(data)) {
+                            $crate::skuiz_core::diag::DiagCounters::bump(
+                                &i.engine.diag().midi_in_events_dropped,
+                            );
+                        }
+                        i.engine.end_audio(token);
+                    },
+                    (),
+                )
+            }
+
+            /// Count a MIDI input overflow detected by the shim's own
+            /// fixed-size staging array.
+            #[no_mangle]
+            pub unsafe extern "C" fn skuiz_auv3_midi_input_overflow(
+                ptr: *mut ::std::ffi::c_void,
+            ) {
+                if let Some(i) = inst(ptr) {
+                    $crate::skuiz_core::diag::DiagCounters::bump(
+                        &i.engine.diag().midi_in_events_dropped,
+                    );
+                }
+            }
+
+            /// Expose `[start, end)` of the collected host block to the
+            /// next processor call, with offsets rebased to `start`.
+            #[no_mangle]
+            pub unsafe extern "C" fn skuiz_auv3_midi_input_range(
+                ptr: *mut ::std::ffi::c_void,
+                start: u32,
+                end: u32,
+            ) {
+                if let Some(i) = inst(ptr) {
+                    let token = i.engine.begin_audio();
+                    i.engine.audio_core(&token).midi_in.set_range(start, end);
+                    i.engine.end_audio(token);
+                }
+            }
+
+            /// Whether this processor consumes MIDI; the shim uses this to
+            /// publish `MIDIInputNames`.
+            #[no_mangle]
+            pub extern "C" fn skuiz_auv3_accepts_midi() -> bool {
+                <$P>::accepts_midi()
+            }
+
             #[no_mangle]
             pub unsafe extern "C" fn skuiz_auv3_render(
                 ptr: *mut ::std::ffi::c_void,
@@ -584,7 +684,12 @@ macro_rules! export_auv3 {
 
                         core.midi_out.clear();
                         let (inputs, mut outputs) = scratch.views();
-                        core.processor.process(&inputs, &mut outputs, &mut core.midi_out);
+                        core.processor.process(
+                            &inputs,
+                            &mut outputs,
+                            &core.midi_in,
+                            &mut core.midi_out,
+                        );
                         i.engine.diag().midi_events_dropped.fetch_add(
                             core.midi_out.dropped() as u64,
                             ::std::sync::atomic::Ordering::Relaxed,

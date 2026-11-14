@@ -46,7 +46,7 @@ are unique across the whole plugin, the first bus of a direction is the
 ## Reading buses in `process`
 
 ```rust
-fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut) {
+fn process(&mut self, inputs: &AudioInputs, outputs: &mut AudioOutputs, notes: &MidiIn, midi: &mut MidiOut) {
     let Some(main_in) = inputs.main() else { return };      // None: instrument
     let Some(main_out) = outputs.main() else { return };
     let side = inputs

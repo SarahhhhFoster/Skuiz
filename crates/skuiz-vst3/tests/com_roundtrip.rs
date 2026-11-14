@@ -3,7 +3,7 @@
 
 #![allow(non_snake_case)]
 
-use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 use skuiz_vst3::vst3::Steinberg::Vst::*;
 use skuiz_vst3::vst3::Steinberg::*;
 use skuiz_vst3::vst3::{Class, ComPtr, ComWrapper, Interface};
@@ -88,7 +88,13 @@ impl Processor for Fixture {
             _ => 0.0,
         }
     }
-    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        midi: &mut MidiOut,
+    ) {
         let g = self.gain as f32;
         // The main input aliases the main output, so processing the output
         // bus in place applies the gain to the copied input.
@@ -749,7 +755,13 @@ impl Processor for CcFixture {
     fn get_param(&self, _id: u32) -> f64 {
         0.0
     }
-    fn process(&mut self, _inputs: &AudioInputs, _outputs: &mut AudioOutputs, midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        _outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        midi: &mut MidiOut,
+    ) {
         midi.push(0, skuiz_core::MidiEvent::from_midi1([0xB2, 7, 64])); // CC 7, ch 2
         midi.push(4, skuiz_core::MidiEvent::from_midi1([0xE0, 0x00, 0x40])); // bend centre
         midi.push(8, skuiz_core::MidiEvent::from_midi1([0xA0, 60, 96])); // poly pressure
@@ -837,5 +849,118 @@ fn midi_cc_bend_and_pressure_reach_the_event_output() {
         assert_eq!(ev.__field0.midiCCOut.value, 100);
 
         assert_eq!(component.terminate(), kResultOk);
+    }
+}
+
+#[derive(Default)]
+struct MidiEcho;
+
+impl Processor for MidiEcho {
+    fn info() -> PluginInfo {
+        PluginInfo {
+            id: "test.vst3midiin",
+            name: "MidiEcho",
+            vendor: "Skuiz",
+            version: "0",
+            description: "",
+        }
+    }
+    fn params() -> &'static [ParamDef] {
+        &[]
+    }
+    fn accepts_midi() -> bool {
+        true
+    }
+    fn emits_midi() -> bool {
+        true
+    }
+    fn set_param(&mut self, _id: u32, _v: f64) {}
+    fn get_param(&self, _id: u32) -> f64 {
+        0.0
+    }
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        _outputs: &mut AudioOutputs,
+        notes: &MidiIn,
+        midi: &mut MidiOut,
+    ) {
+        for (frame, event) in notes.events() {
+            midi.push(frame, event);
+        }
+    }
+}
+
+#[test]
+fn native_note_input_reaches_dsp_at_exact_offsets() {
+    unsafe {
+        let component = ComWrapper::new(Vst3Plugin::<MidiEcho>::default())
+            .to_com_ptr::<IComponent>()
+            .unwrap();
+        assert_eq!(component.initialize(std::ptr::null_mut()), kResultOk);
+        assert_eq!(
+            component.getBusCount(
+                MediaTypes_::kEvent as MediaType,
+                BusDirections_::kInput as BusDirection
+            ),
+            1
+        );
+        let processor = component.cast::<IAudioProcessor>().unwrap();
+        let mut setup = ProcessSetup {
+            processMode: ProcessModes_::kRealtime as int32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as int32,
+            maxSamplesPerBlock: 512,
+            sampleRate: 48_000.0,
+        };
+        assert_eq!(processor.setupProcessing(&mut setup), kResultOk);
+
+        let input = ComWrapper::new(EventSink::default());
+        let input_ptr = input.to_com_ptr::<IEventList>().unwrap();
+        let mut off: Event = std::mem::zeroed();
+        off.r#type = Event_::EventTypes_::kNoteOffEvent as u16;
+        off.sampleOffset = 40;
+        off.__field0.noteOff = NoteOffEvent {
+            channel: 2,
+            pitch: 67,
+            velocity: 0.25,
+            noteId: -1,
+            tuning: 0.0,
+        };
+        assert_eq!(input_ptr.addEvent(&mut off), kResultOk);
+        let mut on: Event = std::mem::zeroed();
+        on.r#type = Event_::EventTypes_::kNoteOnEvent as u16;
+        on.sampleOffset = 17;
+        on.__field0.noteOn = NoteOnEvent {
+            channel: 0,
+            pitch: 60,
+            tuning: 0.0,
+            velocity: 0.5,
+            length: 0,
+            noteId: -1,
+        };
+        assert_eq!(input_ptr.addEvent(&mut on), kResultOk);
+
+        let output = ComWrapper::new(EventSink::default());
+        let output_ptr = output.to_com_ptr::<IEventList>().unwrap();
+        let mut data: ProcessData = std::mem::zeroed();
+        data.numSamples = 64;
+        data.symbolicSampleSize = SymbolicSampleSizes_::kSample32 as int32;
+        data.inputEvents = input_ptr.as_ptr();
+        data.outputEvents = output_ptr.as_ptr();
+        assert_eq!(processor.process(&mut data), kResultOk);
+
+        assert_eq!(output_ptr.getEventCount(), 2);
+        let mut seen: Event = std::mem::zeroed();
+        assert_eq!(output_ptr.getEvent(0, &mut seen), kResultOk);
+        assert_eq!(seen.r#type, Event_::EventTypes_::kNoteOnEvent as u16);
+        assert_eq!(seen.sampleOffset, 17);
+        assert_eq!(seen.__field0.noteOn.pitch, 60);
+        assert_eq!(seen.__field0.noteOn.channel, 0);
+        assert!((seen.__field0.noteOn.velocity - 64.0 / 127.0).abs() < 1e-6);
+        assert_eq!(output_ptr.getEvent(1, &mut seen), kResultOk);
+        assert_eq!(seen.r#type, Event_::EventTypes_::kNoteOffEvent as u16);
+        assert_eq!(seen.sampleOffset, 40);
+        assert_eq!(seen.__field0.noteOff.pitch, 67);
+        assert_eq!(seen.__field0.noteOff.channel, 2);
     }
 }

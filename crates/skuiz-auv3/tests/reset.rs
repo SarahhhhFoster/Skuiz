@@ -3,7 +3,7 @@
 //! audio, so the test can see the reset land without touching internals.
 
 use skuiz_auv3::SkuizAudioBusBuffers;
-use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 use std::ffi::c_void;
 
 struct Counter {
@@ -50,7 +50,13 @@ impl Processor for Counter {
     fn reset(&mut self) {
         self.blocks = 0;
     }
-    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        _midi: &mut MidiOut,
+    ) {
         self.blocks += 1;
         // Frame 0 of channel 0 reports how many blocks have run since the
         // last reset; the rest is ordinary gain processing.

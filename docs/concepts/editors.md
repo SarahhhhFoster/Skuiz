@@ -18,7 +18,7 @@ fn editor_size() -> (u32, u32) {
 One HTML document drives every format — CLAP's `gui` extension, VST3's
 `IPlugView`, and the standalone window all attach the same page.
 
-## The bridge is two functions
+## The built-in bridge
 
 **Page → plugin:** `window.ipc.postMessage("set_param 0 0.75")` — a
 plain string, parsed by `skuiz_core::protocol::parse_set_param`.
@@ -29,18 +29,92 @@ definition order — the adapter always calls it as
 `window.skuizOnParam && window.skuizOnParam(...)` so an early call
 before your script runs is dropped, not an error.
 
-That is the entire protocol. Everything else — sliders, frameworks,
-visualizations — is ordinary web development.
+For diagnostics, the page posts `"skuiz_diag"` and the plugin answers
+with `window.skuizOnDiag && window.skuizOnDiag({...})`, a plain object
+of the instance's drop counters (`param_events_dropped`,
+`midi_events_dropped`, `midi_in_events_dropped`,
+`editor_messages_dropped`, `commands_dropped`, `bus_frames_dropped`,
+`state_responses_dropped`, `mirror_retries` — see `skuiz_core::diag`).
+Wired in the CLAP, VST3 and standalone editors; AUv3 has no webview
+editor. Useful for a debug overlay, ignorable otherwise.
 
-There is one more message kind, for diagnostics: the page posts
-`"skuiz_diag"` and the plugin answers with
-`window.skuizOnDiag && window.skuizOnDiag({...})`, a plain object of the
-instance's drop counters (`param_events_dropped`, `midi_events_dropped`,
-`commands_dropped`, `bus_frames_dropped`, `state_responses_dropped`,
-`mirror_retries` — see
-`skuiz_core::diag`). Wired in the CLAP, VST3 and standalone editors;
-AUv3 has no webview editor. Useful for a debug overlay, ignorable
-otherwise.
+## Custom messages
+
+Anything outside `set_param` and `skuiz_diag` is a custom message. This
+covers UI events that are not parameter state: audition a chord, assign a
+grid slot, flash a control when MIDI arrives, and so on.
+
+**Page → processor:** post a plain string, and implement
+`Processor::on_editor_message`:
+
+```js
+window.ipc.postMessage('audition 42');
+```
+
+**Processor → page:** store the `EditorSender` the engine supplies just
+after construction, send it a string, and implement
+`window.skuizOnMessage`:
+
+```rust
+use skuiz_core::engine::EditorSender;
+
+struct MyProcessor {
+    editor: Option<EditorSender>,
+    // ...
+}
+
+impl Processor for MyProcessor {
+    fn set_editor_sender(&mut self, sender: EditorSender) {
+        self.editor = Some(sender);
+    }
+
+    fn on_editor_message(&mut self, message: &str) {
+        if message == "ping" {
+            if let Some(editor) = &self.editor {
+                editor.send("pong");
+            }
+        }
+    }
+    // ...
+}
+```
+
+```js
+window.skuizOnMessage = (text) => {
+  if (text === 'pong') { /* update the page */ }
+};
+```
+
+The adapter evals a guarded, JSON-escaped
+`window.skuizOnMessage && window.skuizOnMessage(...)`, so arbitrary text
+cannot break the JavaScript call and an early call is dropped safely.
+
+### Threading and limits
+
+Incoming custom messages call `on_editor_message` directly on the main
+thread when stopped. While blocks flow they travel through a bounded
+queue and run on the **audio thread at block top**, which is what makes
+them suitable for triggering MIDI. Keep the handler to cheap parsing and
+assignment, with the same no-allocation/no-locking rules as `set_param`.
+
+Outgoing `EditorSender::send` is allocation-free and realtime-safe. The
+adapter drains it on the main thread: CLAP uses `request_callback`, VST3
+uses its `getParamNormalized` polling point, and standalone posts a UI
+event. Do not call the sender from bus callbacks or arbitrary threads.
+
+Messages are at most **256 UTF-8 bytes**; each direction queues **64**
+messages. Overlong messages and full queues return `false` and increment
+`editor_messages_dropped`. Parameter messages and custom messages use
+separate queues, so their relative order is not guaranteed.
+
+Custom output is **transient, not a state-synchronization mechanism**:
+messages emitted while no editor is open are discarded, and calls made
+before the page installs its handler are dropped. Push durable state on
+mount, or represent it as parameters/custom state and have the page
+request it. AUv3 has no webview editor channel.
+
+Everything else — sliders, frameworks, visualizations — is ordinary web
+development.
 
 ## Two rules that keep editors sane
 

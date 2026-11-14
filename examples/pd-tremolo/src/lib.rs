@@ -14,7 +14,7 @@
 
 #![cfg(feature = "libpd")]
 
-use skuiz_core::{AudioInputs, AudioOutputs, MidiOut, ParamDef, PluginInfo, Processor};
+use skuiz_core::{AudioInputs, AudioOutputs, MidiIn, MidiOut, ParamDef, PluginInfo, Processor};
 use skuiz_dsp::PdEngine;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -139,7 +139,13 @@ impl Processor for PdTremolo {
         }
     }
 
-    fn process(&mut self, _inputs: &AudioInputs, outputs: &mut AudioOutputs, _midi: &mut MidiOut) {
+    fn process(
+        &mut self,
+        _inputs: &AudioInputs,
+        outputs: &mut AudioOutputs,
+        _notes: &MidiIn,
+        _midi: &mut MidiOut,
+    ) {
         // Pd still speaks the flat in-place channel array; the main output
         // bus (which the adapter already copied the input into) is that
         // array.

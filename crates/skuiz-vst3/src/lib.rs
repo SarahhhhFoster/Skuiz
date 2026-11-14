@@ -34,7 +34,7 @@ use skuiz_core::bus::{
 };
 use skuiz_core::diag::DiagCounters;
 use skuiz_core::engine::{AudioCore, AudioToken, Engine};
-use skuiz_core::{MidiOut, ParamDef, Processor};
+use skuiz_core::{MidiEvent, MidiIn, MidiOut, ParamDef, Processor};
 use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::marker::PhantomData;
@@ -204,6 +204,10 @@ pub const fn derive_cid(plugin_id: &str) -> TUID {
 /// `Arc` so the view cannot outlive it, and so a bus callback never points
 /// at memory the host has freed.
 struct Shared<P: Processor> {
+    /// Main-thread editor slot, shared with the COM plug view so custom
+    /// processor messages can be flushed from the controller's poll point.
+    editor_slot:
+        std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<Option<skuiz_ui::Editor>>>>>,
     /// The engine owns the processor and everything realtime (see
     /// docs/concepts/invariants.md); Arc'd for the view and the bus
     /// callback's Weak handle.
@@ -239,6 +243,32 @@ struct Shared<P: Processor> {
 }
 
 impl<P: Processor> Shared<P> {
+    /// Flush custom processor → page messages on the main thread. Messages
+    /// emitted while no editor exists are transient and discarded.
+    fn flush_editor_output(&self) {
+        self.engine.drain_editor_output(|message| {
+            let js = skuiz_core::protocol::on_editor_message_js(message);
+            if let Some(slot) = self.editor_slot.borrow().as_ref() {
+                if let Some(editor) = slot.borrow().as_ref() {
+                    let _ = editor.eval(&js);
+                }
+            }
+        });
+        self.flush_bus_output();
+    }
+
+    /// Forward queued processor → bus frames onto the IPC bus.
+    fn flush_bus_output(&self) {
+        if !self.engine.bus_output_pending() {
+            return;
+        }
+        let Ok(bus) = self.bus.lock() else { return };
+        let Some(bus) = bus.as_ref() else { return };
+        self.engine.drain_bus_output(|message| {
+            bus.send(message.as_bytes());
+        });
+    }
+
     /// Apply an editor-driven parameter change: update the processor (via
     /// the engine — direct when stopped, queued for the next block when
     /// running), tell the host so it records automation, and share it with
@@ -310,6 +340,7 @@ impl<P: Processor + Default> Vst3Plugin<P> {
     pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
+                editor_slot: std::cell::RefCell::new(None),
                 engine: Engine::new(MIDI_OUT_CAPACITY),
                 audio_token: std::cell::RefCell::new(None),
                 param_events: UnsafeCell::new(Vec::with_capacity(PARAM_EVENT_CAPACITY)),
@@ -410,6 +441,46 @@ impl<P: Processor> Vst3Plugin<P> {
         }
         // Points across queues are not mutually ordered; sort them.
         out.sort_unstable_by_key(|e| e.0);
+    }
+
+    /// Collect native VST3 note events into the preallocated block buffer.
+    /// Velocities are normalized by VST3 and reduced to MIDI 1.0's 7-bit
+    /// channel-message representation. VST3 has no UMP input event type.
+    #[allow(clippy::unnecessary_cast)] // event constants are u16 on Windows, u32 on macOS
+    unsafe fn collect_midi_events(&self, list: *mut IEventList, out: &mut MidiIn) {
+        let Some(list) = ComRef::from_raw(list) else {
+            return;
+        };
+        for i in 0..list.getEventCount() {
+            let mut event: Event = std::mem::zeroed();
+            if list.getEvent(i, &mut event) != kResultOk {
+                continue;
+            }
+            let status = event.r#type as u32;
+            let bytes = if status == Event_::EventTypes_::kNoteOnEvent as u32 {
+                let note = event.__field0.noteOn;
+                [
+                    0x90 | note.channel.clamp(0, 15) as u8,
+                    note.pitch.clamp(0, 127) as u8,
+                    (note.velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                ]
+            } else if status == Event_::EventTypes_::kNoteOffEvent as u32 {
+                let note = event.__field0.noteOff;
+                [
+                    0x80 | note.channel.clamp(0, 15) as u8,
+                    note.pitch.clamp(0, 127) as u8,
+                    (note.velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                ]
+            } else {
+                continue;
+            };
+            if !out.push(
+                event.sampleOffset.max(0) as u32,
+                MidiEvent::from_midi1(bytes),
+            ) {
+                DiagCounters::bump(&self.shared.engine.diag().midi_in_events_dropped);
+            }
+        }
     }
 
     /// Convert generated MIDI into VST3 events. MIDI 1.0 note on/off and
@@ -569,15 +640,19 @@ impl<P: Processor> Vst3Plugin<P> {
         let Some(setup) = (unsafe { setup.as_ref() }) else {
             return kInvalidArgument;
         };
-        // setupProcessing is main-thread with the transport stopped; a
-        // host calling it while processing is breaking the spec, and we
-        // say no rather than race.
-        let Some(latency) = self.shared.engine.with_main(|core| {
-            core.processor
-                .activate(setup.sampleRate, setup.maxSamplesPerBlock as u32);
-            core.processor.latency()
-        }) else {
-            return kResultFalse;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
+        let latency = loop {
+            if let Some(lat) = self.shared.engine.with_main(|core| {
+                core.processor
+                    .activate(setup.sampleRate, setup.maxSamplesPerBlock as u32);
+                core.processor.latency()
+            }) {
+                break lat;
+            }
+            if self.shared.engine.is_processing() || std::time::Instant::now() >= deadline {
+                return kResultFalse;
+            }
+            std::thread::yield_now();
         };
         self.shared.engine.set_latency(latency);
         kResultOk
@@ -607,10 +682,18 @@ impl<P: Processor> Vst3Plugin<P> {
         if report.notify_main {
             self.shared.editor_dirty.store(true, Ordering::Release);
         }
+        if engine.editor_output_pending() || engine.bus_output_pending() {
+            self.shared.editor_dirty.store(true, Ordering::Release);
+        }
         // The block's timed automation points, sorted by sample offset.
         let events = &mut *self.shared.param_events.get();
         events.clear();
         self.collect_param_changes(data.inputParameterChanges, frames, events);
+        core.midi_in.clear();
+        if P::accepts_midi() {
+            self.collect_midi_events(data.inputEvents, &mut core.midi_in);
+        }
+        core.midi_in.prepare(frames as u32);
 
         // Copy the main input into the main output once (unless the host
         // processes in place) and zero what no input covered; segments
@@ -618,23 +701,34 @@ impl<P: Processor> Vst3Plugin<P> {
         // directly from the host's buffers.
         self.copy_main_into_output(data, frames);
 
-        // Split the block at point times: render up to the next point,
-        // apply it, continue. Segments re-slice the same host buffers.
+        // Split at both automation and MIDI times. Events at `pos`
+        // belong to the segment starting there; an event at a
+        // segment's end is seen by the next segment, never twice.
         let mut pos = 0usize;
-        for &(time, id, value) in events.iter() {
-            let t = (time as usize).min(frames);
-            if t > pos {
-                self.process_segment(core, data, pos, t);
-                pos = t;
+        let mut param_index = 0usize;
+        while pos < frames || param_index < events.len() {
+            while param_index < events.len() && events[param_index].0 as usize <= pos {
+                let (_, id, value) = events[param_index];
+                core.processor.set_param(id, value);
+                // Publish the readback, not the request: processors may
+                // round or clamp, and the mirror must hold the value
+                // actually in force.
+                engine.mirror().publish(id, core.processor.get_param(id));
+                param_index += 1;
             }
-            core.processor.set_param(id, value);
-            // Publish the readback, not the request: processors may round
-            // or clamp, and the mirror must hold the value actually in
-            // force.
-            engine.mirror().publish(id, core.processor.get_param(id));
-        }
-        if pos < frames {
-            self.process_segment(core, data, pos, frames);
+            if pos >= frames {
+                break;
+            }
+            let next_param = events
+                .get(param_index)
+                .map_or(frames, |event| (event.0 as usize).min(frames));
+            let next_note = core
+                .midi_in
+                .first_frame_after(pos as u32)
+                .map_or(frames, |frame| (frame as usize).min(frames));
+            let end = next_param.min(next_note).max(pos + 1).min(frames);
+            self.process_segment(core, data, pos, end);
+            pos = end;
         }
         kResultOk
     }
@@ -778,9 +872,11 @@ impl<P: Processor> Vst3Plugin<P> {
         }
 
         let (inputs, mut outputs) = scratch.views();
+        core.midi_in.set_range(start as u32, end as u32);
         let midi = &mut core.midi_out;
         midi.clear();
-        core.processor.process(&inputs, &mut outputs, midi);
+        core.processor
+            .process(&inputs, &mut outputs, &core.midi_in, midi);
         // MIDI pushed past capacity is a counted drop (invariant 8).
         if midi.dropped() > 0 {
             self.shared
@@ -806,7 +902,11 @@ impl<P: Processor> Vst3Plugin<P> {
         // their generic editors and automation lanes. The flag is consumed
         // before the call, so a host answering the restart synchronously
         // cannot recurse.
+        if self.shared.engine.editor_output_pending() || self.shared.engine.bus_output_pending() {
+            self.shared.editor_dirty.store(true, Ordering::Release);
+        }
         if self.shared.editor_dirty.swap(false, Ordering::Acquire) {
+            self.shared.flush_editor_output();
             let handler = self
                 .shared
                 .handler
@@ -874,12 +974,15 @@ impl<P: Processor + Default> IPluginBaseTrait for Vst3Plugin<P> {
         let lww_cb = Arc::clone(&lww);
         let sender_slot: Arc<Mutex<Option<skuiz_ipc::BusSender>>> = Arc::new(Mutex::new(None));
         let cb_sender = Arc::clone(&sender_slot);
-        let bus = skuiz_ipc::Bus::join(P::info().id, move |frame| {
+        let bus = skuiz_ipc::Bus::join(P::bus_scope(), move |frame| {
             if frame == skuiz_ipc::LINK_UP_FRAME {
                 // Link (back) up: re-sync so frames dropped while the
                 // cross-process link was down heal (invariant 9).
                 if let Some(sender) = cb_sender.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     sender.send(proto::sync_request(lww_cb.origin()).as_bytes());
+                    if let Some(custom) = P::on_bus_link_up() {
+                        sender.send(custom.as_bytes());
+                    }
                 }
                 return;
             }
@@ -929,12 +1032,32 @@ impl<P: Processor + Default> IPluginBaseTrait for Vst3Plugin<P> {
                         lww_cb.accept_with(id, Some((seq, origin)), || handle.set_param(id, value));
                     }
                 }
+                return;
             }
+            // Custom companion-plugin frame: hand to the processor.
+            handle.editor_message(msg);
         });
+        let pump_sender = bus.sender();
         *sender_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus.sender());
         // Late joiner: ask the bus for current shared state.
         bus.send(proto::sync_request(lww.origin()).as_bytes());
+        if let Some(custom) = P::on_bus_link_up() {
+            bus.send(custom.as_bytes());
+        }
         *self.shared.bus.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus);
+        // Pump processor → bus frames even when no editor is open and the
+        // host is not polling parameters. Stops automatically when the
+        // instance (or its bus) drops.
+        let weak_engine = Arc::downgrade(&self.shared.engine);
+        std::thread::spawn(move || {
+            while let Some(engine) = weak_engine.upgrade() {
+                engine.drain_bus_output(|msg| {
+                    pump_sender.send(msg.as_bytes());
+                });
+                drop(engine);
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        });
         kResultOk
     }
 
@@ -966,10 +1089,11 @@ impl<P: Processor + Default> IComponentTrait for Vst3Plugin<P> {
                 Self::bus_specs(dir).count() as i32
             }
             MediaTypes_::kEvent
-                // Only advertise an event bus for plugins that generate MIDI.
-                if P::emits_midi() && dir as BusDirections == BusDirections_::kOutput => {
-                    1
-                }
+                if (dir as BusDirections == BusDirections_::kInput && P::accepts_midi())
+                    || (dir as BusDirections == BusDirections_::kOutput && P::emits_midi()) =>
+            {
+                1
+            }
             _ => 0,
         }
     }
@@ -1020,11 +1144,14 @@ impl<P: Processor + Default> IComponentTrait for Vst3Plugin<P> {
                 }
                 kResultOk
             }
-            MediaTypes_::kEvent if index == 0 && P::emits_midi() && !is_input => {
+            MediaTypes_::kEvent
+                if index == 0
+                    && ((is_input && P::accepts_midi()) || (!is_input && P::emits_midi())) =>
+            {
                 bus.mediaType = MediaTypes_::kEvent as MediaType;
                 bus.direction = dir;
                 bus.channelCount = 16;
-                copy_wstring("MIDI Out", &mut bus.name);
+                copy_wstring(if is_input { "MIDI In" } else { "MIDI Out" }, &mut bus.name);
                 bus.busType = BusTypes_::kMain as BusType;
                 // The cast is platform-load-bearing: these enum constants
                 // are i32 on Windows and u32 on macOS, so clippy sees a
@@ -1358,7 +1485,25 @@ impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
             };
             let shared = Arc::clone(&self.shared);
             let editor_slot = std::rc::Rc::clone(&self.editor);
+            // The param seeding below races page load (evaluate_script runs
+            // whenever the webview gets to it), so the real seed happens on
+            // the page's first message: a page that can post has loaded.
+            let seeded = std::cell::Cell::new(false);
             let editor = skuiz_ui::Editor::attach(&view, html, P::editor_size(), move |msg| {
+                if !seeded.replace(true) {
+                    let values = shared.engine.mirror().snapshot();
+                    if let Some(editor) = editor_slot.borrow().as_ref() {
+                        for (id, value) in values {
+                            let _ = editor.eval(&skuiz_core::protocol::on_param_js(id, value));
+                        }
+                    }
+                }
+                if msg == skuiz_core::protocol::POLL {
+                    // The page's keepalive: deliver whatever the processor
+                    // emitted since the last flush. Never forwarded.
+                    shared.flush_editor_output();
+                    return;
+                }
                 if msg == skuiz_core::protocol::DIAG_QUERY {
                     // Diagnostics for the page: counters are atomics; the
                     // eval back is main-thread editor work.
@@ -1369,18 +1514,16 @@ impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
                     return;
                 }
                 let Some((id, value)) = skuiz_core::protocol::parse_set_param(&msg) else {
+                    shared.engine.editor_message(&msg);
+                    shared.flush_editor_output();
                     return;
                 };
                 shared.set_param_from_editor(id, value);
             });
             match editor {
                 Ok(editor) => {
-                    // Seed the page with the current values — read from the
-                    // mirror (wait-free), never from the processor.
-                    for (id, value) in self.shared.engine.mirror().snapshot() {
-                        let _ = editor.eval(&skuiz_core::protocol::on_param_js(id, value));
-                    }
                     *self.editor.borrow_mut() = Some(editor);
+                    *self.shared.editor_slot.borrow_mut() = Some(std::rc::Rc::clone(&self.editor));
                     kResultOk
                 }
                 Err(_) => kResultFalse,
@@ -1394,6 +1537,7 @@ impl<P: Processor + Default> IPlugViewTrait for Vst3PlugView<P> {
     }
 
     unsafe fn removed(&self) -> tresult {
+        *self.shared.editor_slot.borrow_mut() = None;
         *self.editor.borrow_mut() = None;
         kResultOk
     }
@@ -1467,7 +1611,40 @@ impl<P: Processor + Default> Default for Vst3Factory<P> {
 }
 
 impl<P: Processor + Default> Class for Vst3Factory<P> {
-    type Interfaces = (IPluginFactory,);
+    type Interfaces = (IPluginFactory, IPluginFactory2);
+}
+
+impl<P: Processor + Default> IPluginFactory2Trait for Vst3Factory<P> {
+    unsafe fn getClassInfo2(&self, index: i32, info: *mut PClassInfo2) -> tresult {
+        if index != 0 {
+            return kInvalidArgument;
+        }
+        let Some(info) = info.as_mut() else {
+            return kInvalidArgument;
+        };
+        let plugin = P::info();
+        info.cid = derive_cid(plugin.id);
+        info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as int32;
+        copy_cstring("Audio Module Class", &mut info.category);
+        copy_cstring(plugin.name, &mut info.name);
+        info.classFlags = 0;
+        // Match the CLAP adapter's rule: a MIDI-emitting plugin (or one
+        // with no audio inputs) advertises "Instrument" so hosts like
+        // Ableton Live allow it on a MIDI track; audio effects advertise "Fx".
+        let has_audio_in = P::audio_buses()
+            .iter()
+            .any(|b| b.direction == CoreBusDirection::Input);
+        let sub_categories = match (P::emits_midi() || !has_audio_in, has_audio_in) {
+            (true, true) => "Instrument|Fx",
+            (true, false) => "Instrument",
+            (false, _) => "Fx",
+        };
+        copy_cstring(sub_categories, &mut info.subCategories);
+        copy_cstring(plugin.vendor, &mut info.vendor);
+        copy_cstring(plugin.version, &mut info.version);
+        copy_cstring("VST 3.7.8", &mut info.sdkVersion);
+        kResultOk
+    }
 }
 
 impl<P: Processor + Default> IPluginFactoryTrait for Vst3Factory<P> {
